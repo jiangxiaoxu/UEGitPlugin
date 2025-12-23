@@ -546,12 +546,13 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 		if (AllExistingFiles.Num() > 0)
 		{
 			// reset and revert any changes already added to the index
-			InCommand.bCommandSuccessful &= GitSourceControlUtils::RunCommand(TEXT("reset"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), AllExistingFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
-			InCommand.bCommandSuccessful &= GitSourceControlUtils::RunCommand(TEXT("checkout"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), AllExistingFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+			/*InCommand.bCommandSuccessful &= GitSourceControlUtils::RunCommand(TEXT("reset"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), AllExistingFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+			InCommand.bCommandSuccessful &= GitSourceControlUtils::RunCommand(TEXT("checkout"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), AllExistingFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);*/
+
 		}
 		if (OtherThanAddedExistingFiles.Num() > 0)
 		{
-			// revert any changes in working copy (this would fails if the asset was in "Added" state, since after "reset" it is now "untracked")
+			/*// revert any changes in working copy (this would fails if the asset was in "Added" state, since after "reset" it is now "untracked")
 			// may need to try a few times due to file locks from prior operations
 			bool CheckoutSuccess = false;
 			int32 Attempts = 10;
@@ -565,8 +566,16 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 
 				FPlatformProcess::Sleep(0.1f);
 			}
-			
 			InCommand.bCommandSuccessful &= CheckoutSuccess;
+			*/
+
+			{
+				TArray<FString> Parameters;
+				Parameters.Add(TEXT("-SW"));
+
+				InCommand.bCommandSuccessful &= GitSourceControlUtils::RunCommand(TEXT("restore"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, Parameters, AllExistingFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+			}
+			
 		}
 	}
 
