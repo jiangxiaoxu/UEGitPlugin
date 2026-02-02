@@ -302,6 +302,9 @@ bool UpdateChangelistStateByCommand();
 */
 bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InParameter, const FString& InDumpFileName);
 
+// 拉取指定文件的 Git LFS 历史对象(更激进, 允许拉取旧版本)
+bool FetchLfsContentForFile(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InRelativeFile, TArray<FString>& OutErrorMessages);
+
 /**
  * Run a Git "log" command and parse it.
  *

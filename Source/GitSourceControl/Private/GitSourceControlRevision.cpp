@@ -7,12 +7,71 @@
 
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
+#include "Misc/App.h"
+#include "Misc/FileHelper.h"
+#include "Misc/MessageDialog.h"
 #include "Modules/ModuleManager.h"
 #include "GitSourceControlModule.h"
 #include "GitSourceControlUtils.h"
 #include "ISourceControlModule.h"
 
 #define LOCTEXT_NAMESPACE "GitSourceControl"
+
+static bool IsLfsPointerFile(const FString& InFilename)
+{
+	TArray<uint8> Data;
+	if (!FFileHelper::LoadFileToArray(Data, *InFilename))
+	{
+		return false;
+	}
+
+	const ANSICHAR* Signature = "version https://git-lfs.github.com/spec/v1";
+	const int32 SignatureLen = FCStringAnsi::Strlen(Signature);
+	if (Data.Num() < SignatureLen)
+	{
+		return false;
+	}
+
+	return FMemory::Memcmp(Data.GetData(), Signature, SignatureLen) == 0;
+}
+
+static bool IsValidUassetFile(const FString& InFilename)
+{
+	TArray<uint8> Data;
+	if (!FFileHelper::LoadFileToArray(Data, *InFilename))
+	{
+		return false;
+	}
+
+	if (Data.Num() < sizeof(uint32))
+	{
+		return false;
+	}
+
+	const uint32 Tag = *reinterpret_cast<const uint32*>(Data.GetData());
+	return Tag == PACKAGE_FILE_TAG || Tag == PACKAGE_FILE_TAG_SWAPPED;
+}
+
+static FString ReadFileHeaderHex(const FString& InFilename, int32 NumBytes = 16)
+{
+	TArray<uint8> Data;
+	if (!FFileHelper::LoadFileToArray(Data, *InFilename))
+	{
+		return TEXT("");
+	}
+
+	const int32 Count = FMath::Min(NumBytes, Data.Num());
+	FString Hex;
+	for (int32 Index = 0; Index < Count; ++Index)
+	{
+		Hex += FString::Printf(TEXT("%02X"), Data[Index]);
+		if (Index + 1 < Count)
+		{
+			Hex += TEXT(" ");
+		}
+	}
+	return Hex;
+}
 
 #if ENGINE_MAJOR_VERSION >= 5
 bool FGitSourceControlRevision::Get( FString& InOutFilename, EConcurrency::Type InConcurrency ) const
@@ -55,11 +114,87 @@ bool FGitSourceControlRevision::Get( FString& InOutFilename ) const
 	bool bCommandSuccessful;
 	if(FPaths::FileExists(InOutFilename))
 	{
-		bCommandSuccessful = true; // if the temp file already exists, reuse it directly
+		const bool bPointer = IsLfsPointerFile(InOutFilename);
+		const bool bValidUasset = IsValidUassetFile(InOutFilename);
+		if (!bPointer && bValidUasset)
+		{
+			bCommandSuccessful = true; // reuse only if the file looks valid
+		}
+		else
+		{
+			UE_LOG(LogSourceControl, Warning, TEXT("Diff temp file invalid, deleting. File='%s' Pointer=%d ValidUasset=%d Header='%s'"),
+				*InOutFilename, bPointer ? 1 : 0, bValidUasset ? 1 : 0, *ReadFileHeaderHex(InOutFilename));
+			IFileManager::Get().Delete(*InOutFilename);
+			bCommandSuccessful = false;
+		}
 	}
 	else
 	{
+		bCommandSuccessful = false;
+	}
+
+	if (!bCommandSuccessful)
+	{
+		UE_LOG(LogSourceControl, Log, TEXT("Diff export start. File='%s' Commit='%s' Path='%s'"),
+			*InOutFilename, *CommitId, *Filename);
 		bCommandSuccessful = GitSourceControlUtils::RunDumpToFile(PathToGitBinary, PathToRepositoryRoot, Parameter, InOutFilename);
+		if (bCommandSuccessful && IsLfsPointerFile(InOutFilename))
+		{
+			bCommandSuccessful = false;
+		}
+
+		if (!bCommandSuccessful)
+		{
+			UE_LOG(LogSourceControl, Warning, TEXT("Diff export failed or LFS pointer. File='%s' Header='%s'"),
+				*InOutFilename, *ReadFileHeaderHex(InOutFilename));
+			TArray<FString> LfsErrors;
+			const bool bLfsFetchOk = GitSourceControlUtils::FetchLfsContentForFile(PathToGitBinary, PathToRepositoryRoot, Filename, LfsErrors);
+			if (!bLfsFetchOk && !FApp::IsUnattended() && !IsRunningCommandlet())
+			{
+				const FText Title = LOCTEXT("GitLfsFetchFailedTitle", "Git LFS Fetch Failed");
+				const FText Message = FText::Format(
+					LOCTEXT("GitLfsFetchFailedMessage", "Failed to fetch Git LFS content for file:\n{0}\n\nPlease run 'git lfs fetch --all' or check your network."),
+					FText::FromString(Filename));
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+				FMessageDialog::Open(EAppMsgType::Ok, Message, Title);
+#else
+				FMessageDialog::Open(EAppMsgType::Ok, Message, &Title);
+#endif
+			}
+			if (bLfsFetchOk)
+			{
+				UE_LOG(LogSourceControl, Log, TEXT("Diff export retry after LFS fetch. File='%s'"), *InOutFilename);
+				bCommandSuccessful = GitSourceControlUtils::RunDumpToFile(PathToGitBinary, PathToRepositoryRoot, Parameter, InOutFilename);
+				if (bCommandSuccessful && IsLfsPointerFile(InOutFilename))
+				{
+					bCommandSuccessful = false;
+				}
+			}
+		}
+
+		if (bCommandSuccessful)
+		{
+			const bool bValidUasset = IsValidUassetFile(InOutFilename);
+			if (!bValidUasset)
+			{
+				UE_LOG(LogSourceControl, Error, TEXT("Diff export invalid uasset, keep for debug. File='%s' Header='%s'"),
+					*InOutFilename, *ReadFileHeaderHex(InOutFilename));
+				bCommandSuccessful = false;
+			}
+		}
+
+		if (!bCommandSuccessful && !FApp::IsUnattended() && !IsRunningCommandlet())
+		{
+			const FText Title = LOCTEXT("GitLfsDumpFailedTitle", "Git LFS Export Failed");
+			const FText Message = FText::Format(
+				LOCTEXT("GitLfsDumpFailedMessage", "Failed to export file revision for diff:\n{0}\n\nPlease run 'git lfs fetch --all' and try again. If the file is a Git LFS asset, ensure git-lfs is available in PATH."),
+				FText::FromString(Filename));
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+			FMessageDialog::Open(EAppMsgType::Ok, Message, Title);
+#else
+			FMessageDialog::Open(EAppMsgType::Ok, Message, &Title);
+#endif
+		}
 	}
 	return bCommandSuccessful;
 }

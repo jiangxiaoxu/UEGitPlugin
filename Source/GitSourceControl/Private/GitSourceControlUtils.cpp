@@ -42,6 +42,7 @@
 
 #include "Async/Async.h"
 #include "UObject/Linker.h"
+#include "Serialization/MemoryReader.h"
 
 #ifndef GIT_DEBUG_STATUS
 #define GIT_DEBUG_STATUS 0
@@ -53,6 +54,8 @@ namespace GitSourceControlConstants
 {
 /** The maximum number of files we submit in a single Git command */
 const int32 MaxFilesPerBatch = 50;
+/** Scan limit for locating PACKAGE_FILE_TAG in git stdout to avoid large false-positive searches */
+const int32 MaxUassetTagScanBytes = 16 * 1024;
 } // namespace GitSourceControlConstants
 
 FGitScopedTempFile::FGitScopedTempFile(const FText& InText)
@@ -839,7 +842,7 @@ bool RunCommand(const FString& InCommand, const FString& InPathToGitBinary, cons
 }
 
 #ifndef GIT_USE_CUSTOM_LFS
-#define GIT_USE_CUSTOM_LFS 1
+#define GIT_USE_CUSTOM_LFS 0
 #endif
 
 bool RunLFSCommand(const FString& InCommand, const FString& InRepositoryRoot, const FString& GitBinaryFallback, const TArray<FString>& InParameters, const TArray<FString>& InFiles,
@@ -1836,13 +1839,88 @@ void UpdateStateOnAssetRename(const FAssetData& InAssetData, const FString& InOl
 #endif
 }
 
+// Validate a candidate package header to reduce false positives when scanning stdout.
+static bool IsValidPackageSummary(const TArray<uint8>& Data, int32 Offset)
+{
+	if (Offset < 0 || Offset + static_cast<int32>(sizeof(FPackageFileSummary)) > Data.Num())
+	{
+		return false;
+	}
+
+	FMemoryReader Reader(Data, true);
+	Reader.Seek(Offset);
+	FPackageFileSummary Summary;
+	Reader << Summary;
+
+	const int64 DataSize = Data.Num() - Offset;
+	if (Summary.TotalHeaderSize <= 0 || Summary.TotalHeaderSize > DataSize)
+	{
+		return false;
+	}
+
+	auto IsOffsetValid = [DataSize](int32 InOffset, int32 InCount) -> bool
+	{
+		if (InOffset < 0 || InCount < 0)
+		{
+			return false;
+		}
+		if (InOffset == 0 && InCount == 0)
+		{
+			return true;
+		}
+		return InOffset < DataSize;
+	};
+
+	if (!IsOffsetValid(Summary.NameOffset, Summary.NameCount))
+	{
+		return false;
+	}
+	if (!IsOffsetValid(Summary.ExportOffset, Summary.ExportCount))
+	{
+		return false;
+	}
+	if (!IsOffsetValid(Summary.ImportOffset, Summary.ImportCount))
+	{
+		return false;
+	}
+	return true;
+}
+
+// Locate PACKAGE_FILE_TAG/ PACKAGE_FILE_TAG_SWAPPED and trim to the binary start.
+static bool TrimToPackageHeader(TArray<uint8>& InOutData, FString& OutTrimmedText)
+{
+	constexpr int32 MaxScanBytes = GitSourceControlConstants::MaxUassetTagScanBytes;
+	constexpr uint32 PackageTag = PACKAGE_FILE_TAG;
+	constexpr uint32 PackageTagSwapped = PACKAGE_FILE_TAG_SWAPPED;
+	const int32 ScanLimit = FMath::Min(MaxScanBytes, InOutData.Num());
+	const int32 MaxOffset = ScanLimit - static_cast<int32>(sizeof(uint32));
+	for (int32 Offset = 0; Offset <= MaxOffset; ++Offset)
+	{
+		uint32 TagCandidate = 0;
+		FMemory::Memcpy(&TagCandidate, InOutData.GetData() + Offset, sizeof(uint32));
+		if (TagCandidate == PackageTag || TagCandidate == PackageTagSwapped)
+		{
+			if (!IsValidPackageSummary(InOutData, Offset))
+			{
+				continue;
+			}
+			if (Offset > 0)
+			{
+				const ANSICHAR* Raw = reinterpret_cast<const ANSICHAR*>(InOutData.GetData());
+				OutTrimmedText = FString(ANSI_TO_TCHAR(Raw)).Left(Offset).TrimStartAndEnd();
+				InOutData.RemoveAt(0, Offset, EAllowShrinking::No);
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
 // Run a Git `cat-file --filters` command to dump the binary content of a revision into a file.
 bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InParameter, const FString& InDumpFileName)
 {
 	int32 ReturnCode = -1;
 	FString FullCommand;
-
-	FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
 
 	if (!InRepositoryRoot.IsEmpty())
 	{
@@ -1853,10 +1931,8 @@ bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepository
 	}
 
 	// then the git command itself
-	// Newer versions (2.9.3.windows.2) support smudge/clean filters used by Git LFS, git-fat, git-annex, etc
+	// Newer versions support smudge/clean filters used by Git LFS, git-fat, git-annex, etc
 	FullCommand += TEXT("cat-file --filters ");
-
-	// Append to the command the parameter
 	FullCommand += TEXT("\"") + InParameter + TEXT("\"");
 
 	const bool bLaunchDetached = false;
@@ -1870,30 +1946,30 @@ bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepository
 
 	UE_LOG(LogSourceControl, Log, TEXT("RunDumpToFile: 'git %s'"), *FullCommand);
 
-    FString PathToGitOrEnvBinary = InPathToGitBinary;
-    #if PLATFORM_MAC
-        // The Cocoa application does not inherit shell environment variables, so add the path expected to have git-lfs to PATH
-        FString PathEnv = FPlatformMisc::GetEnvironmentVariable(TEXT("PATH"));
-        FString GitInstallPath = FPaths::GetPath(InPathToGitBinary);
+	FString PathToGitOrEnvBinary = InPathToGitBinary;
+	#if PLATFORM_MAC
+		// The Cocoa application does not inherit shell environment variables, so add the path expected to have git-lfs to PATH
+		FString PathEnv = FPlatformMisc::GetEnvironmentVariable(TEXT("PATH"));
+		FString GitInstallPath = FPaths::GetPath(InPathToGitBinary);
 
-        TArray<FString> PathArray;
-        PathEnv.ParseIntoArray(PathArray, FPlatformMisc::GetPathVarDelimiter());
-        bool bHasGitInstallPath = false;
-        for (auto Path : PathArray)
-        {
-            if (GitInstallPath.Equals(Path, ESearchCase::CaseSensitive))
-            {
-                bHasGitInstallPath = true;
-                break;
-            }
-        }
+		TArray<FString> PathArray;
+		PathEnv.ParseIntoArray(PathArray, FPlatformMisc::GetPathVarDelimiter());
+		bool bHasGitInstallPath = false;
+		for (auto Path : PathArray)
+		{
+			if (GitInstallPath.Equals(Path, ESearchCase::CaseSensitive))
+			{
+				bHasGitInstallPath = true;
+				break;
+			}
+		}
 
-        if (!bHasGitInstallPath)
-        {
-            PathToGitOrEnvBinary = FString("/usr/bin/env");
-            FullCommand = FString::Printf(TEXT("PATH=\"%s%s%s\" \"%s\" %s"), *GitInstallPath, FPlatformMisc::GetPathVarDelimiter(), *PathEnv, *InPathToGitBinary, *FullCommand);
-        }
-    #endif
+		if (!bHasGitInstallPath)
+		{
+			PathToGitOrEnvBinary = FString("/usr/bin/env");
+			FullCommand = FString::Printf(TEXT("PATH=\"%s%s%s\" \"%s\" %s"), *GitInstallPath, FPlatformMisc::GetPathVarDelimiter(), *PathEnv, *InPathToGitBinary, *FullCommand);
+		}
+	#endif
 
 #if ENGINE_MAJOR_VERSION == 5 && 0
 	FProcHandle ProcessHandle = FPlatformProcess::CreateProc(*PathToGitOrEnvBinary, *FullCommand, bLaunchDetached, bLaunchHidden, bLaunchReallyHidden, nullptr, 0, *InRepositoryRoot, PipeWrite, nullptr, nullptr);
@@ -1905,6 +1981,7 @@ bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepository
 		FPlatformProcess::Sleep(0.01f);
 
 		TArray<uint8> BinaryFileContent;
+
 		bool bShouldContinue = true;
 		while (FPlatformProcess::IsProcRunning(ProcessHandle) || bShouldContinue)
 		{
@@ -1912,18 +1989,37 @@ bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepository
 			bShouldContinue = FPlatformProcess::ReadPipeToArray(PipeRead, BinaryData);
 			if (BinaryData.Num() > 0)
 			{
-				// @todo: this is hacky!
-				bool bIsLFSMessage = BinaryData[0] == 68 // Check for D in "Downloading"
-									&& BinaryData.Last() == 10; // Check for new line
-				if (GitSourceControl.AccessSettings().IsUsingGitLfsLocking() && bIsLFSMessage)
-				{
-					continue;
-				}
 				BinaryFileContent.Append(MoveTemp(BinaryData));
 			}
 		}
 
 		FPlatformProcess::GetProcReturnCode(ProcessHandle, &ReturnCode);
+		if (ReturnCode == 0)
+		{
+			FString TrimmedText;
+			const bool bFoundPackageTag = TrimToPackageHeader(BinaryFileContent, TrimmedText);
+			if (!bFoundPackageTag)
+			{
+				UE_LOG(LogSourceControl, Error, TEXT("DumpToFile: Package tag not found in first %d bytes for %s"),
+					GitSourceControlConstants::MaxUassetTagScanBytes, *InDumpFileName);
+				ReturnCode = -1;
+			}
+			if (!TrimmedText.IsEmpty())
+			{
+				UE_LOG(LogSourceControl, Log, TEXT("DumpToFile: Trimmed leading text: %s"), *TrimmedText);
+			}
+			uint32 PackageTag = 0;
+			if (BinaryFileContent.Num() >= 4)
+			{
+				FMemory::Memcpy(&PackageTag, BinaryFileContent.GetData(), sizeof(uint32));
+			}
+			const bool bHasValidHeader = PackageTag == PACKAGE_FILE_TAG || PackageTag == PACKAGE_FILE_TAG_SWAPPED;
+			if (!bHasValidHeader)
+			{
+				UE_LOG(LogSourceControl, Error, TEXT("DumpToFile: Invalid uasset header for %s"), *InDumpFileName);
+				ReturnCode = -1;
+			}
+		}
 		if (ReturnCode == 0)
 		{
 			// Save buffer into temp file
@@ -1952,6 +2048,35 @@ bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepository
 	FPlatformProcess::ClosePipe(PipeRead, PipeWrite);
 
 	return (ReturnCode == 0);
+}
+
+bool FetchLfsContentForFile(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InRelativeFile, TArray<FString>& OutErrorMessages)
+{
+	if (InPathToGitBinary.IsEmpty() || InRepositoryRoot.IsEmpty() || InRelativeFile.IsEmpty())
+	{
+		return false;
+	}
+
+	FString NormalizedFile = InRelativeFile;
+	FPaths::NormalizeFilename(NormalizedFile);
+
+	static FCriticalSection LfsFetchCacheGuard;
+	static TSet<FString> LfsFetchAttemptedFiles;
+	{
+		FScopeLock Lock(&LfsFetchCacheGuard);
+		if (LfsFetchAttemptedFiles.Contains(NormalizedFile))
+		{
+			return true;
+		}
+		LfsFetchAttemptedFiles.Add(NormalizedFile);
+	}
+
+	TArray<FString> Parameters;
+	Parameters.Add(FString::Printf(TEXT("--include=%s"), *NormalizedFile));
+	Parameters.Add(TEXT("--all"));
+
+	TArray<FString> Results;
+	return RunLFSCommand(TEXT("fetch"), InRepositoryRoot, InPathToGitBinary, Parameters, FGitSourceControlModule::GetEmptyStringArray(), Results, OutErrorMessages);
 }
 
 /**
@@ -1998,6 +2123,44 @@ static FString LogStatusToString(TCHAR InStatus)
 	}
 
 	return FString();
+}
+
+static bool TryGetLfsPointerSize(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InBlobHash, int64& OutSize)
+{
+	TArray<FString> Results;
+	TArray<FString> Errors;
+	TArray<FString> Parameters;
+	Parameters.Add(TEXT("-p"));
+	Parameters.Add(InBlobHash);
+
+	const bool bResult = RunCommand(TEXT("cat-file"), InPathToGitBinary, InRepositoryRoot, Parameters, FGitSourceControlModule::GetEmptyStringArray(), Results, Errors);
+	if (!bResult)
+	{
+		return false;
+	}
+
+	bool bHasHeader = false;
+	int64 ParsedSize = 0;
+	for (const FString& Line : Results)
+	{
+		if (Line.StartsWith(TEXT("version https://git-lfs.github.com/spec/v1")))
+		{
+			bHasHeader = true;
+		}
+		else if (Line.StartsWith(TEXT("size ")))
+		{
+			const FString SizeString = Line.RightChop(5);
+			ParsedSize = FCString::Atoi64(*SizeString);
+		}
+	}
+
+	if (bHasHeader && ParsedSize > 0)
+	{
+		OutSize = ParsedSize;
+		return true;
+	}
+
+	return false;
 }
 
 /**
@@ -2171,6 +2334,12 @@ bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepository
 			FGitLsTreeParser LsTree(Results);
 			Revision->FileHash = LsTree.FileHash;
 			Revision->FileSize = LsTree.FileSize;
+
+			int64 LfsSize = 0;
+			if (TryGetLfsPointerSize(InPathToGitBinary, InRepositoryRoot, Revision->FileHash, LfsSize))
+			{
+				Revision->FileSize = static_cast<int32>(FMath::Clamp<int64>(LfsSize, 0, MAX_int32));
+			}
 		}
 		Revision->PathToRepoRoot = InRepositoryRoot;
 	}
