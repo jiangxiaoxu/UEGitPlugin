@@ -15,10 +15,12 @@ public class GitSourceControl : ModuleRules
 			new string[] {
 				"Core",
 				"CoreUObject",
+				"Engine",
 				"Slate",
 				"SlateCore",
 				"InputCore",
 				"DesktopWidgets",
+				"DirectoryWatcher",
 				"EditorStyle",
 				"UnrealEd",
 				"SourceControl",
@@ -30,20 +32,6 @@ public class GitSourceControl : ModuleRules
 		if (Target.Version.MajorVersion == 5)
 		{
 			PrivateDependencyModuleNames.Add("ToolMenus");
-		}
-
-		if (Target.Platform == UnrealTargetPlatform.Win64)
-		{
-			RuntimeDependencies.Add("$(PluginDir)/git-lfs.exe");
-		}
-		else if (Target.Platform == UnrealTargetPlatform.Mac)
-		{
-			RuntimeDependencies.Add("$(PluginDir)/git-lfs-mac-amd64");
-			RuntimeDependencies.Add("$(PluginDir)/git-lfs-mac-arm64");			
-		}
-		else if (Target.Platform == UnrealTargetPlatform.Linux)
-		{
-			RuntimeDependencies.Add("$(PluginDir)/git-lfs");
 		}
 	}
 }

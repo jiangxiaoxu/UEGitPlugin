@@ -8,42 +8,118 @@
 #include "GitMessageLog.h"
 #include "GitSourceControlState.h"
 #include "Misc/Paths.h"
+#include "HAL/FileManager.h"
 #include "Misc/QueuedThreadPool.h"
 #include "GitSourceControlCommand.h"
 #include "ISourceControlModule.h"
 #include "GitSourceControlModule.h"
 #include "GitSourceControlUtils.h"
 #include "SGitSourceControlSettings.h"
-#include "GitSourceControlRunner.h"
-#include "GitSourceControlChangelistState.h"
+#include "DirectoryWatcherModule.h"
+#include "IDirectoryWatcher.h"
 #include "Logging/MessageLog.h"
 #include "ScopedSourceControlProgress.h"
 #include "SourceControlHelpers.h"
 #include "SourceControlOperations.h"
-#include "AssetRegistry/AssetRegistryModule.h"
-#include "Async/Async.h"
-#include "GenericPlatform/GenericPlatformFile.h"
-#include "HAL/FileManager.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/App.h"
-#include "Misc/EngineVersion.h"
 #include "Misc/MessageDialog.h"
 
 #include "Runtime/Launch/Resources/Version.h"
-#if ENGINE_MAJOR_VERSION == 5
-#include "UObject/ObjectSaveContext.h"
-#endif
-
-#include "UObject/Package.h"
 
 #define LOCTEXT_NAMESPACE "GitSourceControl"
 
-static FName ProviderName("Git LFS 2");
+static FName ProviderName("Git");
+
+namespace GitSourceControlProviderPrivate
+{
+FString NormalizeCacheFilename(const FString& Filename)
+{
+	FString Result = FPaths::ConvertRelativePathToFull(Filename);
+	FPaths::CollapseRelativeDirectories(Result);
+	FPaths::NormalizeFilename(Result);
+#if PLATFORM_WINDOWS
+	Result.ToLowerInline();
+#endif
+	return Result;
+}
+
+FString NormalizeDisplayFilename(const FString& Filename)
+{
+	FString Result = FPaths::ConvertRelativePathToFull(Filename);
+	FPaths::CollapseRelativeDirectories(Result);
+	FPaths::NormalizeFilename(Result);
+
+	// Preserve the actual on-disk spelling where the path exists. Cache keys stay
+	// case-insensitive on Windows, but SourceControl revisions must retain the
+	// spelling UE and Git use when opening the asset.
+	if (FPaths::FileExists(Result) || FPaths::DirectoryExists(Result))
+	{
+		const FString OnDiskFilename = IFileManager::Get().GetFilenameOnDisk(*Result);
+		if (!OnDiskFilename.IsEmpty())
+		{
+			Result = OnDiskFilename;
+			FPaths::NormalizeFilename(Result);
+		}
+	}
+
+	return Result;
+}
+
+FString ResolveNearestRepositoryRoot(const FString& Filename, const FString& FallbackRepositoryRoot)
+{
+	const FString CanonicalFallbackRoot = NormalizeCacheFilename(FallbackRepositoryRoot);
+	FString Candidate = FPaths::GetPath(NormalizeCacheFilename(Filename));
+	while (!Candidate.IsEmpty() && (Candidate == CanonicalFallbackRoot || FPaths::IsUnderDirectory(Candidate, CanonicalFallbackRoot)))
+	{
+		const FString GitPath = FPaths::Combine(Candidate, TEXT(".git"));
+		if (FPaths::FileExists(GitPath) || FPaths::DirectoryExists(GitPath))
+		{
+			return Candidate;
+		}
+		if (Candidate == CanonicalFallbackRoot)
+		{
+			break;
+		}
+		Candidate = FPaths::GetPath(Candidate);
+	}
+	return FString();
+}
+
+TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> CloneUpdateStatusOperation(const FUpdateStatus& SourceOperation)
+{
+	const TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> Operation = ISourceControlOperation::Create<FUpdateStatus>();
+	Operation->SetUpdateHistory(SourceOperation.ShouldUpdateHistory());
+	Operation->SetGetOpenedOnly(SourceOperation.ShouldGetOpenedOnly());
+	Operation->SetUpdateModifiedState(SourceOperation.ShouldUpdateModifiedState());
+	Operation->SetUpdateModifiedStateToLocalRevision(SourceOperation.ShouldUpdateModifiedStateToLocalRevision());
+	Operation->SetCheckingAllFiles(SourceOperation.ShouldCheckAllFiles());
+	Operation->SetQuiet(SourceOperation.ShouldBeQuiet());
+	Operation->SetForceUpdate(SourceOperation.ShouldForceUpdate());
+	return Operation;
+}
+
+struct FUpdateStatusBatch
+{
+	FUpdateStatusBatch(const FSourceControlOperationRef& InOperation, const FSourceControlOperationComplete& InCompletionDelegate, const int32 InRemaining)
+		: Operation(InOperation)
+		, CompletionDelegate(InCompletionDelegate)
+		, Remaining(InRemaining)
+	{
+	}
+
+	FSourceControlOperationRef Operation;
+	FSourceControlOperationComplete CompletionDelegate;
+	int32 Remaining;
+	ECommandResult::Type Result = ECommandResult::Succeeded;
+};
+}
 
 void FGitSourceControlProvider::Init(bool bForceConnection)
 {
-	// Init() is called multiple times at startup: do not check git each time
-	if(!bGitAvailable)
+	(void)bForceConnection;
+	// Editor 启动期间可能重复调用 Init().
+	if (!bGitAvailable)
 	{
 		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("GitSourceControl"));
 		if(Plugin.IsValid())
@@ -53,32 +129,13 @@ void FGitSourceControlProvider::Init(bool bForceConnection)
 
 		CheckGitAvailability();
 	}
-
-#if ENGINE_MAJOR_VERSION == 5
-	UPackage::PackageSavedWithContextEvent.AddStatic(&GitSourceControlUtils::UpdateFileStagingOnSaved);
-#endif
-	
-	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
-	AssetRegistryModule.Get().OnAssetRenamed().AddStatic(&GitSourceControlUtils::UpdateStateOnAssetRename);	
-
-	// bForceConnection: not used anymore
 }
 
 void FGitSourceControlProvider::CheckGitAvailability()
 {
-	FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
-	PathToGitBinary = GitSourceControl.AccessSettings().GetBinaryPath();
-	if(PathToGitBinary.IsEmpty())
-	{
-		// Try to find Git binary, and update settings accordingly
-		PathToGitBinary = GitSourceControlUtils::FindGitBinaryPath();
-		if(!PathToGitBinary.IsEmpty())
-		{
-			GitSourceControl.AccessSettings().SetBinaryPath(PathToGitBinary);
-		}
-	}
+	PathToGitBinary = GitSourceControlUtils::FindGitBinaryPath();
 
-	if(!PathToGitBinary.IsEmpty())
+	if (!PathToGitBinary.IsEmpty() && GitSourceControlUtils::CheckGitAvailability(PathToGitBinary, &GitVersion))
 	{
 		UE_LOG(LogSourceControl, Log, TEXT("Using '%s'"), *PathToGitBinary);
 		bGitAvailable = true;
@@ -86,147 +143,338 @@ void FGitSourceControlProvider::CheckGitAvailability()
 	}
 	else
 	{
+		UnregisterDirectoryWatchers();
 		bGitAvailable = false;
+		bGitRepositoryFound = false;
+		PathToGitRoot.Reset();
+		PathToRepositoryRoot.Reset();
+		GitVersion = FGitVersion();
 	}
-}
-
-void FGitSourceControlProvider::UpdateSettings()
-{
-	const FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
-	bUsingGitLfsLocking = GitSourceControl.AccessSettings().IsUsingGitLfsLocking();
-	LockUser = GitSourceControl.AccessSettings().GetLfsUserName();
 }
 
 void FGitSourceControlProvider::CheckRepositoryStatus()
 {
-	GitSourceControlMenu.Register();
+	UnregisterDirectoryWatchers();
+	bGitRepositoryFound = false;
+	PathToGitRoot.Reset();
+	PathToRepositoryRoot.Reset();
 
-	// Make sure our settings our up to date
-	UpdateSettings();
+	if (!bGitAvailable)
+	{
+		return;
+	}
 
-	// Find the path to the root Git directory (if any, else uses the ProjectDir)
+	// 查找包含当前项目的 Git root, 不访问 remote.
 	const FString PathToProjectDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
-	PathToRepositoryRoot = PathToProjectDir;
 	if (!GitSourceControlUtils::FindRootDirectory(PathToProjectDir, PathToGitRoot))
 	{
-		UE_LOG(LogSourceControl, Error, TEXT("Failed to find valid Git root directory."));
-		bGitRepositoryFound = false;
+		UE_LOG(LogSourceControl, Log, TEXT("No Git repository contains '%s'."), *PathToProjectDir);
 		return;
 	}
 	PathToRepositoryRoot = PathToGitRoot;
 
-	if (!GitSourceControlUtils::CheckGitAvailability(PathToGitBinary, &GitVersion))
+	FString CapabilityError;
+	if (!GitSourceControlUtils::CheckLocalGitCapabilities(PathToGitBinary, PathToRepositoryRoot, CapabilityError))
 	{
-		UE_LOG(LogSourceControl, Error, TEXT("Failed to find valid Git executable."));
-		bGitRepositoryFound = false;
+		UE_LOG(LogSourceControl, Error, TEXT("Git is missing required local status capability: %s"), *CapabilityError);
+		PathToGitRoot.Reset();
+		PathToRepositoryRoot.Reset();
 		return;
 	}
 
-	TUniqueFunction<void()> InitFunc = [this]()
+	bGitRepositoryFound = true;
+	RegisterDirectoryWatchers();
+}
+
+void FGitSourceControlProvider::RegisterDirectoryWatchers()
+{
+	RegisterDirectoryWatchesForRoot(PathToGitRoot, true);
+}
+
+void FGitSourceControlProvider::RegisterDirectoryWatchesForRoot(const FString& RepositoryRoot, const bool bWatchProjectManagedPaths)
+{
+	if (FApp::IsUnattended() || IsRunningCommandlet())
 	{
-		if (!IsInGameThread())
+		return;
+	}
+
+	const FString CanonicalRepositoryRoot = GitSourceControlProviderPrivate::NormalizeCacheFilename(RepositoryRoot);
+	if (CanonicalRepositoryRoot.IsEmpty() || DirectoryWatches.ContainsByPredicate([&CanonicalRepositoryRoot](const FDirectoryWatch& Watch)
+	{
+		return Watch.RepositoryRoot == CanonicalRepositoryRoot;
+	}))
+	{
+		return;
+	}
+
+	FDirectoryWatcherModule& DirectoryWatcherModule = FModuleManager::LoadModuleChecked<FDirectoryWatcherModule>(TEXT("DirectoryWatcher"));
+	IDirectoryWatcher* DirectoryWatcher = DirectoryWatcherModule.Get();
+	if (DirectoryWatcher == nullptr)
+	{
+		return;
+	}
+
+	auto RegisterWatch = [this, DirectoryWatcher, &CanonicalRepositoryRoot](const FString& Directory, const bool bRepositoryMetadata, const uint32 WatchOptions)
+	{
+		const FString CanonicalDirectory = GitSourceControlProviderPrivate::NormalizeCacheFilename(Directory);
+		if (!FPaths::DirectoryExists(CanonicalDirectory))
 		{
-			// Wait until the module interface is valid
-			do
-			{
-				if (FModuleManager::Get().IsModuleLoaded("GitSourceControl"))
-				{
-					break;
-				}
-				FPlatformProcess::Sleep(0.01f);
-			} while (true);
+			return;
 		}
 
-		// Get user name & email (of the repository, else from the global Git config)
-		GitSourceControlUtils::GetUserConfig(PathToGitBinary, PathToRepositoryRoot, UserName, UserEmail);
-		
-		TMap<FString, FGitSourceControlState> States;
-		auto ConditionalRepoInit = [this, &States]()
+		FDelegateHandle Handle;
+		if (DirectoryWatcher->RegisterDirectoryChangedCallback_Handle(
+			CanonicalDirectory,
+			IDirectoryWatcher::FDirectoryChanged::CreateLambda([this, RepositoryRoot = CanonicalRepositoryRoot, bRepositoryMetadata](const TArray<FFileChangeData>& FileChanges)
+			{
+				OnDirectoryChanged(FileChanges, RepositoryRoot, bRepositoryMetadata);
+			}),
+			Handle,
+			WatchOptions))
 		{
-			if (!GitSourceControlUtils::GetBranchName(PathToGitBinary, PathToRepositoryRoot, BranchName))
-			{
-				return false;
-			}
-			GitSourceControlUtils::GetRemoteBranchName(PathToGitBinary, PathToRepositoryRoot, RemoteBranchName);
-			GitSourceControlUtils::GetRemoteUrl(PathToGitBinary, PathToRepositoryRoot, RemoteUrl);
-			const TArray<FString> Files{TEXT("*.uasset"), TEXT("*.umap")};
-			TArray<FString> LockableErrorMessages;
-			if (!GitSourceControlUtils::CheckLFSLockable(PathToGitBinary, PathToRepositoryRoot, Files, LockableErrorMessages))
-			{
-				for (const auto &ErrorMessage : LockableErrorMessages)
-				{
-					UE_LOG(LogSourceControl, Error, TEXT("%s"), *ErrorMessage);
-				}
-			}
-			else if (bUsingGitLfsLocking)
-			{
-				if (!GitSourceControlUtils::IsFileLFSLockable(".umap")
-					|| !GitSourceControlUtils::IsFileLFSLockable(".uasset"))
-				{
-					UE_LOG(LogSourceControl, Error, TEXT("Git LFS Locking is disabled. Files .uasset or .umap are not lockable. Make sure your .gitattributes is setting lockable attributes for .uasset or .umap at the root of the git repository."));
-					bUsingGitLfsLocking = false;
-				}
-				else
-				{
-					UE_LOG(LogSourceControl, Log, TEXT("Git LFS Locking is enabled."));
-				}
-			}
-
-			const TArray<FString> ProjectDirs = GitSourceControlUtils::GetSourceControlledAssetPaths();
-
-			TArray<FString> StatusErrorMessages;
-			if (!GitSourceControlUtils::RunUpdateStatus(PathToGitBinary, PathToRepositoryRoot, bUsingGitLfsLocking, ProjectDirs, StatusErrorMessages, States))
-			{
-				return false;
-			}
-			return true;
-		};
-		if (ConditionalRepoInit())
-		{
-			TUniqueFunction<void()> SuccessFunc = [States, this]()
-			{
-				TMap<const FString, FGitState> Results;
-				if (GitSourceControlUtils::CollectNewStates(States, Results))
-				{
-					GitSourceControlUtils::UpdateCachedStates(Results);
-				}
-				Runner = new FGitSourceControlRunner();
-				bGitRepositoryFound = true;
-			};
-			if (FApp::IsUnattended() || IsRunningCommandlet())
-			{
-				SuccessFunc();
-			}
-			else
-			{
-				AsyncTask(ENamedThreads::GameThread, MoveTemp(SuccessFunc));
-			}
-		}
-		else
-		{
-			TUniqueFunction<void()> ErrorFunc = [States, this]()
-			{
-				UE_LOG(LogSourceControl, Error, TEXT("Failed to update repo on initialization."));
-				bGitRepositoryFound = false;
-			};
-			if (FApp::IsUnattended() || IsRunningCommandlet())
-			{
-				ErrorFunc();
-			}
-			else
-			{
-				AsyncTask(ENamedThreads::GameThread, MoveTemp(ErrorFunc));
-			}
+			FDirectoryWatch& Watch = DirectoryWatches.AddDefaulted_GetRef();
+			Watch.Directory = CanonicalDirectory;
+			Watch.RepositoryRoot = CanonicalRepositoryRoot;
+			Watch.Handle = Handle;
 		}
 	};
 
-	if (FApp::IsUnattended() || IsRunningCommandlet())
+	RegisterWatch(CanonicalRepositoryRoot, false, bWatchProjectManagedPaths
+		? IDirectoryWatcher::WatchOptions::IncludeDirectoryChanges | IDirectoryWatcher::WatchOptions::IgnoreChangesInSubtree
+		: IDirectoryWatcher::WatchOptions::IncludeDirectoryChanges);
+	if (bWatchProjectManagedPaths)
 	{
-		InitFunc();
+		RegisterWatch(FPaths::ProjectContentDir(), false, IDirectoryWatcher::WatchOptions::IncludeDirectoryChanges);
+		RegisterWatch(FPaths::ProjectConfigDir(), false, IDirectoryWatcher::WatchOptions::IncludeDirectoryChanges);
+		RegisterWatch(FPaths::ProjectPluginsDir(), false, IDirectoryWatcher::WatchOptions::IncludeDirectoryChanges);
 	}
-	else
+
+	TArray<FString> GitMetadataPaths;
+	TArray<FString> Results;
+	TArray<FString> Errors;
+	if (GitSourceControlUtils::RunCommand(
+		TEXT("rev-parse"),
+		PathToGitBinary,
+		CanonicalRepositoryRoot,
+		{ TEXT("--git-dir"), TEXT("--git-common-dir") },
+		FGitSourceControlModule::GetEmptyStringArray(),
+		Results,
+		Errors))
 	{
-		AsyncTask(ENamedThreads::AnyHiPriThreadNormalTask, MoveTemp(InitFunc));
+		for (FString GitMetadataPath : Results)
+		{
+			if (FPaths::IsRelative(GitMetadataPath))
+			{
+				GitMetadataPath = FPaths::Combine(CanonicalRepositoryRoot, GitMetadataPath);
+			}
+			GitMetadataPaths.AddUnique(MoveTemp(GitMetadataPath));
+		}
+	}
+
+	for (const FString& GitMetadataPath : GitMetadataPaths)
+	{
+		RegisterWatch(GitMetadataPath, true, IDirectoryWatcher::WatchOptions::IncludeDirectoryChanges);
+	}
+}
+
+void FGitSourceControlProvider::UnregisterDirectoryWatchers()
+{
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("DirectoryWatcher")))
+	{
+		FDirectoryWatcherModule& DirectoryWatcherModule = FModuleManager::GetModuleChecked<FDirectoryWatcherModule>(TEXT("DirectoryWatcher"));
+		if (IDirectoryWatcher* DirectoryWatcher = DirectoryWatcherModule.Get())
+		{
+			for (const FDirectoryWatch& Watch : DirectoryWatches)
+			{
+				DirectoryWatcher->UnregisterDirectoryChangedCallback_Handle(Watch.Directory, Watch.Handle);
+			}
+		}
+	}
+
+	DirectoryWatches.Empty();
+	PendingChangedPathsByRepository.Empty();
+	PendingRepositoryMetadataInvalidations.Empty();
+	PendingStatusRefreshesByRepository.Empty();
+	PendingWatchInvalidationTime = 0.0;
+}
+
+void FGitSourceControlProvider::OnDirectoryChanged(const TArray<FFileChangeData>& FileChanges, const FString& RepositoryRoot, const bool bRepositoryMetadata)
+{
+	const FString CanonicalRepositoryRoot = GitSourceControlProviderPrivate::NormalizeCacheFilename(RepositoryRoot);
+	for (const FFileChangeData& FileChange : FileChanges)
+	{
+		if (FileChange.Action == FFileChangeData::FCA_RescanRequired || FileChange.Filename.IsEmpty())
+		{
+			PendingRepositoryMetadataInvalidations.Add(CanonicalRepositoryRoot);
+			continue;
+		}
+
+		const FString Filename = GitSourceControlProviderPrivate::NormalizeCacheFilename(FileChange.Filename);
+		const FString CleanFilename = FPaths::GetCleanFilename(Filename);
+		if (CleanFilename.StartsWith(TEXT(".git-source-control-txn-"), ESearchCase::IgnoreCase)
+			|| CleanFilename.StartsWith(TEXT(".uegit-backup-"), ESearchCase::IgnoreCase)
+			|| CleanFilename.StartsWith(TEXT(".uegit-restore-"), ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+		if (bRepositoryMetadata)
+		{
+			PendingRepositoryMetadataInvalidations.Add(CanonicalRepositoryRoot);
+			continue;
+		}
+		if (Filename == GitSourceControlProviderPrivate::NormalizeCacheFilename(FPaths::Combine(CanonicalRepositoryRoot, TEXT(".git")))
+			|| FPaths::DirectoryExists(Filename) || FPaths::GetExtension(Filename).IsEmpty())
+		{
+			PendingRepositoryMetadataInvalidations.Add(CanonicalRepositoryRoot);
+			continue;
+		}
+
+		FString EventRepositoryRoot = CanonicalRepositoryRoot;
+		for (const FDirectoryWatch& Watch : DirectoryWatches)
+		{
+			if (Watch.RepositoryRoot.Len() > EventRepositoryRoot.Len() && FPaths::IsUnderDirectory(Filename, Watch.RepositoryRoot))
+			{
+				EventRepositoryRoot = Watch.RepositoryRoot;
+			}
+		}
+		PendingChangedPathsByRepository.FindOrAdd(EventRepositoryRoot).Add(Filename);
+	}
+
+	for (TPair<FString, TSet<FString>>& Pair : PendingChangedPathsByRepository)
+	{
+		if (Pair.Value.Num() > 128)
+		{
+			PendingRepositoryMetadataInvalidations.Add(Pair.Key);
+			Pair.Value.Empty();
+		}
+	}
+	PendingWatchInvalidationTime = FPlatformTime::Seconds() + 0.25;
+}
+
+bool FGitSourceControlProvider::ApplyPendingDirectoryChanges()
+{
+	if (PendingWatchInvalidationTime == 0.0 || FPlatformTime::Seconds() < PendingWatchInvalidationTime)
+	{
+		return false;
+	}
+
+	TMap<FString, TSet<FString>> ChangedPathsByRepository = MoveTemp(PendingChangedPathsByRepository);
+	TSet<FString> MetadataInvalidations = MoveTemp(PendingRepositoryMetadataInvalidations);
+	PendingWatchInvalidationTime = 0.0;
+
+	bool bInvalidatedCache = false;
+	for (const FString& RepositoryRoot : MetadataInvalidations)
+	{
+		GitSourceControlUtils::InvalidateRepository(RepositoryRoot);
+		bInvalidatedCache = true;
+	}
+
+	if (bInvalidatedCache)
+	{
+		FScopeLock Lock(&StateCacheCriticalSection);
+		TArray<FString> CacheKeysToRemove;
+		for (const TPair<FString, TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe>>& Pair : StateCache)
+		{
+			const FString StateRepositoryRoot = GitSourceControlProviderPrivate::ResolveNearestRepositoryRoot(Pair.Key, PathToRepositoryRoot);
+			if (MetadataInvalidations.Contains(StateRepositoryRoot))
+			{
+				CacheKeysToRemove.Add(Pair.Key);
+			}
+		}
+		for (const FString& CacheKey : CacheKeysToRemove)
+		{
+			StateCache.Remove(CacheKey);
+		}
+	}
+
+	for (const TPair<FString, TSet<FString>>& Pair : ChangedPathsByRepository)
+	{
+		if (MetadataInvalidations.Contains(Pair.Key) || Pair.Value.IsEmpty())
+		{
+			continue;
+		}
+
+		TMap<FString, TArray<FString>> FilesByRepository;
+		for (const FString& Filename : Pair.Value)
+		{
+			const FString RepositoryRoot = GitSourceControlProviderPrivate::ResolveNearestRepositoryRoot(Filename, Pair.Key);
+			if (!RepositoryRoot.IsEmpty())
+			{
+				FilesByRepository.FindOrAdd(RepositoryRoot).Add(Filename);
+			}
+		}
+
+		for (const TPair<FString, TArray<FString>>& RepositoryFiles : FilesByRepository)
+		{
+			RegisterDirectoryWatchesForRoot(RepositoryFiles.Key, RepositoryFiles.Key == GitSourceControlProviderPrivate::NormalizeCacheFilename(PathToGitRoot));
+			GitSourceControlUtils::InvalidateRepository(RepositoryFiles.Key);
+			QueueStatusRefresh(RepositoryFiles.Value);
+		}
+	}
+	return bInvalidatedCache;
+}
+
+void FGitSourceControlProvider::QueueStatusRefresh(const TArray<FString>& Filenames)
+{
+	for (const FString& Filename : Filenames)
+	{
+		const FString RepositoryRoot = ResolveRepositoryRootForFile(Filename);
+		if (!RepositoryRoot.IsEmpty())
+		{
+			PendingStatusRefreshesByRepository.FindOrAdd(RepositoryRoot).Add(GitSourceControlProviderPrivate::NormalizeCacheFilename(Filename));
+		}
+	}
+}
+
+void FGitSourceControlProvider::IssuePendingStatusRefreshes()
+{
+	TMap<FString, TSet<FString>> PendingRefreshes = MoveTemp(PendingStatusRefreshesByRepository);
+	for (const TPair<FString, TSet<FString>>& PendingRefresh : PendingRefreshes)
+	{
+		if (PendingRefresh.Value.IsEmpty())
+		{
+			continue;
+		}
+
+		TSet<FString> OutstandingPaths;
+		bool bStatusRequestInFlight = false;
+		for (const FGitSourceControlCommand* Command : CommandQueue)
+		{
+			if (Command->Operation->GetName() != TEXT("UpdateStatus") || Command->PathToRepositoryRoot != PendingRefresh.Key || Command->bExecuteProcessed)
+			{
+				continue;
+			}
+
+			bStatusRequestInFlight = true;
+			for (const FString& Filename : PendingRefresh.Value)
+			{
+				if (!Command->Files.Contains(Filename))
+				{
+					OutstandingPaths.Add(Filename);
+				}
+			}
+			break;
+		}
+
+		if (bStatusRequestInFlight)
+		{
+			for (const FString& Filename : OutstandingPaths)
+			{
+				PendingStatusRefreshesByRepository.FindOrAdd(PendingRefresh.Key).Add(Filename);
+			}
+			continue;
+		}
+
+		RegisterDirectoryWatchesForRoot(PendingRefresh.Key, PendingRefresh.Key == GitSourceControlProviderPrivate::NormalizeCacheFilename(PathToGitRoot));
+		const ECommandResult::Type Result = Execute(
+			ISourceControlOperation::Create<FUpdateStatus>(),
+			FSourceControlChangelistPtr(),
+			PendingRefresh.Value.Array(),
+			EConcurrency::Asynchronous);
+		if (Result != ECommandResult::Succeeded)
+		{
+			UE_LOG(LogSourceControl, Warning, TEXT("Failed to schedule local Git status refresh."));
+		}
 	}
 }
 
@@ -252,69 +500,72 @@ int32 FGitSourceControlProvider::GetNumLastErrors() const
 
 void FGitSourceControlProvider::Close()
 {
-	// clear the cache
-	StateCache.Empty();
-	// Remove all extensions to the "Revision Control" menu in the Editor Toolbar
-	GitSourceControlMenu.Unregister();
+	UnregisterDirectoryWatchers();
+
+	TArray<FGitSourceControlCommand*> CommandsToJoin = MoveTemp(CommandQueue);
+	for (FGitSourceControlCommand* Command : CommandsToJoin)
+	{
+		Command->Cancel();
+		if (GThreadPool != nullptr && GThreadPool->RetractQueuedWork(Command))
+		{
+			Command->Abandon();
+		}
+	}
+
+	for (FGitSourceControlCommand* Command : CommandsToJoin)
+	{
+		Command->WaitForCompletion();
+		delete Command;
+	}
+	CommandGenerations.Empty();
+
+	{
+		FScopeLock Lock(&StateCacheCriticalSection);
+		StateCache.Empty();
+	}
 
 	bGitAvailable = false;
 	bGitRepositoryFound = false;
-	UserName.Empty();
-	UserEmail.Empty();
-	if (Runner)
+	PathToGitBinary.Reset();
+	PathToGitRoot.Reset();
+	PathToRepositoryRoot.Reset();
+	GitVersion = FGitVersion();
 	{
-		delete Runner;
-		Runner = nullptr;
+		FScopeLock Lock(&LastErrorsCriticalSection);
+		LastErrors.Empty();
 	}
 }
 
 TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> FGitSourceControlProvider::GetStateInternal(const FString& Filename)
 {
-	TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe>* State = StateCache.Find(Filename);
+	const FString CacheFilename = GitSourceControlProviderPrivate::NormalizeCacheFilename(Filename);
+	const FString DisplayFilename = GitSourceControlProviderPrivate::NormalizeDisplayFilename(Filename);
+	FScopeLock Lock(&StateCacheCriticalSection);
+	TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe>* State = StateCache.Find(CacheFilename);
 	if (State != NULL)
 	{
-		// found cached item
+		// Keep the cache key canonical while preserving the reliable path spelling
+		// for UE's asset and History/Diff UI. Only the game thread mutates states.
+		if (IsInGameThread() && !DisplayFilename.IsEmpty() && (*State)->LocalFilename != DisplayFilename)
+		{
+			(*State)->LocalFilename = DisplayFilename;
+		}
 		return (*State);
 	}
 	else
 	{
 		// cache an unknown state for this item
-		TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> NewState = MakeShareable( new FGitSourceControlState(Filename) );
-		StateCache.Add(Filename, NewState);
+		TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> NewState = MakeShareable(new FGitSourceControlState(DisplayFilename));
+		StateCache.Add(CacheFilename, NewState);
 		return NewState;
 	}
 }
-
-#if ENGINE_MAJOR_VERSION == 5
-TSharedRef<FGitSourceControlChangelistState, ESPMode::ThreadSafe> FGitSourceControlProvider::GetStateInternal(const FGitSourceControlChangelist& InChangelist)
-{
-	TSharedRef<FGitSourceControlChangelistState, ESPMode::ThreadSafe>* State = ChangelistsStateCache.Find(InChangelist);
-	if (State != NULL)
-	{
-		// found cached item
-		return (*State);
-	}
-	else
-	{
-		// cache an unknown state for this item
-		TSharedRef<FGitSourceControlChangelistState, ESPMode::ThreadSafe> NewState = MakeShared<FGitSourceControlChangelistState>(InChangelist);
-		ChangelistsStateCache.Add(InChangelist, NewState);
-		return NewState;
-	}
-}
-#endif
 
 FText FGitSourceControlProvider::GetStatusText() const
 {
 	FFormatNamedArguments Args;
 	Args.Add(TEXT("IsAvailable"), (IsEnabled() && IsAvailable()) ? LOCTEXT("Yes", "Yes") : LOCTEXT("No", "No"));
 	Args.Add( TEXT("RepositoryName"), FText::FromString(PathToRepositoryRoot) );
-	Args.Add( TEXT("RemoteUrl"), FText::FromString(RemoteUrl) );
-	Args.Add( TEXT("UserName"), FText::FromString(UserName) );
-	Args.Add( TEXT("UserEmail"), FText::FromString(UserEmail) );
-	Args.Add( TEXT("BranchName"), FText::FromString(BranchName) );
-	Args.Add( TEXT("CommitId"), FText::FromString(CommitId.Left(8)) );
-	Args.Add( TEXT("CommitSummary"), FText::FromString(CommitSummary) );
 
 	FText FormattedError;
 	const TArray<FText>& RecentErrors = GetLastErrors();
@@ -328,7 +579,7 @@ FText FGitSourceControlProvider::GetStatusText() const
 
 	Args.Add(TEXT("ErrorText"), FormattedError);
 
-	return FText::Format( NSLOCTEXT("GitStatusText", "{ErrorText}Enabled: {IsAvailable}", "Local repository: {RepositoryName}\nRemote: {RemoteUrl}\nUser: {UserName}\nE-mail: {UserEmail}\n[{BranchName} {CommitId}] {CommitSummary}"), Args );
+	return FText::Format(NSLOCTEXT("GitStatusText", "{ErrorText}Enabled: {IsAvailable}", "Local repository: {RepositoryName}"), Args);
 }
 
 /** Quick check if revision control is enabled */
@@ -348,6 +599,15 @@ const FName& FGitSourceControlProvider::GetName(void) const
 	return ProviderName;
 }
 
+FString FGitSourceControlProvider::ResolveRepositoryRootForFile(const FString& Filename) const
+{
+	if (PathToRepositoryRoot.IsEmpty())
+	{
+		return FString();
+	}
+	return GitSourceControlProviderPrivate::ResolveNearestRepositoryRoot(Filename, PathToRepositoryRoot);
+}
+
 ECommandResult::Type FGitSourceControlProvider::GetState( const TArray<FString>& InFiles, TArray< TSharedRef<ISourceControlState, ESPMode::ThreadSafe> >& OutState, EStateCacheUsage::Type InStateCacheUsage )
 {
 	if (!IsEnabled())
@@ -358,26 +618,20 @@ ECommandResult::Type FGitSourceControlProvider::GetState( const TArray<FString>&
 	if (InStateCacheUsage == EStateCacheUsage::ForceUpdate)
 	{
 		TArray<FString> ForceUpdate;
-		for (FString Path : InFiles)
+		ForceUpdate.Reserve(InFiles.Num());
+		for (const FString& Filename : InFiles)
 		{
-			// Remove the path from the cache, so it's not ignored the next time we force check.
-			// If the file isn't in the cache, force update it now.
-			if (!RemoveFileFromIgnoreForceCache(Path))
-			{
-				ForceUpdate.Add(Path);
-			}
+			ForceUpdate.AddUnique(GitSourceControlProviderPrivate::NormalizeCacheFilename(Filename));
 		}
 		if (ForceUpdate.Num() > 0)
 		{
-			Execute(ISourceControlOperation::Create<FUpdateStatus>(), ForceUpdate);
+			QueueStatusRefresh(ForceUpdate);
 		}
 	}
 
-	const TArray<FString>& AbsoluteFiles = SourceControlHelpers::AbsoluteFilenames(InFiles);
-
-	for (TArray<FString>::TConstIterator It(AbsoluteFiles); It; It++)
+	for (const FString& Filename : InFiles)
 	{
-		OutState.Add(GetStateInternal(*It));
+		OutState.Add(GetStateInternal(Filename));
 	}
 
 	return ECommandResult::Succeeded;
@@ -386,22 +640,16 @@ ECommandResult::Type FGitSourceControlProvider::GetState( const TArray<FString>&
 #if ENGINE_MAJOR_VERSION >= 5
 ECommandResult::Type FGitSourceControlProvider::GetState(const TArray<FSourceControlChangelistRef>& InChangelists, TArray<FSourceControlChangelistStateRef>& OutState, EStateCacheUsage::Type InStateCacheUsage)
 {
-	if (!IsEnabled())
-	{
-		return ECommandResult::Failed;
-	}
-
-	for (FSourceControlChangelistRef Changelist : InChangelists)
-	{
-		FGitSourceControlChangelistRef GitChangelist = StaticCastSharedRef<FGitSourceControlChangelist>(Changelist);
-		OutState.Add(GetStateInternal(GitChangelist.Get()));
-	}
-	return ECommandResult::Succeeded;
+	(void)InChangelists;
+	(void)OutState;
+	(void)InStateCacheUsage;
+	return ECommandResult::Failed;
 }
 #endif
 
 TArray<FSourceControlStateRef> FGitSourceControlProvider::GetCachedStateByPredicate(TFunctionRef<bool(const FSourceControlStateRef&)> Predicate) const
 {
+	FScopeLock Lock(&StateCacheCriticalSection);
 	TArray<FSourceControlStateRef> Result;
 	for (const auto& CacheItem : StateCache)
 	{
@@ -416,22 +664,15 @@ TArray<FSourceControlStateRef> FGitSourceControlProvider::GetCachedStateByPredic
 
 bool FGitSourceControlProvider::RemoveFileFromCache(const FString& Filename)
 {
-	return StateCache.Remove(Filename) > 0;
-}
-
-bool FGitSourceControlProvider::AddFileToIgnoreForceCache(const FString& Filename)
-{
-	return IgnoreForceCache.Add(Filename) > 0;
-}
-
-bool FGitSourceControlProvider::RemoveFileFromIgnoreForceCache(const FString& Filename)
-{
-	return IgnoreForceCache.Remove(Filename) > 0;
+	const FString CacheFilename = GitSourceControlProviderPrivate::NormalizeCacheFilename(Filename);
+	FScopeLock Lock(&StateCacheCriticalSection);
+	return StateCache.Remove(CacheFilename) > 0;
 }
 
 /** Get files in cache */
 TArray<FString> FGitSourceControlProvider::GetFilesInCache()
 {
+	FScopeLock Lock(&StateCacheCriticalSection);
 	TArray<FString> Files;
 	for (const auto& State : StateCache)
 	{
@@ -463,6 +704,100 @@ ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOpe
 	}
 
 	TArray<FString> AbsoluteFiles = SourceControlHelpers::AbsoluteFilenames(InFiles);
+	TMap<FString, TArray<FString>> FilesByRepository;
+	for (const FString& Filename : AbsoluteFiles)
+	{
+		const FString RepositoryRoot = GitSourceControlProviderPrivate::ResolveNearestRepositoryRoot(Filename, PathToRepositoryRoot);
+		if (RepositoryRoot.IsEmpty())
+		{
+			const FText Message = FText::Format(LOCTEXT("FileOutsideRepository", "File '{0}' is outside the connected Git repository."), FText::FromString(Filename));
+			InOperation->AddErrorMessge(Message);
+			InOperationCompleteDelegate.ExecuteIfBound(InOperation, ECommandResult::Failed);
+			return ECommandResult::Failed;
+		}
+		FilesByRepository.FindOrAdd(RepositoryRoot).Add(Filename);
+	}
+
+	// FSourceControlWindows requests History once through the provider and then
+	// performs its own synchronous state update before opening the dialog. If an
+	// explicit History prefetch already completed for the current repository
+	// generation, satisfy that second request from the immutable cache instead of
+	// starting a duplicate git log process (and blocking the editor again).
+	if (InOperation->GetName() == TEXT("UpdateStatus") && InConcurrency == EConcurrency::Synchronous && FilesByRepository.Num() == 1)
+	{
+		const TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> StatusOperation = StaticCastSharedRef<FUpdateStatus>(InOperation);
+		if (StatusOperation->ShouldUpdateHistory())
+		{
+			const TPair<FString, TArray<FString>>& RepositoryFiles = *FilesByRepository.CreateConstIterator();
+			const uint64 CurrentGeneration = GitSourceControlUtils::GetRepositoryGeneration(RepositoryFiles.Key);
+			bool bHistoryIsFresh = !RepositoryFiles.Value.IsEmpty();
+			for (const FString& Filename : RepositoryFiles.Value)
+			{
+				const TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> State = GetStateInternal(Filename);
+				if (State->History.IsEmpty() || State->HistoryGeneration != CurrentGeneration)
+				{
+					bHistoryIsFresh = false;
+					break;
+				}
+			}
+			if (bHistoryIsFresh)
+			{
+				InOperationCompleteDelegate.ExecuteIfBound(InOperation, ECommandResult::Succeeded);
+				return ECommandResult::Succeeded;
+			}
+		}
+	}
+
+	if (FilesByRepository.Num() > 1)
+	{
+		if (InOperation->GetName() == TEXT("UpdateStatus"))
+		{
+			const TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> SourceOperation = StaticCastSharedRef<FUpdateStatus>(InOperation);
+			if (InConcurrency == EConcurrency::Asynchronous)
+			{
+				const TSharedRef<GitSourceControlProviderPrivate::FUpdateStatusBatch, ESPMode::ThreadSafe> Batch = MakeShared<GitSourceControlProviderPrivate::FUpdateStatusBatch, ESPMode::ThreadSafe>(InOperation, InOperationCompleteDelegate, FilesByRepository.Num());
+				for (const TPair<FString, TArray<FString>>& RepositoryFiles : FilesByRepository)
+				{
+					const TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> RepositoryOperation = GitSourceControlProviderPrivate::CloneUpdateStatusOperation(SourceOperation.Get());
+					Execute(RepositoryOperation, FSourceControlChangelistPtr(), RepositoryFiles.Value, EConcurrency::Asynchronous,
+						FSourceControlOperationComplete::CreateLambda([Batch, RepositoryOperation](const FSourceControlOperationRef&, const ECommandResult::Type RepositoryResult)
+						{
+							Batch->Operation->AppendResultInfo(RepositoryOperation->GetResultInfo());
+							if (Batch->Result == ECommandResult::Succeeded && RepositoryResult != ECommandResult::Succeeded)
+							{
+								Batch->Result = RepositoryResult;
+							}
+							if (--Batch->Remaining == 0)
+							{
+								Batch->CompletionDelegate.ExecuteIfBound(Batch->Operation, Batch->Result);
+							}
+						}));
+				}
+				return ECommandResult::Succeeded;
+			}
+
+			ECommandResult::Type Result = ECommandResult::Succeeded;
+			for (const TPair<FString, TArray<FString>>& RepositoryFiles : FilesByRepository)
+			{
+				const TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> RepositoryOperation = GitSourceControlProviderPrivate::CloneUpdateStatusOperation(SourceOperation.Get());
+
+				Result = Execute(RepositoryOperation, FSourceControlChangelistPtr(), RepositoryFiles.Value, EConcurrency::Synchronous);
+				InOperation->AppendResultInfo(RepositoryOperation->GetResultInfo());
+				if (Result != ECommandResult::Succeeded)
+				{
+					break;
+				}
+			}
+			InOperationCompleteDelegate.ExecuteIfBound(InOperation, Result);
+			return Result;
+		}
+
+		const FText Message = LOCTEXT("MixedRepositoryOperation", "Selected files belong to multiple Git repositories. Refresh each repository separately.");
+		FTSMessageLog("SourceControl").Error(Message);
+		InOperation->AddErrorMessge(Message);
+		InOperationCompleteDelegate.ExecuteIfBound(InOperation, ECommandResult::Failed);
+		return ECommandResult::Failed;
+	}
 
 	// Query to see if we allow this operation
 	TSharedPtr<IGitSourceControlWorker, ESPMode::ThreadSafe> Worker = CreateWorker(InOperation->GetName());
@@ -482,13 +817,20 @@ ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOpe
 	}
 
 	FGitSourceControlCommand* Command = new FGitSourceControlCommand(InOperation, Worker.ToSharedRef());
-	Command->UpdateRepositoryRootIfSubmodule(AbsoluteFiles);
+	if (FilesByRepository.Num() == 1)
+	{
+		const TPair<FString, TArray<FString>>& RepositoryFiles = *FilesByRepository.CreateConstIterator();
+		Command->PathToRepositoryRoot = RepositoryFiles.Key;
+		Command->PathToGitRoot = RepositoryFiles.Key;
+		AbsoluteFiles = RepositoryFiles.Value;
+		RegisterDirectoryWatchesForRoot(RepositoryFiles.Key, RepositoryFiles.Key == GitSourceControlProviderPrivate::NormalizeCacheFilename(PathToGitRoot));
+	}
 	Command->Files = AbsoluteFiles;
 	Command->OperationCompleteDelegate = InOperationCompleteDelegate;
+	CommandGenerations.Add(Command, GitSourceControlUtils::GetRepositoryGeneration(Command->PathToRepositoryRoot));
 
 #if ENGINE_MAJOR_VERSION == 5
-	TSharedPtr<FGitSourceControlChangelist, ESPMode::ThreadSafe> ChangelistPtr = StaticCastSharedPtr<FGitSourceControlChangelist>(InChangelist);
-	Command->Changelist = ChangelistPtr ? ChangelistPtr.ToSharedRef().Get() : FGitSourceControlChangelist();
+	(void)InChangelist;
 #endif
 	
 	// fire off operation
@@ -518,20 +860,19 @@ bool FGitSourceControlProvider::CanCancelOperation( const FSourceControlOperatio
 bool FGitSourceControlProvider::CanCancelOperation( const FSourceControlOperationRef& InOperation ) const
 #endif
 {
-	// TODO: maybe support cancellation again?
-#if 0
-	for (int32 CommandIndex = 0; CommandIndex < CommandQueue.Num(); ++CommandIndex)
+	const FName OperationName = InOperation->GetName();
+	if (OperationName != TEXT("Connect") && OperationName != TEXT("UpdateStatus"))
 	{
-		const FGitSourceControlCommand& Command = *CommandQueue[CommandIndex];
-		if (Command.Operation == InOperation)
+		return false;
+	}
+
+	for (const FGitSourceControlCommand* Command : CommandQueue)
+	{
+		if (Command->Operation == InOperation && !Command->bExecuteProcessed)
 		{
-			check(Command.bAutoDelete);
 			return true;
 		}
 	}
-#endif
-
-	// operation was not in progress!
 	return false;
 }
 
@@ -541,12 +882,17 @@ void FGitSourceControlProvider::CancelOperation( const FSourceControlOperationRe
 void FGitSourceControlProvider::CancelOperation( const FSourceControlOperationRef& InOperation )
 #endif
 {
+	const FName OperationName = InOperation->GetName();
+	if (OperationName != TEXT("Connect") && OperationName != TEXT("UpdateStatus"))
+	{
+		return;
+	}
+
 	for (int32 CommandIndex = 0; CommandIndex < CommandQueue.Num(); ++CommandIndex)
 	{
 		FGitSourceControlCommand& Command = *CommandQueue[CommandIndex];
 		if (Command.Operation == InOperation)
 		{
-			check(Command.bAutoDelete);
 			Command.Cancel();
 			return;
 		}
@@ -555,17 +901,17 @@ void FGitSourceControlProvider::CancelOperation( const FSourceControlOperationRe
 
 bool FGitSourceControlProvider::UsesLocalReadOnlyState() const
 {
-	return bUsingGitLfsLocking; // Git LFS Lock uses read-only state
+	return false;
 }
 
 bool FGitSourceControlProvider::UsesChangelists() const
 {
-	return true;
+	return false;
 }
 
 bool FGitSourceControlProvider::UsesCheckout() const
 {
-	return bUsingGitLfsLocking; // Git LFS Lock uses read-only state
+	return false;
 }
 
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
@@ -593,7 +939,7 @@ bool FGitSourceControlProvider::AllowsDiffAgainstDepot() const
 
 bool FGitSourceControlProvider::UsesUncontrolledChangelists() const
 {
-	return true;
+	return false;
 }
 
 bool FGitSourceControlProvider::UsesSnapshots() const
@@ -604,7 +950,7 @@ bool FGitSourceControlProvider::UsesSnapshots() const
 
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
 bool FGitSourceControlProvider::CanExecuteOperation(const FSourceControlOperationRef& InOperation) const {
-	return WorkersMap.Find(InOperation->GetName()) != nullptr;
+	return WorkersMap.Find(InOperation->GetName()) != nullptr && (IsEnabled() || InOperation->GetName() == TEXT("Connect"));
 }
 
 TMap<ISourceControlProvider::EStatus, FString> FGitSourceControlProvider::GetStatus() const
@@ -612,11 +958,7 @@ TMap<ISourceControlProvider::EStatus, FString> FGitSourceControlProvider::GetSta
 	TMap<EStatus, FString> Result;
 	Result.Add(EStatus::Enabled, IsEnabled() ? TEXT("Yes") : TEXT("No") );
 	Result.Add(EStatus::Connected, (IsEnabled() && IsAvailable()) ? TEXT("Yes") : TEXT("No") );
-	Result.Add(EStatus::User, UserName);
 	Result.Add(EStatus::Repository, PathToRepositoryRoot);
-	Result.Add(EStatus::Remote, RemoteUrl);
-	Result.Add(EStatus::Branch, BranchName);
-	Result.Add(EStatus::Email, UserEmail);
 	return Result;
 }
 #endif
@@ -652,27 +994,10 @@ void FGitSourceControlProvider::OutputCommandMessages(const FGitSourceControlCom
 	}
 }
 
-void FGitSourceControlProvider::UpdateRepositoryStatus(const class FGitSourceControlCommand& InCommand)
-{
-	// For all operations running UpdateStatus, get Commit information:
-	if (!InCommand.CommitId.IsEmpty())
-	{
-		CommitId = InCommand.CommitId;
-		CommitSummary = InCommand.CommitSummary;
-	}
-}
-
 void FGitSourceControlProvider::Tick()
 {
-#if ENGINE_MAJOR_VERSION < 5
-	bool bStatesUpdated = false;
-#else
-	bool bStatesUpdated = TicksUntilNextForcedUpdate == 1;
-	if( TicksUntilNextForcedUpdate > 0 )
-	{
-		--TicksUntilNextForcedUpdate;
-	}
-#endif
+	bool bStatesUpdated = ApplyPendingDirectoryChanges();
+	IssuePendingStatusRefreshes();
 
 	for (int32 CommandIndex = 0; CommandIndex < CommandQueue.Num(); ++CommandIndex)
 	{
@@ -680,26 +1005,28 @@ void FGitSourceControlProvider::Tick()
 
 		if (Command.bExecuteProcessed)
 		{
+			const uint64 CommandGeneration = CommandGenerations.FindRef(&Command);
+			const bool bCurrentGeneration = CommandGeneration == GitSourceControlUtils::GetRepositoryGeneration(Command.PathToRepositoryRoot);
+			CommandGenerations.Remove(&Command);
+			if (!bCurrentGeneration)
+			{
+				Command.Cancel();
+			}
+
 			// Remove command from the queue
 			CommandQueue.RemoveAt(CommandIndex);
 
-			if (!Command.IsCanceled())
+			if (!Command.IsCanceled() && bCurrentGeneration)
 			{
-				// Update repository status on UpdateStatus operations
-				UpdateRepositoryStatus(Command);
+				// Let the completed command update only the states it queried.
+				bStatesUpdated |= Command.Worker->UpdateStates();
 			}
-
-			// let command update the states of any files
-			bStatesUpdated |= Command.Worker->UpdateStates();
 
 			// dump any messages to output log
 			OutputCommandMessages(Command);
 
-			// run the completion delegate callback if we have one bound
-			if (!Command.IsCanceled())
-			{
-				Command.ReturnResults();
-			}
+			// 先从队列移除再回调, 保证正常完成和取消都只通知一次.
+			Command.ReturnResults();
 
 			// commands that are left in the array during a tick need to be deleted
 			if(Command.bAutoDelete)
@@ -712,15 +1039,6 @@ void FGitSourceControlProvider::Tick()
 			// of the command queue (which can happen in the completion delegate)
 			break;
 		}
-		else if (Command.bCancelled)
-		{
-			// If this was a synchronous command, set it free so that it will be deleted automatically
-			// when its (still running) thread finally finishes
-			Command.bAutoDelete = true;
-
-			Command.ReturnResults();
-			break;
-		}
 	}
 
 	if (bStatesUpdated)
@@ -731,6 +1049,7 @@ void FGitSourceControlProvider::Tick()
 
 TArray< TSharedRef<ISourceControlLabel> > FGitSourceControlProvider::GetLabels( const FString& InMatchingSpec ) const
 {
+	(void)InMatchingSpec;
 	TArray< TSharedRef<ISourceControlLabel> > Tags;
 
 	// NOTE list labels. Called by CrashDebugHelper() (to remote debug Engine crash)
@@ -742,14 +1061,8 @@ TArray< TSharedRef<ISourceControlLabel> > FGitSourceControlProvider::GetLabels( 
 #if ENGINE_MAJOR_VERSION >= 5
 TArray<FSourceControlChangelistRef> FGitSourceControlProvider::GetChangelists( EStateCacheUsage::Type InStateCacheUsage )
 {
-	if (!IsEnabled())
-	{
-		return TArray<FSourceControlChangelistRef>();
-	}
-	
-	TArray<FSourceControlChangelistRef> Changelists;
-	Algo::Transform(ChangelistsStateCache, Changelists, [](const auto& Pair) { return MakeShared<FGitSourceControlChangelist, ESPMode::ThreadSafe>(Pair.Key); });
-	return Changelists;
+	(void)InStateCacheUsage;
+	return TArray<FSourceControlChangelistRef>();
 }
 #endif
 
@@ -846,7 +1159,17 @@ ECommandResult::Type FGitSourceControlProvider::IssueCommand(FGitSourceControlCo
 
 		InCommand.bCommandSuccessful = InCommand.DoWork();
 
-		InCommand.Worker->UpdateStates();
+		const uint64 CommandGeneration = CommandGenerations.FindRef(&InCommand);
+		const bool bCurrentGeneration = CommandGeneration == GitSourceControlUtils::GetRepositoryGeneration(InCommand.PathToRepositoryRoot);
+		CommandGenerations.Remove(&InCommand);
+		if (bCurrentGeneration)
+		{
+			InCommand.Worker->UpdateStates();
+		}
+		else
+		{
+			InCommand.Cancel();
+		}
 
 		OutputCommandMessages(InCommand);
 
@@ -857,94 +1180,30 @@ ECommandResult::Type FGitSourceControlProvider::IssueCommand(FGitSourceControlCo
 
 bool FGitSourceControlProvider::QueryStateBranchConfig(const FString& ConfigSrc, const FString& ConfigDest)
 {
-	// Check similar preconditions to Perforce (valid src and dest),
-	if (ConfigSrc.Len() == 0 || ConfigDest.Len() == 0)
-	{
-		return false;
-	}
-
-	if (!bGitAvailable || !bGitRepositoryFound)
-	{
-		FTSMessageLog("SourceControl").Error(LOCTEXT("StatusBranchConfigNoConnection", "Unable to retrieve status branch configuration from repo, no connection"));
-		return false;
-	}
-
-	// Otherwise, we can assume that whatever our user is doing to config state branches is properly synced, so just copy.
-	// TODO: maybe don't assume, and use git show instead?
-	IFileManager::Get().Copy(*ConfigDest, *ConfigSrc);
-	return true;
+	(void)ConfigSrc;
+	(void)ConfigDest;
+	return false;
 }
 
 void FGitSourceControlProvider::RegisterStateBranches(const TArray<FString>& BranchNames, const FString& ContentRootIn)
 {
-	StatusBranchNamePatternsInternal = BranchNames;
+	(void)BranchNames;
+	(void)ContentRootIn;
 }
 
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
 bool FGitSourceControlProvider::GetStateBranchAtIndex(int32 BranchIndex, FString& OutBranchName) const
 {
-	auto StatusBranchNames = GetStatusBranchNames();
-
-	if (BranchIndex >= 0 && BranchIndex < StatusBranchNames.Num())
-	{
-		OutBranchName = StatusBranchNames[BranchIndex];
-		return true;
-	}
+	(void)BranchIndex;
+	(void)OutBranchName;
 	return false;
 }
 #endif
 
 int32 FGitSourceControlProvider::GetStateBranchIndex(const FString& StateBranchName) const
 {
-	// How do state branches indices work?
-	// Order matters. Lower values are lower in the hierarchy, i.e., changes from higher branches get automatically merged down.
-	// The higher branch is, the stabler it is, and has changes manually promoted up.
-
-	// Check if we are checking the index of the current branch
-	// UE uses FEngineVersion for the current branch name because of UEGames setup, but we want to handle otherwise for Git repos.
-	auto StatusBranchNames = GetStatusBranchNames();
-	if (StateBranchName == FEngineVersion::Current().GetBranch())
-	{
-		const int32 CurrentBranchStatusIndex = StatusBranchNames.IndexOfByKey(BranchName);
-		const bool bCurrentBranchInStatusBranches = CurrentBranchStatusIndex != INDEX_NONE;
-		// If the user's current branch is tracked as a status branch, give the proper index
-		if (bCurrentBranchInStatusBranches)
-		{
-			return CurrentBranchStatusIndex;
-		}
-		// If the current branch is not a status branch, make it the highest branch
-		// This is semantically correct, since if a branch is not marked as a status branch
-		// it merges changes in a similar fashion to the highest status branch, i.e. manually promotes them
-		// based on the user merging those changes in. and these changes always get merged from even the highest point
-		// of the stream. i.e, promoted/stable changes are always up for consumption by this branch.
-		return INT32_MAX;
-	}
-
-	// If we're not checking the current branch, then we don't need to do special handling.
-	// If it is not a status branch, there is no message
-	return StatusBranchNames.IndexOfByKey(StateBranchName);
-}
-
-TArray<FString> FGitSourceControlProvider::GetStatusBranchNames() const
-{
-	TArray<FString> StatusBranches;
-	if(PathToGitBinary.IsEmpty() || PathToRepositoryRoot.IsEmpty())
-		return StatusBranches;
-	
-	for (int i = 0; i < StatusBranchNamePatternsInternal.Num(); i++)
-	{
-		TArray<FString> Matches;
-		bool bResult = GitSourceControlUtils::GetRemoteBranchesWildcard(PathToGitBinary, PathToRepositoryRoot, StatusBranchNamePatternsInternal[i], Matches);
-		if (bResult && Matches.Num() > 0)
-		{
-			for (int j = 0; j < Matches.Num(); j++)
-			{
-				StatusBranches.Add(Matches[j].TrimStartAndEnd());	
-			}
-		}
-	}
-	
-	return StatusBranches;
+	(void)StateBranchName;
+	return INDEX_NONE;
 }
 
 #undef LOCTEXT_NAMESPACE

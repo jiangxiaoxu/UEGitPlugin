@@ -39,24 +39,51 @@ private:
 
 struct FGitVersion;
 
-class FGitLockedFilesCache
+struct GITSOURCECONTROL_API FGitRenamePair
 {
-public:
-	static FDateTime LastUpdated;
+	FString OldPath;
+	FString NewPath;
+};
 
- static const TMap<FString, FString>& GetLockedFiles() { return LockedFiles; }
- static void SetLockedFiles(const TMap<FString, FString>& newLocks);
- static void AddLockedFile(const FString& filePath, const FString& lockUser);
- static void RemoveLockedFile(const FString& filePath);
-
-private:
- static void OnFileLockChanged(const FString& filePath, const FString& lockUser, bool locked);
- // update local read/write state when our own lock statuses change
-	static TMap<FString, FString> LockedFiles;
+/** Raw `git update-index -z --index-info` records for one explicit set of paths. */
+struct GITSOURCECONTROL_API FGitIndexSnapshot
+{
+	FString RepositoryRoot;
+	TArray<FString> Paths;
+	TArray<uint8> IndexInfo;
 };
 
 namespace GitSourceControlUtils
 {
+	/** 跨 UI 和 worker 传递的取消边界. 只读和网络 Git 工作可在任意时刻取消. */
+	class GITSOURCECONTROL_API FGitOperationCancellationContext final
+	{
+	public:
+		void Cancel();
+		bool IsCancellationRequested() const;
+
+	private:
+		TAtomic<bool> bCancellationRequested = false;
+	};
+
+	/**
+	 * 将一个取消边界绑定到当前执行链. Scope 会保留嵌套绑定并传播给
+	 * 由 Git utility 发起的内部 worker, 使一个 UI Cancel 可以终止全部只读 Git 子进程.
+	 */
+	class GITSOURCECONTROL_API FGitOperationCancellationScope final
+	{
+	public:
+		explicit FGitOperationCancellationScope(TSharedPtr<FGitOperationCancellationContext, ESPMode::ThreadSafe> InContext);
+		~FGitOperationCancellationScope();
+
+		FGitOperationCancellationScope(const FGitOperationCancellationScope&) = delete;
+		FGitOperationCancellationScope& operator=(const FGitOperationCancellationScope&) = delete;
+
+	private:
+		TSharedPtr<FGitOperationCancellationContext, ESPMode::ThreadSafe> Context;
+		TSharedPtr<FGitOperationCancellationContext, ESPMode::ThreadSafe> PreviousContext;
+	};
+
 	/**
 		*  Returns an updated repo root if all selected files are in a plugin subfolder, and the plugin subfolder is a git repo
 		*  This supports the case where each plugin is a sub module
@@ -79,7 +106,7 @@ namespace GitSourceControlUtils
  * Find the path to the Git binary, looking into a few places (standalone Git install, and other common tools embedding Git)
  * @returns the path to the Git binary if found, or an empty string.
  */
-FString FindGitBinaryPath();
+GITSOURCECONTROL_API FString FindGitBinaryPath();
 
 /**
  * Run a Git "version" command to check the availability of the binary.
@@ -88,6 +115,9 @@ FString FindGitBinaryPath();
  * @returns true if the command succeeded and returned no errors
  */
 bool CheckGitAvailability(const FString& InPathToGitBinary, FGitVersion* OutVersion = nullptr);
+
+/** Verify the local-only porcelain-v2 status and literal path query capabilities required by this provider. */
+GITSOURCECONTROL_API bool CheckLocalGitCapabilities(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutError);
 
 /**
  * Parse the output from the "version" command into GitMajorVersion and GitMinorVersion.
@@ -127,48 +157,6 @@ bool FindRootDirectory(const FString& InPath, FString& OutRepositoryRoot);
  */
 void GetUserConfig(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutUserName, FString& OutUserEmail);
 
-/**
- * Get Git current checked-out branch
- * @param	InPathToGitBinary	The path to the Git binary
- * @param	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory
- * @param	OutBranchName		Name of the current checked-out branch (if any, ie. not in detached HEAD)
- * @returns true if the command succeeded and returned no errors
- */
-bool GetBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName);
-
-/**
- * Get Git remote tracking branch
- * @returns false if the branch is not tracking a remote
- */
-bool GetRemoteBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName);
-
- /**
- * Get Git remote tracking branches that match wildcard
- * @returns false if no matching branches
- */
- bool GetRemoteBranchesWildcard(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& PatternMatch, TArray<FString>& OutBranchNames);
- 
-/**
- * Get Git current commit details
- * @param	InPathToGitBinary	The path to the Git binary
- * @param	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory
- * @param	OutCommitId			Current Commit full SHA1
- * @param	OutCommitSummary	Current Commit description's Summary
- * @returns true if the command succeeded and returned no errors
- */
-bool GetCommitInfo(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutCommitId, FString& OutCommitSummary);
-
-/**
- * Get the URL of the "origin" defaut remote server
- * @param	InPathToGitBinary	The path to the Git binary
- * @param	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory
- * @param	OutRemoteUrl		URL of "origin" defaut remote server
- * @returns true if the command succeeded and returned no errors
- */
-bool GetRemoteUrl(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutRemoteUrl);
-
-// A list of asset paths that we will always check locks, status, etc on startup and periodically 
-TArray<FString> GetSourceControlledAssetPaths();
 
 /**
  * Run a Git command - output is a string TArray.
@@ -183,7 +171,19 @@ TArray<FString> GetSourceControlledAssetPaths();
  * @returns true if the command succeeded and returned no errors
  */
 GITSOURCECONTROL_API  bool RunCommand( const FString & InCommand, const FString & InPathToGitBinary, const FString & InRepositoryRoot, const TArray< FString > & InParameters, const TArray< FString > & InFiles, TArray< FString > & OutResults, TArray< FString > & OutErrorMessages );
-bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, FString& OutResults, FString& OutErrors, const int32 ExpectedReturnCode = 0);
+bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, FString& OutResults, FString& OutErrors, const int32 ExpectedReturnCode = 0, const bool bLogFailure = true);
+
+/** Bind cancellation to Git work executed by the current worker thread. */
+void SetActiveCommand(const FGitSourceControlCommand* InCommand);
+
+/** Clear the cancellation binding for the current worker thread. */
+void ClearActiveCommand(const FGitSourceControlCommand* InCommand);
+
+/** Increment the local repository generation after an external or local mutation. */
+GITSOURCECONTROL_API void InvalidateRepository(const FString& InRepositoryRoot);
+
+/** Return the local repository generation used to reject stale asynchronous results. */
+GITSOURCECONTROL_API uint64 GetRepositoryGeneration(const FString& InRepositoryRoot);
 
 /**
  * Unloads packages of specified named files
@@ -196,50 +196,6 @@ TArray<class UPackage*> UnlinkPackages(const TArray<FString>& InPackageNames);
 void ReloadPackages(TArray<UPackage*>& InPackagesToReload);
 
 /**
- * Gets all Git tracked files, including within directories, recursively
- */
-bool ListFilesInDirectoryRecurse(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InDirectory, TArray<FString>& OutFiles);
-
-/**
- * Run a Git "commit" command by batches.
- *
- * @param	InPathToGitBinary	The path to the Git binary
- * @param	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory
- * @param	InParameter			The parameters to the Git commit command
- * @param	InFiles				The files to be operated on
- * @param	OutErrorMessages	Any errors (from StdErr) as an array per-line
- * @returns true if the command succeeded and returned no errors
- */
-bool RunCommit(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages);
-
-/**
- * @brief Detects how to parse the result of a "status" command to get workspace file states
- *
- *  It is either a command for a whole directory (ie. "Content/", in case of "Submit to Revision Control" menu),
- * or for one or more files all on a same directory (by design, since we group files by directory in RunUpdateStatus())
- *
- * @param[in]	InPathToGitBinary	The path to the Git binary
- * @param[in]	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory (can be empty)
- * @param[in]	InUsingLfsLocking	Tells if using the Git LFS file Locking workflow
- * @param[in]	InFiles				List of files in a directory, or the path to the directory itself (never empty).
- * @param[out]	InResults			Results from the "status" command
- * @param[out]	OutStates			States of files for witch the status has been gathered (distinct than InFiles in case of a "directory status")
- */
-GITSOURCECONTROL_API void ParseStatusResults( const FString & InPathToGitBinary, const FString & InRepositoryRoot, const bool InUsingLfsLocking, const TArray< FString > & InFiles, const TMap< FString, FString > & InResults, TMap< FString, FGitSourceControlState > & OutStates );
-
-/**
- * Checks remote branches to see file differences.
- *
- * @param	CurrentBranchName The current branch we are on.
- * @param	InPathToGitBinary	The path to the Git binary
- * @param	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory
- * @param	OnePath				The file to be checked
- * @param	OutErrorMessages	Any errors (from StdErr) as an array per-line
- */
-void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& Files,
-				 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlState>& OutStates);
-
-/**
  * Run a Git "status" command and parse it.
  *
  * @param	InPathToGitBinary	The path to the Git binary
@@ -250,60 +206,42 @@ void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRo
  * @param   OutStates           The resultant states
  * @returns true if the command succeeded and returned no errors
  */
-bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles,
+GITSOURCECONTROL_API bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles,
 					 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlState>& OutStates);
 
-#if ENGINE_MAJOR_VERSION == 5
-/**
- * Keep Consistency of being file staged
- *
- * @param	Filename			Saved filename
- * @param	Pkg					Package (for adapting delegate)
- * @param   ObjectSaveContext	Context for save (for adapting delegate)
- */
-void UpdateFileStagingOnSaved(const FString& Filename, UPackage* Pkg, FObjectPostSaveContext ObjectSaveContext);
-#endif
+/** Expand selected paths with their porcelain-v2 rename counterpart as atomic old/new groups. */
+GITSOURCECONTROL_API bool ExpandSelectedPathsWithRenamePairs(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InSelectedFiles,
+	TArray<FString>& OutExpandedFiles, TArray<FGitRenamePair>& OutRenamePairs, TArray<FString>& OutErrorMessages);
+
+/** Capture stage entries, including explicit removal records for selected paths absent from the index. */
+GITSOURCECONTROL_API bool CaptureIndexEntriesForPaths(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InFiles,
+	FGitIndexSnapshot& OutSnapshot, FString& OutError);
+
+/** Restore only entries in a prior snapshot through stdin consumed by `git update-index -z --index-info`. */
+GITSOURCECONTROL_API bool RestoreIndexEntries(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FGitIndexSnapshot& InSnapshot, FString& OutError);
+
+/** Run a guarded local restore on explicit absolute files; no directory or repository-wide mutation is accepted. */
+GITSOURCECONTROL_API bool RunExactPathspecMutation(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InVerb,
+	const TArray<FString>& InParameters, const TArray<FString>& InFiles, FString& OutError);
 
 /**
- * Keep Consistency of being file staged with simple argument
- *
- * @param	Filename			Saved filename
+ * Export an exact Git blob without filters or LFS smudging, then atomically replace OutputFile.
+ * The command is local-only and never performs network I/O.
  */
-bool UpdateFileStagingOnSavedInternal(const FString& Filename);
-	
-/**
- * 
- *
- * @param	Filename			Saved filename
- * @param	Pkg					Package (for adapting delegate)
- * @param   ObjectSaveContext	Context for save (for adapting delegate)
- */    
-void UpdateStateOnAssetRename(const FAssetData& InAssetData, const FString& InOldName);
+GITSOURCECONTROL_API bool DumpRevisionBlobToFile(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InRevisionSpec, const FString& InOutputFile, FString& OutError);
 
-#if ENGINE_MAJOR_VERSION == 5
 /**
- * 
- *
- * @param	Filename			Saved filename
- * @param	Pkg					Package (for adapting delegate)
- * @param   ObjectSaveContext	Context for save (for adapting delegate)
+ * Verify a local Git LFS object against its pointer metadata using the resolved
+ * Git binary's local `git lfs pointer` command. This never invokes fetch or transfer.
  */
-bool UpdateChangelistStateByCommand();
-#endif
-	
-/**
- * Run a Git "cat-file" command to dump the binary content of a revision into a file.
- *
- * @param	InPathToGitBinary	The path to the Git binary
- * @param	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory
- * @param	InParameter			The parameters to the Git show command (rev:path)
- * @param	InDumpFileName		The temporary file to dump the revision
- * @returns true if the command succeeded and returned no errors
-*/
-bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InParameter, const FString& InDumpFileName);
+	GITSOURCECONTROL_API bool VerifyLocalLfsObject(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InObjectFilename, const FString& InExpectedOid, int64 InExpectedSize, FString& OutError);
 
-// 拉取指定文件的 Git LFS 历史对象(更激进, 允许拉取旧版本)
-bool FetchLfsContentForFile(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InRelativeFile, TArray<FString>& OutErrorMessages);
+	/**
+	 * Fetch one historical LFS path only after an explicit History Diff/Restore request.
+	 * The remote is resolved as current upstream, then origin, then the sole configured remote.
+	 */
+	GITSOURCECONTROL_API bool FetchLfsContentForRevision(const FString& InPathToGitBinary, const FString& InRepositoryRoot,
+		const FString& InFullCommitId, const FString& InHistoricalPath, FString& OutError);
 
 /**
  * Run a Git "log" command and parse it.
@@ -315,7 +253,7 @@ bool FetchLfsContentForFile(const FString& InPathToGitBinary, const FString& InR
  * @param	OutErrorMessages	Any errors (from StdErr) as an array per-line
  * @param	OutHistory			The history of the file
  */
-bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InFile, bool bMergeConflict, TArray<FString>& OutErrorMessages, TGitSourceControlHistory& OutHistory);
+GITSOURCECONTROL_API bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InFile, bool bMergeConflict, TArray<FString>& OutErrorMessages, TGitSourceControlHistory& OutHistory);
 
 /**
  * Helper function to convert a filename array to relative paths.
@@ -339,7 +277,6 @@ TArray<FString> AbsoluteFilenames(const TArray<FString>& InFileNames, const FStr
  */
 void RemoveRedundantErrors(FGitSourceControlCommand& InCommand, const FString& InFilter);
 
-	bool RunLFSCommand(const FString& InCommand, const FString& InRepositoryRoot, const FString& GitBinaryFallback, const TArray<FString>& InParameters, const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages);
 
 /**
  * Helper function for various commands to update cached states.
@@ -358,39 +295,5 @@ GITSOURCECONTROL_API bool CollectNewStates( const TMap< FString, FGitSourceContr
  * @returns true if any states were updated
  */
 bool CollectNewStates(const TArray<FString>& InFiles, TMap<const FString, FGitState>& OutResults, EFileState::Type FileState, ETreeState::Type TreeState = ETreeState::Unset, ELockState::Type LockState = ELockState::Unset, ERemoteState::Type RemoteState = ERemoteState::Unset);
-
-	/**
-		 * Run 'git lfs locks" to extract all lock information for all files in the repository
-		 *
-		 * @param	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory
-		 * @param   GitBinaryFallBack   The Git binary fallback path
-		 * @param	OutErrorMessages    Any errors (from StdErr) as an array per-line
-		 * @param	OutLocks		    The lock results (file, username)
-		 * @returns true if the command succeeded and returned no errors
-		 */
-	bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallBack, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache = false);
-
-/**
- * Gets locks from state cache
- */
-void GetLockedFiles(const TArray<FString>& InFiles, TArray<FString>& OutFiles);
-
-/**
- * Checks cache for if this file type is lockable
- */
-bool IsFileLFSLockable(const FString& InFile);
-
-/**
- * Gets Git attribute to see if these extensions are lockable
- */
-bool CheckLFSLockable(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InFiles, TArray<FString>& OutErrorMessages);
-
-GITSOURCECONTROL_API bool FetchRemote( const FString & InPathToGitBinary, const FString & InPathToRepositoryRoot, bool InUsingGitLfsLocking, TArray< FString > & OutResults, TArray< FString > & OutErrorMessages );
-
-bool PullOrigin(const FString& InPathToGitBinary, const FString& InPathToRepositoryRoot, const TArray<FString>& InFiles, TArray<FString>& OutFiles,
-				TArray<FString>& OutResults, TArray<FString>& OutErrorMessages);
-
-
-GITSOURCECONTROL_API TSharedPtr< class ISourceControlRevision, ESPMode::ThreadSafe > GetOriginRevisionOnBranch( const FString & InPathToGitBinary, const FString & InRepositoryRoot, const FString & InRelativeFileName, TArray< FString > & OutErrorMessages, const FString & BranchName );
 
 }

@@ -5,7 +5,6 @@
 
 #pragma once
 
-#include "GitSourceControlChangelist.h"
 #include "GitSourceControlRevision.h"
 #include "Runtime/Launch/Resources/Version.h"
 
@@ -190,6 +189,9 @@ public:
 	/** History of the item, if any */
 	TGitSourceControlHistory History;
 
+	/** Repository generation for which History was loaded. Zero is a valid initial generation. */
+	uint64 HistoryGeneration = 0;
+
 	/** Filename on disk */
 	FString LocalFilename;
 
@@ -204,11 +206,6 @@ public:
 
 	/** Status of the file */
 	FGitState State;
-
-#if ENGINE_MAJOR_VERSION == 5
-	FGitSourceControlChangelist Changelist;
-#endif
-
 	/** The timestamp of the last update */
 	FDateTime TimeStamp;
 

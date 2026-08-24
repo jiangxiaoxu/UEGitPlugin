@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 316,
-	"VersionName": "3.16",
-	"FriendlyName": "Git LFS 2",
-	"Description": "Git source control management",
+	"Version": 400,
+	"VersionName": "4.0",
+	"FriendlyName": "Git Source Control",
+	"Description": "Fast local Git source control for Unreal Editor",
 	"Category": "Source Control",
 	"CreatedBy": "Project Borealis",
 	"CreatedByURL": "https://projectborealis.com",
@@ -16,7 +16,12 @@
 	"Modules": [
 		{
 			"Name": "GitSourceControl",
-			"Type": "EditorNoCommandlet",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "GitSourceControlTests",
+			"Type": "DeveloperTool",
 			"LoadingPhase": "Default"
 		}
 	]

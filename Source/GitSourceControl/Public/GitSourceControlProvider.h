@@ -5,14 +5,12 @@
 
 #pragma once
 
-#include "GitSourceControlChangelist.h"
 #include "ISourceControlProvider.h"
 #include "IGitSourceControlWorker.h"
-#include "GitSourceControlMenu.h"
 #include "Runtime/Launch/Resources/Version.h"
 
-class FGitSourceControlChangelistState;
 class FGitSourceControlState;
+struct FFileChangeData;
 
 class FGitSourceControlCommand;
 
@@ -105,16 +103,11 @@ public:
 
 	using ISourceControlProvider::Execute;
 
-	/**
-	 * Check configuration, else standard paths, and run a Git "version" command to check the availability of the binary.
-	 */
+	/** 自动发现 Git binary 并验证其可用性. */
 	void CheckGitAvailability();
 
-	/** Refresh Git settings from revision control settings */
-	void UpdateSettings();
-
 	/**
-	 * Find the .git/ repository and check its status.
+	 * Find the .git/ repository and validate the local Git capability.
 	 */
 	void CheckRepositoryStatus();
 
@@ -148,36 +141,11 @@ public:
 		return PathToGitBinary;
 	}
 
-	/** Git config user.name */
-	inline const FString& GetUserName() const
-	{
-		return UserName;
-	}
-
-	/** Git config user.email */
-	inline const FString& GetUserEmail() const
-	{
-		return UserEmail;
-	}
-
-	/** Git remote origin url */
-	inline const FString& GetRemoteUrl() const
-	{
-		return RemoteUrl;
-	}
-
-	inline const FString& GetLockUser() const
-	{
-		return LockUser;
-	}
+	/** 返回文件所在的 canonical Git root; 不在已连接仓库内时返回空字符串. */
+	FString ResolveRepositoryRootForFile(const FString& Filename) const;
 
 	/** Helper function used to update state cache */
 	TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> GetStateInternal(const FString& Filename);
-
-#if ENGINE_MAJOR_VERSION == 5	
-	/** Helper function used to update changelists state cache */
-	TSharedRef<FGitSourceControlChangelistState, ESPMode::ThreadSafe> GetStateInternal(const FGitSourceControlChangelist& InChangelist);
-#endif
 	
 	/**
 	 * Register a worker with the provider.
@@ -200,45 +168,38 @@ public:
 	/** Get files in cache */
 	TArray<FString> GetFilesInCache();
 
-	bool AddFileToIgnoreForceCache(const FString& Filename);
-
-	bool RemoveFileFromIgnoreForceCache(const FString& Filename);
-
-	const FString& GetBranchName() const
-	{
-		return BranchName;
-	}
-
-	const FString& GetRemoteBranchName() const { return RemoteBranchName; }
-
-	TArray<FString> GetStatusBranchNames() const;
-	
-	/** Indicates editor binaries are to be updated upon next sync */
-	bool bPendingRestart;
-
-#if ENGINE_MAJOR_VERSION >= 5
-	uint32 TicksUntilNextForcedUpdate = 0;
-#endif
-
 private:
+	struct FDirectoryWatch
+	{
+		FString Directory;
+		FString RepositoryRoot;
+		FDelegateHandle Handle;
+	};
+
+	void RegisterDirectoryWatchers();
+	void RegisterDirectoryWatchesForRoot(const FString& RepositoryRoot, bool bWatchProjectManagedPaths);
+	void UnregisterDirectoryWatchers();
+	void OnDirectoryChanged(const TArray<FFileChangeData>& FileChanges, const FString& RepositoryRoot, bool bRepositoryMetadata);
+	bool ApplyPendingDirectoryChanges();
+	void QueueStatusRefresh(const TArray<FString>& Filenames);
+	void IssuePendingStatusRefreshes();
+
 	/** Is git binary found and working. */
 	bool bGitAvailable = false;
 
 	/** Is git repository found. */
 	bool bGitRepositoryFound = false;
 
-	/** Is LFS locking enabled? */
-	bool bUsingGitLfsLocking = false;
-
 	FString PathToGitBinary;
-
-	FString LockUser;
 
 	/** Critical section for thread safety of error messages that occurred after last perforce command */
 	mutable FCriticalSection LastErrorsCriticalSection;
 
 	/** List of error messages that occurred after last perforce command */
 	TArray<FText> LastErrors;
+
+	/** 仅在命令完成后的 game thread 修改状态缓存. */
+	mutable FCriticalSection StateCacheCriticalSection;
 
 	/** Helper function for Execute() */
 	TSharedPtr<class IGitSourceControlWorker, ESPMode::ThreadSafe> CreateWorker(const FName& InOperationName) const;
@@ -251,41 +212,14 @@ private:
 	/** Output any messages this command holds */
 	void OutputCommandMessages(const class FGitSourceControlCommand& InCommand) const;
 
-	/** Update repository status on Connect and UpdateStatus operations */
-	void UpdateRepositoryStatus(const class FGitSourceControlCommand& InCommand);
-
 	/** Path to the root of the Unreal revision control repository: usually the ProjectDir */
 	FString PathToRepositoryRoot;
 
 	/** Path to the root of the Git repository: can be the ProjectDir itself, or any parent directory (found by the "Connect" operation) */
 	FString PathToGitRoot;
 
-	/** Git config user.name (from local repository, else globally) */
-	FString UserName;
-
-	/** Git config user.email (from local repository, else globally) */
-	FString UserEmail;
-
-	/** Name of the current branch */
-	FString BranchName;
-
-	/** Name of the current remote branch */
-	FString RemoteBranchName;
-
-	/** URL of the "origin" default remote server */
-	FString RemoteUrl;
-
-	/** Current Commit full SHA1 */
-	FString CommitId;
-
-	/** Current Commit description's Summary */
-	FString CommitSummary;
-
 	/** State cache */
 	TMap<FString, TSharedRef<class FGitSourceControlState, ESPMode::ThreadSafe> > StateCache;
-#if ENGINE_MAJOR_VERSION == 5
-	TMap<FGitSourceControlChangelist, TSharedRef<class FGitSourceControlChangelistState, ESPMode::ThreadSafe> > ChangelistsStateCache;
-#endif
 
 	/** The currently registered revision control operations */
 	TMap<FName, FGetGitSourceControlWorker> WorkersMap;
@@ -293,23 +227,20 @@ private:
 	/** Queue for commands given by the main thread */
 	TArray < FGitSourceControlCommand* > CommandQueue;
 
+	/** Repository generation observed when each queued read command started. */
+	TMap<FGitSourceControlCommand*, uint64> CommandGenerations;
+
+	/** Provider-owned local filesystem watches. */
+	TArray<FDirectoryWatch> DirectoryWatches;
+	TMap<FString, TSet<FString>> PendingChangedPathsByRepository;
+	TSet<FString> PendingRepositoryMetadataInvalidations;
+	TMap<FString, TSet<FString>> PendingStatusRefreshesByRepository;
+	double PendingWatchInvalidationTime = 0.0;
+
 	/** For notifying when the revision control states in the cache have changed */
 	FSourceControlStateChanged OnSourceControlStateChanged;
 
 	/** Git version for feature checking */
 	FGitVersion GitVersion;
 
-	/** Revision Control Menu Extension */
-	FGitSourceControlMenu GitSourceControlMenu;
-
-	/**
-		Ignore these files when forcing status updates. We add to this list when we've just updated the status already.
-		UE's SourceControl has a habit of performing a double status update, immediately after an operation.
-	*/
-	TArray<FString> IgnoreForceCache;
-
-	/** Array of branch name patterns for status queries */
-	TArray<FString> StatusBranchNamePatternsInternal;
-		
-	class FGitSourceControlRunner* Runner = nullptr;
 };

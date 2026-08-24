@@ -34,9 +34,14 @@ public:
 	virtual int32 GetCheckInIdentifier() const override;
 	virtual int32 GetFileSize() const override;
 
-public:
+	/** Export this revision to an explicit file without changing the index or worktree. */
+	bool ExportToFile(const FString& InFilename) const;
 
-	/** The filename this revision refers to */
+public:
+	/** Absolute workspace filename used by Unreal's revision-control UI. */
+	FString LocalFilename;
+
+	/** Repository-relative filename at this revision, used for blob lookup. */
 	FString Filename;
 
 	/** The full hexadecimal SHA1 id of the commit this revision refers to */

@@ -1,97 +1,69 @@
 # UEGitPlugin 研究报告
 
-## 总体概览
-- 插件模块: GitSourceControl. 核心职责是实现 UE SourceControl Provider, 并通过 Git CLI 完成状态查询, 提交, 同步, LFS 锁等操作.
-- 主要对象: FGitSourceControlModule 负责模块生命周期和菜单扩展, FGitSourceControlProvider 负责 ISourceControlProvider, IGitSourceControlWorker 系列负责具体命令执行, GitSourceControlUtils 封装 Git 命令与解析逻辑.
-- 线程模型: 命令可异步执行, 通过 FGitSourceControlCommand 派发到线程池并在 Tick 中回收结果; 另外有一个 FGitSourceControlRunner 定时后台拉取并刷新状态.
+## 结论
 
-## 文件结构与职责
-- 模块入口: GitSourceControlModule.h/.cpp
-- Provider 实现: GitSourceControlProvider.h/.cpp
-- 命令与执行: GitSourceControlCommand.h/.cpp
-- Git 工具与解析: GitSourceControlUtils.h/.cpp
-- 操作 Worker: GitSourceControlOperations.h/.cpp
-- 状态与历史: GitSourceControlState.h/.cpp, GitSourceControlRevision.h/.cpp
-- Changelist 支持: GitSourceControlChangelist.h/.cpp, GitSourceControlChangelistState.h/.cpp
-- UI 设置面板: SGitSourceControlSettings.h/.cpp
-- 菜单扩展: GitSourceControlMenu.h/.cpp
-- 后台刷新线程: GitSourceControlRunner.h/.cpp
-- 控制台命令: GitSourceControlConsole.h/.cpp
+当前插件是 Unreal Editor 的 local Git Source Control provider. 它只在本地 Git working tree 和 index 上执行明确路径操作, 不承担 remote 或 branch workflow. 远端同步, 分支管理和团队协作由项目使用的外部 Git GUI 或命令行客户端完成.
 
-## 核心流程梳理
+## 当前实现
 
-### 初始化与连接
-- FGitSourceControlModule::StartupModule 注册 Worker, 加载设置, 绑定 Provider, 绑定 ContentBrowser 事件.
-- FGitSourceControlProvider::CheckGitAvailability 解析设置或自动查找 Git 路径, 随后调用 CheckRepositoryStatus.
-- CheckRepositoryStatus 会解析用户配置, 分支, 远端, 以及 LFS lockable 状态, 并做首次 RunUpdateStatus.
+- `FGitSourceControlModule` 注册 `Connect`, `UpdateStatus` 和 `Delete` worker, 注册 Source Control provider 和 Content Browser 菜单.
+- `FGitSourceControlProvider` 负责 Git executable 和 repository 检查, 状态缓存, 异步命令调度, generation 防陈旧结果, 目录监听和防抖刷新.
+- `GitSourceControlUtils` 使用本地 Git 命令解析 porcelain-v2 status, rename/copy 对, special path, history 和 exact blob. 空路径不会升级为 repository-wide scan.
+- `FGitSourceControlMenu` 提供选中资产的 discard, delete new asset files, history restore 和 local status refresh.
+- `FGitSourceControlAssetOperations` 是 UI 无关的本地变更服务. 它拒绝目录目标和 mixed-root 请求, 对 mutation 执行确认, fingerprint, repository generation 和 index snapshot 复核, 并在失败时尝试 backup rollback.
+- `FGitSourceControlRevision` 和 History UI 支持单文件历史与 revision export. 导出不使用 filters 或 LFS smudge, 以避免把提示文本混入二进制数据.
 
-### 状态查询与缓存
-- 状态缓存存在 FGitSourceControlProvider::StateCache 中, 通过 GetStateInternal 写入.
-- RunUpdateStatus 调用 Git status 并解析结果, 结果写入 FGitSourceControlState.
-- 更新后会 AddFileToIgnoreForceCache 避免短时间内重复强制查询.
+## 支持的 Editor 行为
 
-### 提交与推送
-- FGitCheckInWorker 负责 commit, 并在成功后自动 push, 如失败尝试 fetch + pull + push, 同时处理 LFS unlock.
-- 会使用 git diff 或 git log 获取未推送变更文件, 并用于更新状态.
+### Local status
 
-### 同步与拉取
-- FGitSyncWorker 先 fetch, 再 pull, 再更新状态, 并获取 commit 信息.
-- GitSourceControlUtils::PullOrigin 会对 lockable 文件执行包卸载和重载, 并强制 pull --rebase --autostash.
+Provider 返回选定路径的 staged, working-tree, untracked, ignored, deleted, copied 和 renamed 状态. `UsesCheckout`, `UsesChangelists` 和 `UsesLocalReadOnlyState` 均为 false, 因此 UI 不模拟 checkout, changelist 或 server-side read-only state.
 
-### LFS 文件锁
-- bUsingGitLfsLocking 决定 checkout 和 read-only 语义, 结合 FGitLockedFilesCache 更新本地只读标志.
+### Asset mutations
 
-### uasset 历史版本与 diff 流程
-- 入口在 ContentBrowser 右键菜单: "Diff against status branch". 调用 FGitSourceControlModule::DiffAssetAgainstGitOriginBranch -> DiffAgainstOriginBranch.
-- DiffAgainstOriginBranch 取当前资源的包路径, 通过 GitSourceControlUtils::GetOriginRevisionOnBranch 获取指定分支(状态分支)上的最新提交信息.
-- GetOriginRevisionOnBranch 内部执行 `git show <BranchName>` 解析提交信息, 产出 FGitSourceControlRevision, 并修正 Filename 为相对路径.
-- FGitSourceControlRevision::Get 使用 `git cat-file --filters <CommitId>:<RelativePath>` 将指定版本导出为临时文件(会走 filters, 对 LFS 资产可触发 smudge).
-- 导出的临时包被 LoadPackage 以 LOAD_ForDiff|LOAD_DisableCompileOnLoad 加载, 再由 AssetTools::DiffAssets 将旧版本 UObject 与当前 UObject 做 diff.
-- 另一条历史链路来自 UpdateStatus 的 ShouldUpdateHistory: RunGetHistory 执行 `git log --follow --date=raw --name-status --pretty=medium`, 再用 `git ls-tree --long` 取 blob hash 与大小, 写入 FGitSourceControlState::History 供 UI 展示.
-- 现象与原因: 对 LFS 资产, `git ls-tree --long` 只能拿到 pointer blob 的大小, 所以历史列表会显示指针大小; 超出本地 LFS 缓存的旧版本在 `git cat-file --filters` 时也可能只得到 pointer 或失败.
-- 修复策略: 使用 `git ls-tree <commit> -- <path>` 获取 blob hash, 先 `git cat-file -p <blob>` 判断是否为 LFS pointer; 如果是 LFS, 先执行 `git lfs fetch --include=<path> --all` 拉取历史对象, 再用 `git cat-file --filters <commit>:<path>` 导出. 该导出仍走 stdout, 但由于对象已在本地不会触发下载, 因此不会混入下载进度文本; 若导出结果仍是 LFS pointer, 则视为失败并触发 LFS 拉取重试; 在 history 中对 LFS pointer 解析 `size <n>` 并覆盖 FileSize 为真实大小; fetch 或导出失败时弹对话框提示手动拉取.
-- 已发现 bug: 当 `git cat-file --filters` 触发 LFS 下载时, git-lfs 会输出 "Downloading ..." 进度到 stdout, 该文本被拼入二进制输出导致 uasset 文件头损坏, UE 报 "Unable to load assets to diff" 或 summary invalid.
-- 调试策略: 在 UE 日志中输出导出路径, 文件头 hex, 是否走 LFS 路径, 以及失败原因, 用于快速定位 diff 失败或文件损坏问题.
- - 防御措施: 导出后校验 uasset 文件头魔数, 不合法则删除临时文件并报错, 避免复用损坏文件.
+- **Discard tracked changes**: 对明确选择的 tracked files 执行 `git restore --source=HEAD --staged --worktree`, 覆盖 staged 与 worktree 变更, 并处理 rename 的 old/new pair.
+- **Delete new asset files**: 仅处理明确选择的 untracked 或 index-added files, 先更新 index 再删除磁盘文件, 不调用 directory-level `git clean`.
+- **Restore history revision**: 从指定 commit/path 导出临时 blob, 校验 Unreal package header 后替换当前 worktree 文件. Git index, branch 和 remotes 保持不变.
 
-### UI 与菜单
-- FGitSourceControlMenu 在状态栏菜单中加入 Push, Pull, Revert, Refresh, 并处理通知条与 stash.
-- SGitSourceControlSettings 提供 Git 路径, LFS 开关, 初始化仓库功能. UE5 分支中初始化相关功能被隐藏.
+所有 mutation 都要求用户确认, 变更前重新检查目标文件和 index. 已加载 package 的 reload 由 Editor callback 请求, 失败会在结果中报告.
 
-### 后台自动刷新
-- FGitSourceControlRunner 每 30 秒执行一次 FGitFetch 并更新状态.
+### History and local LFS
 
-## 关键数据结构与状态模型
-- FGitState 组合 EFileState, ETreeState, ELockState, ERemoteState 来描述文件.
-- FGitSourceControlState::GetGitState 将多状态折叠成 UI 友好的优先级状态.
-- Changelist 在 UE5 中抽象为 Working 与 Staged, 并映射到 git add 或 git restore --staged.
+History 是按文件显式请求的 local `git log`. Git LFS pointer 优先从本地 LFS storage materialize; 用户主动执行历史 Diff/Restore 且 object 缺失时, 插件只 fetch 对应 full commit + historical path. 下载阶段可取消并有 90 秒 timeout, 完成后必须通过 SHA-256 和 size 校验.
 
-## 潜在问题与风险点
-- 线程安全: FGitSourceControlRunner 使用普通 bool 标志位, 在多线程环境中没有原子保护, 有竞态风险.
-- 命令可用性与路径: FGitSourceControlModule::StartupModule 中 RequiredRepositoryAccessURL 检查直接调用 git 命令, 未使用设置中的 Git 路径, 在非 PATH 场景会失败.
-- LFS Lock 与只读状态: FGitLockedFilesCache::OnFileLockChanged 直接修改文件只读属性, 若锁状态与远端不同步可能导致误导.
-- Revert 行为: FGitRevertWorker 中 reset/checkout 逻辑被注释, 实际使用 git restore -SW, 但文件选择逻辑较复杂, 可能导致状态未更新.
-- 提交后自动推送: FGitCheckInWorker 在提交后自动 push, 且在冲突时自动 pull, 多人协作时可能引发 UI 意外或阻塞.
+Editor automation 通过 AS-visible `GitLocalSourceControl` typed API 控制当前能力. API 提供 provider info, status, history, LFS fetch, discard, untracked delete 和 revision restore; operation handle 仅在 Game Thread 被 Tick/Cancel/readback, Git/LFS I/O 在 worker. 输入为 asset object path, 不暴露 raw Git argv. Mutation 拒绝 Map, loaded, dirty 或 open package, 在写入前重新验证 package/HEAD/index/generation/fingerprint, 并按 repository 串行执行.
 
-## 优化机会与扩展点
-- 状态刷新策略: TicksUntilNextForcedUpdate 由 ContentBrowser 事件触发强制刷新, 大项目可能带来频繁状态扫描. 可引入节流或分批更新.
-- Git 命令拼接: RunCommandInternalRaw 构建命令时未统一转义策略, 当前依赖上层传入安全参数. 可考虑统一转义并记录原始参数以便调试.
-- Changelist 体验: 仅支持 Working 与 Staged, UI 显示和描述比较基础. 可扩展 staging 视图或增加对 shelved 的提示.
-- LFS 锁信息: GetAllLocks 返回全量锁, 缓存刷新策略依赖 fetch. 可考虑按需刷新或在状态更新时仅刷新相关路径.
+## 外部 Git client 边界
 
-## 建议的后续工作方向
-1) Bug 修复: 先明确症状或日志, 从 GitSourceControlOperations.cpp 与 GitSourceControlUtils.cpp 做最小化定位.
-2) 性能优化: 明确项目规模与卡顿点, 优先评估 RunUpdateStatus 触发频率与 TicksUntilNextForcedUpdate 逻辑.
-3) 功能扩展: 明确目标功能后, 基于 FGitSourceControlProvider::RegisterWorker 与菜单扩展点设计改造方案.
+插件不执行 branch checkout, remote status polling 或 server coordination. 项目仍在外部 Git client 中完成常规 fetch, pull, push, commit, merge, conflict resolution 和 LFS lock 等协作步骤. 唯一网络例外是用户主动历史 Diff/Restore 所需的精准 Git LFS fetch; status, watcher, Content Browser 浏览和普通 workspace mutation 不联网. 外部变更通过 directory watcher 触发防抖 invalidation; 必要时可在菜单中手动刷新 selected 或 cached local status.
 
-## 经验性总结: uasset diff 与 Git LFS stdout 污染
-- 现象: uasset diff 临时文件头出现 `warning: current Git remote contains credentials`, 导致 LoadPackage 失败.
-- 根因: Git 自身把 warning 输出到 stdout, 与 `git cat-file --filters` 的二进制输出混在一起.
-- 关键结论: `git lfs fetch --all` 只影响 LFS 对象可用性, 不会阻止 warning 输出, 也不能保证 stdout 纯净.
-- 防御策略: 导出后在二进制缓冲区内扫描 `PACKAGE_FILE_TAG` / `PACKAGE_FILE_TAG_SWAPPED`, 将其作为二进制起始位置并截断前导文本; 扫描上限建议 16KB.
-- 失败策略: 若前 16KB 未命中 tag, 直接判定导出失败并记录日志, 避免写入坏文件; `RunDumpToFile` 会返回失败以触发上层重试或报错.
-- 弱校验局限: 当前 `IsValidPackageSummary` 的 offset/count 校验只保证值在范围内, 不能拦截 "offset 合法但 count 极大" 这类逻辑异常; 如需更严格应加入 count 上限或 offset+count*entrySize 检查.
-- 调试策略: 输出被截断文本, 便于定位来自 Git 或 git-lfs 的提示内容.
-- 缓存策略: 若已存在临时文件且无效, 应删除并触发重新导出; 避免持续复用坏文件.
-- LFS fetch 触发点: 保留在导出失败或导出结果仍为 LFS pointer 时再执行 fetch + 重试, 可减少无效的预先 fetch.
-- 根因治理建议: 将 remote URL 中的凭据移除, 采用 credential helper 或 SSH, 从源头避免该 warning.
+## 安全与一致性语义
+
+1. 输入路径先转为绝对路径并解析 nearest Git root. 跨 repository 选择直接拒绝.
+2. 命令使用 exact pathspec 和 NUL-safe 参数. 空列表, directory target 和无法解析的 repository 不执行 mutation.
+3. Discard 和 historical restore 在确认前保存文件 fingerprint, index snapshot 和 repository generation. 外部 Git 操作或文件变化会使请求失效, 需要 refresh 后重试.
+4. Mutation 前创建临时 safety backup. Git 或文件系统步骤失败时恢复 index 和 worktree; 无法恢复的 backup 会保留并报告路径.
+5. 历史 Unreal package 校验 `PACKAGE_FILE_TAG` 或 swapped tag. LFS 只检查 pointer 声明的 object size, 不执行 network fetch.
+
+## 构建与测试入口
+
+从项目根目录运行:
+
+```text
+npm run build:regular
+npm run test:unreal:automation -- Cthulhu.GitSourceControl
+```
+
+`GitSourceControlTests` 在 system temp 下创建隔离的 local Git repository, 覆盖 status, rename pair, history/blob, capability 和 asset operation. 测试需要可执行的 Git, 不连接 remote.
+
+## 已知限制
+
+- Provider 不提供 remote/branch 协作状态, commit/push/pull 流程, conflict resolution 或 LFS lock 管理; 这些属于外部 Git client 边界.
+- 历史 LFS revision 依赖本地 object. 缺少 object 时必须先在外部获取, 插件不会自动补齐.
+- LFS materialization 当前按 pointer 声明的 size 检查 object, 不在 Engine 内执行可靠的 SHA-256 OID 校验.
+- Asset mutation 依赖 Unreal package 当前加载状态. 磁盘变更成功后 reload callback 仍可能失败, 需要按 Editor 提示处理.
+- 插件不提供 precompiled binary. 构建需要项目 Unreal Editor target 和可用的 C++ toolchain.
+
+## Attribution and license
+
+代码起源于 [UE4GitPlugin by Sebastien Rombauts](https://github.com/SRombauts/UE4GitPlugin), 后续包含 Project Borealis 的 production changes. 许可证为 MIT, 详见同目录 [LICENSE.txt](../LICENSE.txt).

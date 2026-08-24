@@ -8,6 +8,7 @@
 #include "Modules/ModuleManager.h"
 #include "GitSourceControlModule.h"
 #include "GitSourceControlUtils.h"
+#include "HAL/PlatformProcess.h"
 
 FGitSourceControlCommand::FGitSourceControlCommand(const TSharedRef<class ISourceControlOperation, ESPMode::ThreadSafe>& InOperation, const TSharedRef<class IGitSourceControlWorker, ESPMode::ThreadSafe>& InWorker, const FSourceControlOperationComplete& InOperationCompleteDelegate)
 	: Operation(InOperation)
@@ -16,6 +17,8 @@ FGitSourceControlCommand::FGitSourceControlCommand(const TSharedRef<class ISourc
 	, bExecuteProcessed(0)
 	, bCancelled(0)
 	, bCommandSuccessful(false)
+	, CompletionEvent(FPlatformProcess::GetSynchEventFromPool(true))
+	, bResultsReturned(0)
 	, bAutoDelete(true)
 	, Concurrency(EConcurrency::Synchronous)
 {
@@ -23,9 +26,17 @@ FGitSourceControlCommand::FGitSourceControlCommand(const TSharedRef<class ISourc
 	const FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
 	const FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
 	PathToGitBinary = Provider.GetGitBinaryPath();
-	bUsingGitLfsLocking = Provider.UsesCheckout();
 	PathToRepositoryRoot = Provider.GetPathToRepositoryRoot();
 	PathToGitRoot = Provider.GetPathToGitRoot();
+}
+
+FGitSourceControlCommand::~FGitSourceControlCommand()
+{
+	if (CompletionEvent != nullptr)
+	{
+		FPlatformProcess::ReturnSynchEventToPool(CompletionEvent);
+		CompletionEvent = nullptr;
+	}
 }
 
 void FGitSourceControlCommand::UpdateRepositoryRootIfSubmodule(TArray<FString>& AbsoluteFilePaths)
@@ -35,7 +46,15 @@ void FGitSourceControlCommand::UpdateRepositoryRootIfSubmodule(TArray<FString>& 
 
 bool FGitSourceControlCommand::DoWork()
 {
+	if (IsCanceled())
+	{
+		FPlatformAtomics::InterlockedExchange(&bExecuteProcessed, 1);
+		return false;
+	}
+
+	GitSourceControlUtils::SetActiveCommand(this);
 	bCommandSuccessful = Worker->Execute(*this);
+	GitSourceControlUtils::ClearActiveCommand(this);
 	FPlatformAtomics::InterlockedExchange(&bExecuteProcessed, 1);
 
 	return bCommandSuccessful;
@@ -44,12 +63,15 @@ bool FGitSourceControlCommand::DoWork()
 void FGitSourceControlCommand::Abandon()
 {
 	FPlatformAtomics::InterlockedExchange(&bExecuteProcessed, 1);
+	CompletionEvent->Trigger();
 }
 
 void FGitSourceControlCommand::DoThreadedWork()
 {
 	Concurrency = EConcurrency::Asynchronous;
 	DoWork();
+	// The thread pool may still access this IQueuedWork until this method returns.
+	CompletionEvent->Trigger();
 }
 
 void FGitSourceControlCommand::Cancel()
@@ -62,8 +84,18 @@ bool FGitSourceControlCommand::IsCanceled() const
 	return bCancelled != 0;
 }
 
+bool FGitSourceControlCommand::WaitForCompletion(uint32 InTimeoutMilliseconds) const
+{
+	return CompletionEvent != nullptr && CompletionEvent->Wait(InTimeoutMilliseconds);
+}
+
 ECommandResult::Type FGitSourceControlCommand::ReturnResults()
 {
+	if (FPlatformAtomics::InterlockedCompareExchange(&bResultsReturned, 1, 0) != 0)
+	{
+		return IsCanceled() ? ECommandResult::Cancelled : (bCommandSuccessful ? ECommandResult::Succeeded : ECommandResult::Failed);
+	}
+
 	// Save any messages that have accumulated
 	for (const auto& String : ResultInfo.InfoMessages)
 	{

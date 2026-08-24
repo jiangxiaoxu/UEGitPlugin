@@ -5,10 +5,11 @@
 
 #pragma once
 
-#include "GitSourceControlChangelist.h"
 #include "ISourceControlProvider.h"
 #include "Misc/IQueuedWork.h"
 #include "Runtime/Launch/Resources/Version.h"
+
+class FEvent;
 
 /** Accumulated error and info messages for a revision control operation.  */
 struct FGitSourceControlResultInfo
@@ -36,6 +37,7 @@ class FGitSourceControlCommand : public IQueuedWork
 public:
 
 	FGitSourceControlCommand(const TSharedRef<class ISourceControlOperation, ESPMode::ThreadSafe>& InOperation, const TSharedRef<class IGitSourceControlWorker, ESPMode::ThreadSafe>& InWorker, const FSourceControlOperationComplete& InOperationCompleteDelegate = FSourceControlOperationComplete());
+	virtual ~FGitSourceControlCommand() override;
 
 	/**
 	 *  Modify the repo root if all selected files are in a plugin subfolder, and the plugin subfolder is a git repo
@@ -69,6 +71,9 @@ public:
 	/** Is the operation canceled? */
 	bool IsCanceled() const;
 
+	/** Wait until a worker has stopped accessing this command. */
+	bool WaitForCompletion(uint32 InTimeoutMilliseconds = MAX_uint32) const;
+
 	/** Save any results and call any registered callbacks. */
 	ECommandResult::Type ReturnResults();
 
@@ -81,9 +86,6 @@ public:
 
 	/** Path to the root of the Git repository: can be the ProjectDir itself, or any parent directory (found by the "Connect" operation) */
 	FString PathToGitRoot;
-
-	/** Tell if using the Git LFS file Locking workflow */
-	bool bUsingGitLfsLocking;
 
 	/** Operation we want to perform - contains outward-facing parameters & results */
 	TSharedRef<class ISourceControlOperation, ESPMode::ThreadSafe> Operation;
@@ -103,11 +105,11 @@ public:
 	/**If true, the revision control command succeeded*/
 	bool bCommandSuccessful;
 
-	/** Current Commit full SHA1 */
-	FString CommitId;
+	/** Completion event used by provider shutdown to join an active worker safely. */
+	FEvent* CompletionEvent;
 
-	/** Current Commit description's Summary */
-	FString CommitSummary;
+	/** Prevent a cancellation and normal completion from invoking the delegate twice. */
+	volatile int32 bResultsReturned;
 
 	/** If true, this command will be automatically cleaned up in Tick() */
 	bool bAutoDelete;
@@ -118,14 +120,7 @@ public:
 	/** Files to perform this operation on */
 	TArray<FString> Files;
 
-#if ENGINE_MAJOR_VERSION == 5
-    /** Changelist to perform this operation on */
-    FGitSourceControlChangelist Changelist;
-#endif
-
 	/** Potential error, warning and info message storage */
 	FGitSourceControlResultInfo ResultInfo;
 
-	/** Branch names for status queries */
-	TArray< FString > StatusBranchNames;
 };

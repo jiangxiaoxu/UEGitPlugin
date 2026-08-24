@@ -70,7 +70,11 @@ TSharedPtr<class ISourceControlRevision, ESPMode::ThreadSafe> FGitSourceControlS
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 2
 TSharedPtr<class ISourceControlRevision, ESPMode::ThreadSafe> FGitSourceControlState::GetCurrentRevision() const
 {
-	return nullptr;
+	if (History.IsEmpty())
+	{
+		return nullptr;
+	}
+	return History[0];
 }
 #endif
 
@@ -100,10 +104,6 @@ FSlateIcon FGitSourceControlState::GetIcon() const
 	{
 	case EGitState::NotAtHead:
 		return GET_ICON_RETURN(NotAtHeadRevision);
-	case EGitState::LockedOther:
-		return GET_ICON_RETURN(CheckedOutByOtherUser);
-	case EGitState::NotLatest:
-		return GET_ICON_RETURN(ModifiedOtherBranch);
 	case EGitState::Unmerged:
 		return GET_ICON_RETURN(Branched);
 	case EGitState::Added:
@@ -113,7 +113,6 @@ FSlateIcon FGitSourceControlState::GetIcon() const
 	case EGitState::Deleted:
 		return GET_ICON_RETURN(MarkedForDelete);
 	case EGitState::Modified:
-	case EGitState::CheckedOut:
 		return GET_ICON_RETURN(CheckedOut);
 	case EGitState::Ignored:
 		return GET_ICON_RETURN(NotInDepot);
@@ -161,10 +160,6 @@ FText FGitSourceControlState::GetDisplayName() const
 	{
 	case EGitState::NotAtHead:
 		return LOCTEXT("NotCurrent", "Not current");
-	case EGitState::LockedOther:
-		return FText::Format(LOCTEXT("CheckedOutOther", "Checked out by: {0}"), FText::FromString(State.LockUser));
-	case EGitState::NotLatest:
-		return FText::Format(LOCTEXT("ModifiedOtherBranch", "Modified in branch: {0}"), FText::FromString(State.HeadBranch));
 	case EGitState::Unmerged:
 		return LOCTEXT("Conflicted", "Conflicted");
 	case EGitState::Added:
@@ -174,8 +169,7 @@ FText FGitSourceControlState::GetDisplayName() const
 	case EGitState::Deleted:
 		return LOCTEXT("MarkedForDelete", "Marked for delete");
 	case EGitState::Modified:
-	case EGitState::CheckedOut:
-		return LOCTEXT("CheckedOut", "Checked out");
+		return LOCTEXT("Modified", "Modified");
 	case EGitState::Ignored:
 		return LOCTEXT("Ignore", "Ignore");
 	case EGitState::Lockable:
@@ -193,10 +187,6 @@ FText FGitSourceControlState::GetDisplayTooltip() const
 	{
 	case EGitState::NotAtHead:
 		return LOCTEXT("NotCurrent_Tooltip", "The file(s) are not at the head revision");
-	case EGitState::LockedOther:
-		return FText::Format(LOCTEXT("CheckedOutOther_Tooltip", "Checked out by: {0}"), FText::FromString(State.LockUser));
-	case EGitState::NotLatest:
-		return FText::Format(LOCTEXT("ModifiedOtherBranch_Tooltip", "Modified in branch: {0} CL:{1} ({2})"), FText::FromString(State.HeadBranch), FText::FromString(HeadCommit), FText::FromString(HeadAction));
 	case EGitState::Unmerged:
 		return LOCTEXT("ContentsConflict_Tooltip", "The contents of the item conflict with updates received from the repository.");
 	case EGitState::Added:
@@ -206,8 +196,7 @@ FText FGitSourceControlState::GetDisplayTooltip() const
 	case EGitState::Deleted:
 		return LOCTEXT("MarkedForDelete_Tooltip", "The file(s) are marked for delete");
 	case EGitState::Modified:
-	case EGitState::CheckedOut:
-		return LOCTEXT("CheckedOut_Tooltip", "The file(s) are checked out");
+		return LOCTEXT("Modified_Tooltip", "The file has local Git changes.");
 	case EGitState::Ignored:
 		return LOCTEXT("Ignored_Tooltip", "Item is being ignored.");
 	case EGitState::Lockable:
@@ -232,74 +221,26 @@ const FDateTime& FGitSourceControlState::GetTimeStamp() const
 // Deleted and Missing assets cannot appear in the Content Browser, but they do in the Submit files to Revision Control window!
 bool FGitSourceControlState::CanCheckIn() const
 {
-	// We can check in if this is new content
-	if (IsAdded())
-	{
-		return true;
-	}
-
-	// Cannot check back in if conflicted or not current 
-	if (!IsCurrent() || IsConflicted())
-	{
-		return false;
-	}
-
-	// We can check back in if we're locked.
-	if (State.LockState == ELockState::Locked)
-	{
-		return true;
-	}
-
-	// We can check in any file that has been modified, unless someone else locked it.
-	if (State.LockState != ELockState::LockedOther && IsModified() && IsSourceControlled())
-	{
-		return true;
-	}
-
 	return false;
 }
 
 bool FGitSourceControlState::CanCheckout() const
 {
-	if (State.LockState == ELockState::Unlockable)
-	{
-		// Everything is already available for check in (checked out).
-		return false;
-	}
-	else
-	{
-		// We don't want to allow checkout if the file is out-of-date, as modifying an out-of-date binary file will most likely result in a merge conflict
-		return State.LockState == ELockState::NotLocked && IsCurrent();
-	}
+	return false;
 }
 
 bool FGitSourceControlState::IsCheckedOut() const
 {
-	if (State.LockState == ELockState::Unlockable)
-	{
-		return IsSourceControlled(); // TODO: try modified instead? might block editing the file with a holding pattern
-	}
-	else
-	{
-		// We check for modified here too, because sometimes you don't lock a file but still want to push it. CanCheckout still true, so that you can lock it later...
-		return State.LockState == ELockState::Locked || (State.FileState == EFileState::Modified && State.LockState != ELockState::LockedOther);
-	}
+	return false;
 }
 
 bool FGitSourceControlState::IsCheckedOutOther(FString* Who) const
 {
 	if (Who != nullptr)
 	{
-		// The packages dialog uses our lock user regardless if it was locked by other or us.
-		// But, if there is no lock user, it shows information about modification in other branches, which is important.
-		// So, only show our own lock user if it hasn't been modified in another branch.
-		// This is a very, very rare state (maybe impossible), but one that should be displayed properly.
-		if (State.LockState == ELockState::LockedOther || (State.LockState == ELockState::Locked && !IsModifiedInOtherBranch()))
-		{
-			*Who = State.LockUser;
-		}
+		Who->Reset();
 	}
-	return State.LockState == ELockState::LockedOther;
+	return false;
 }
 
 bool FGitSourceControlState::IsCheckedOutInOtherBranch(const FString& CurrentBranch) const
@@ -310,7 +251,7 @@ bool FGitSourceControlState::IsCheckedOutInOtherBranch(const FString& CurrentBra
 
 bool FGitSourceControlState::IsModifiedInOtherBranch(const FString& CurrentBranch) const
 {
-	return State.RemoteState == ERemoteState::NotLatest;
+	return false;
 }
 
 bool FGitSourceControlState::GetOtherBranchHeadModification(FString& HeadBranchOut, FString& ActionOut, int32& HeadChangeListOut) const
@@ -328,7 +269,7 @@ bool FGitSourceControlState::GetOtherBranchHeadModification(FString& HeadBranchO
 
 bool FGitSourceControlState::IsCurrent() const
 {
-	return State.RemoteState != ERemoteState::NotAtHead && State.RemoteState != ERemoteState::NotLatest;
+	return true;
 }
 
 bool FGitSourceControlState::IsSourceControlled() const
@@ -354,19 +295,12 @@ bool FGitSourceControlState::IsIgnored() const
 
 bool FGitSourceControlState::CanEdit() const
 {
-	// Perforce does not care about it being current
-	return IsCheckedOut() || IsAdded();
+	return !IsConflicted() && !IsIgnored() && State.TreeState != ETreeState::NotInRepo;
 }
 
 bool FGitSourceControlState::CanDelete() const
 {
-	// Perforce enforces that a deleted file must be current.
-	if (!IsCurrent())
-	{
-		return false;
-	}
-	// If someone else hasn't checked it out, we can delete revision controlled files.
-	return !IsCheckedOutOther() && IsSourceControlled();
+	return IsSourceControlled() && !IsConflicted() && !IsIgnored();
 }
 
 bool FGitSourceControlState::IsUnknown() const
@@ -383,7 +317,7 @@ bool FGitSourceControlState::IsModified() const
 
 bool FGitSourceControlState::CanAdd() const
 {
-	return State.TreeState == ETreeState::Untracked;
+	return false;
 }
 
 bool FGitSourceControlState::IsConflicted() const
@@ -393,35 +327,12 @@ bool FGitSourceControlState::IsConflicted() const
 
 bool FGitSourceControlState::CanRevert() const
 {
-	// Can revert the file state if we modified, even if it was locked by someone else.
-	// Useful for when someone locked a file, and you just wanna play around with it locallly, and then revert it.
-	return CanCheckIn() || IsModified();
+	// Generic UE Revert has no asset-aware confirmation or reload boundary.
+	return false;
 }
 
 EGitState::Type FGitSourceControlState::GetGitState() const
 {
-	// No matter what, we must pull from remote, even if we have locked or if we have modified.
-	switch (State.RemoteState)
-	{
-	case ERemoteState::NotAtHead:
-		return EGitState::NotAtHead;
-	default:
-		break;
-	}
-
-	/** Someone else locked this file across branches. */
-	// We cannot push under any circumstance, if someone else has locked.
-	if (State.LockState == ELockState::LockedOther)
-	{
-		return EGitState::LockedOther;
-	}
-
-	// We could theoretically push, but we shouldn't.
-	if (State.RemoteState == ERemoteState::NotLatest)
-	{
-		return EGitState::NotLatest;
-	}
-
 	switch (State.FileState)
 	{
 	case EFileState::Unmerged:
@@ -431,6 +342,8 @@ EGitState::Type FGitSourceControlState::GetGitState() const
 	case EFileState::Deleted:
 		return EGitState::Deleted;
 	case EFileState::Modified:
+	case EFileState::Copied:
+	case EFileState::Renamed:
 		return EGitState::Modified;
 	default:
 		break;
@@ -440,18 +353,13 @@ EGitState::Type FGitSourceControlState::GetGitState() const
 	{
 		return EGitState::Untracked;
 	}
-
-	if (State.LockState == ELockState::Locked)
+	if (State.TreeState == ETreeState::Ignored)
 	{
-		return EGitState::CheckedOut;
+		return EGitState::Ignored;
 	}
 
 	if (IsSourceControlled())
 	{
-		if (CanCheckout())
-		{
-			return EGitState::Lockable;
-		}
 		return EGitState::Unmodified;
 	}
 
