@@ -5,16 +5,12 @@
 
 #pragma once
 
-#include "GitSourceControlRevision.h"
-#include "GitSourceControlState.h"
+#include "GitSourceControlHistoryMode.h"
+#include "GitSourceControlFileStatus.h"
 #include "Runtime/Launch/Resources/Version.h"
 #if ENGINE_MAJOR_VERSION == 5
 #include "UObject/ObjectSaveContext.h"
 #endif
-
-class FGitSourceControlState;
-
-class FGitSourceControlCommand;
 
 /**
  * Helper struct for maintaining temporary files for passing to commands
@@ -38,6 +34,19 @@ private:
 };
 
 struct FGitVersion;
+class UPackage;
+
+#if WITH_DEV_AUTOMATION_TESTS
+struct GITSOURCECONTROL_API FGitStandaloneHistoryTestEntry
+{
+	FString CommitId;
+	FString HistoricalPath;
+	FString LocalFilename;
+	FString Description;
+	FString Author;
+	FString Action;
+};
+#endif
 
 struct GITSOURCECONTROL_API FGitRenamePair
 {
@@ -108,6 +117,9 @@ namespace GitSourceControlUtils
  */
 GITSOURCECONTROL_API FString FindGitBinaryPath();
 
+/** Resolve a local Git executable and repository root for one explicit workspace file. */
+GITSOURCECONTROL_API bool ResolveStandaloneRepositoryForFile(const FString& InFilename, FString& OutGitBinary, FString& OutRepositoryRoot, FString& OutError);
+
 /**
  * Run a Git "version" command to check the availability of the binary.
  * @param InPathToGitBinary		The path to the Git binary
@@ -116,7 +128,7 @@ GITSOURCECONTROL_API FString FindGitBinaryPath();
  */
 bool CheckGitAvailability(const FString& InPathToGitBinary, FGitVersion* OutVersion = nullptr);
 
-/** Verify the local-only porcelain-v2 status and literal path query capabilities required by this provider. */
+/** Verify local-only porcelain-v2 status and literal-path query capabilities for explicit standalone mutations. */
 GITSOURCECONTROL_API bool CheckLocalGitCapabilities(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutError);
 
 /**
@@ -173,18 +185,6 @@ void GetUserConfig(const FString& InPathToGitBinary, const FString& InRepository
 GITSOURCECONTROL_API  bool RunCommand( const FString & InCommand, const FString & InPathToGitBinary, const FString & InRepositoryRoot, const TArray< FString > & InParameters, const TArray< FString > & InFiles, TArray< FString > & OutResults, TArray< FString > & OutErrorMessages );
 bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, FString& OutResults, FString& OutErrors, const int32 ExpectedReturnCode = 0, const bool bLogFailure = true);
 
-/** Bind cancellation to Git work executed by the current worker thread. */
-void SetActiveCommand(const FGitSourceControlCommand* InCommand);
-
-/** Clear the cancellation binding for the current worker thread. */
-void ClearActiveCommand(const FGitSourceControlCommand* InCommand);
-
-/** Increment the local repository generation after an external or local mutation. */
-GITSOURCECONTROL_API void InvalidateRepository(const FString& InRepositoryRoot);
-
-/** Return the local repository generation used to reject stale asynchronous results. */
-GITSOURCECONTROL_API uint64 GetRepositoryGeneration(const FString& InRepositoryRoot);
-
 /**
  * Unloads packages of specified named files
  */
@@ -207,7 +207,7 @@ void ReloadPackages(TArray<UPackage*>& InPackagesToReload);
  * @returns true if the command succeeded and returned no errors
  */
 GITSOURCECONTROL_API bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles,
-					 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlState>& OutStates);
+					 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlFileStatus>& OutStates);
 
 /** Expand selected paths with their porcelain-v2 rename counterpart as atomic old/new groups. */
 GITSOURCECONTROL_API bool ExpandSelectedPathsWithRenamePairs(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InSelectedFiles,
@@ -220,7 +220,7 @@ GITSOURCECONTROL_API bool CaptureIndexEntriesForPaths(const FString& InPathToGit
 /** Restore only entries in a prior snapshot through stdin consumed by `git update-index -z --index-info`. */
 GITSOURCECONTROL_API bool RestoreIndexEntries(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FGitIndexSnapshot& InSnapshot, FString& OutError);
 
-/** Run a guarded local restore on explicit absolute files; no directory or repository-wide mutation is accepted. */
+/** Run a guarded local restore or exact-path index reset; no directory or repository-wide mutation is accepted. */
 GITSOURCECONTROL_API bool RunExactPathspecMutation(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InVerb,
 	const TArray<FString>& InParameters, const TArray<FString>& InFiles, FString& OutError);
 
@@ -238,10 +238,27 @@ GITSOURCECONTROL_API bool DumpRevisionBlobToFile(const FString& InPathToGitBinar
 
 	/**
 	 * Fetch one historical LFS path only after an explicit History Diff/Restore request.
-	 * The remote is resolved as current upstream, then origin, then the sole configured remote.
+	 * The remote is resolved as current branch upstream, then the sole configured remote.
 	 */
 	GITSOURCECONTROL_API bool FetchLfsContentForRevision(const FString& InPathToGitBinary, const FString& InRepositoryRoot,
 		const FString& InFullCommitId, const FString& InHistoricalPath, FString& OutError);
+
+#if WITH_DEV_AUTOMATION_TESTS
+	namespace Testing
+	{
+		GITSOURCECONTROL_API void ResetGitProcessLaunchCount();
+		GITSOURCECONTROL_API uint64 GetGitProcessLaunchCount();
+		GITSOURCECONTROL_API uint64 GetGitLfsFetchLaunchCount();
+		GITSOURCECONTROL_API uint64 GetGitProcessLaunchCountAtModuleStartup();
+		GITSOURCECONTROL_API void CaptureGitProcessLaunchCountAtModuleStartup();
+		GITSOURCECONTROL_API bool LoadStandaloneHistory(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InFilename,
+			EGitLocalSourceControlHistoryMode InMode, FString& OutCapturedHead, bool& bOutHeadChanged, TArray<FGitStandaloneHistoryTestEntry>& OutHistory, FString& OutError);
+		GITSOURCECONTROL_API bool ExportStandaloneRevisionForDiff(const FString& InGitBinary, const FString& InRepositoryRoot,
+			const FString& InLocalFilename, const FString& InCommitId, const FString& InHistoricalPath, FString& OutTempFilename);
+		GITSOURCECONTROL_API UPackage* LoadStandaloneRevisionPackageForDiff(const FString& InGitBinary, const FString& InRepositoryRoot,
+			const FString& InLocalFilename, const FString& InCommitId, const FString& InHistoricalPath);
+	}
+#endif
 
 /**
  * Run a Git "log" command and parse it.
@@ -249,11 +266,13 @@ GITSOURCECONTROL_API bool DumpRevisionBlobToFile(const FString& InPathToGitBinar
  * @param	InPathToGitBinary	The path to the Git binary
  * @param	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory
  * @param	InFile				The file to be operated on
- * @param	bMergeConflict		In case of a merge conflict, we also need to get the tip of the "remote branch" (MERGE_HEAD) before the log of the "current branch" (HEAD)
+ * @param	bMergeConflict		merge conflict 时 history 不可用
+ * @param	InMode				仅当前路径或已提交 R100 rename 链
+ * @param	OutCapturedHead		查询前解析的 HEAD; 所有 entry 使用这个 immutable snapshot
+ * @param	bOutHeadChanged		immutable query 运行期间 HEAD 变化时为 true
  * @param	OutErrorMessages	Any errors (from StdErr) as an array per-line
  * @param	OutHistory			The history of the file
  */
-GITSOURCECONTROL_API bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InFile, bool bMergeConflict, TArray<FString>& OutErrorMessages, TGitSourceControlHistory& OutHistory);
 
 /**
  * Helper function to convert a filename array to relative paths.
@@ -270,30 +289,5 @@ TArray<FString> RelativeFilenames(const TArray<FString>& InFileNames, const FStr
  * @return an array of filenames, transformed into absolute paths
  */
 TArray<FString> AbsoluteFilenames(const TArray<FString>& InFileNames, const FString& InRelativeTo);
-
-/**
- * Remove redundant errors (that contain a particular string) and also
- * update the commands success status if all errors were removed.
- */
-void RemoveRedundantErrors(FGitSourceControlCommand& InCommand, const FString& InFilter);
-
-
-/**
- * Helper function for various commands to update cached states.
- * @returns true if any states were updated
- */
-GITSOURCECONTROL_API bool UpdateCachedStates( const TMap< const FString, FGitState > & InResults );
-
-/**
-* Helper function for various commands to collect new states.
-* @returns true if any states were updated
-*/
-GITSOURCECONTROL_API bool CollectNewStates( const TMap< FString, FGitSourceControlState > & InStates, TMap< const FString, FGitState > & OutResults );
-	
-/**
- * Helper function for various commands to collect new states.
- * @returns true if any states were updated
- */
-bool CollectNewStates(const TArray<FString>& InFiles, TMap<const FString, FGitState>& OutResults, EFileState::Type FileState, ETreeState::Type TreeState = ETreeState::Unset, ELockState::Type LockState = ELockState::Unset, ERemoteState::Type RemoteState = ERemoteState::Unset);
 
 }

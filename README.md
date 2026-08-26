@@ -1,64 +1,38 @@
 # Unreal Engine Git Plugin
 
-`GitSourceControl` is a local Git provider for Unreal Editor. It reads and changes the selected worktree and index paths through a local Git executable. Remote and branch workflows stay in the external Git client used by the project.
+`GitSourceControl` 是 Unreal Editor 的 standalone local Git asset tool。它不注册 Unreal `ISourceControlProvider`, 不维护 Content Browser 状态徽标, 也不参与 Engine asset lifecycle。启动、静置和普通 create/move/copy/save/rename/delete 不执行 Git; 用户显式触发 History、Diff、LFS Fetch、Force Restore 或 Discard 后才创建异步 job。
 
-## Current implementation
+## 文档
 
-- Resolves Git from the Editor process `PATH`, then validates the executable, repository root, and local capabilities without contacting a remote.
-- Reports path-scoped local status, including staged, working-tree, untracked, ignored, deleted, copied, and renamed paths.
-- Provides Unreal Source Control status, file history, and single-file revision export. Checkout, changelist, and remote-state emulation are not part of this provider contract.
-- Adds explicit Content Browser actions for selected assets:
-  - Discard tracked changes from `HEAD`, including staged changes and tracked deletions.
-  - Delete selected untracked or index-added asset files.
-  - Restore a selected historical revision into the worktree while leaving the Git index unchanged.
-  - Refresh selected or cached local status.
-- Uses and verifies local Git LFS objects. An explicit historical Diff/Restore may fetch only its missing commit/path object with a cancelable 90-second timeout.
-- Watches project and repository paths and debounces local status invalidation after Editor or external-client changes.
+- [Standalone Asset Workflow](Documentation/Standalone-Asset-Workflow.md): 用户入口、History、Diff、Restore、Discard、LFS 和错误处理。
+- [Architecture Contract](Documentation/Architecture.md): providerless 边界、线程模型、revision adapter、asset scope、LFS 规则和 release gates。
+- [研究报告](Source/UEGitPlugin_Research_Report.md): 实现现状、限制、安全语义和测试入口。
 
-## External Git client boundary
+## 当前能力
 
-Status, watching, browsing and workspace mutations are local-only. Use the team's Git GUI or command-line client for branch and collaboration operations such as fetch, pull, push, commit, merge, conflict resolution, and LFS lock management. The only network exception is an explicit historical Diff/Restore whose required LFS object is missing locally; the provider performs a path- and commit-scoped fetch after showing cancelable progress.
+- 当前 mutation scope 只有 tracked `.uasset`; `.umap` 计划未来单独支持。
+- History 默认使用固定 `HEAD` 的 `CurrentPath` 查询; `ExactRenames` 仅追踪 committed、single-parent、`R100` rename, 不使用 `--follow`。
+- standalone History window 提供 revision-workspace、revision-previous 和 selected-revisions 三种 Diff, 以及 selection-driven Restore、Refresh、Close 按钮。
+- Diff 失败或取消时立即清理临时导出; 成功打开的 Diff 导出保留到当前 Editor session 退出, 仅清理插件专用的 `Diff/UEGitPlugin/UEGit-Diff-*` 文件。
+- LFS object 优先使用本地 cache; miss 时只针对目标 commit/path fetch, remote 必须是 branch upstream 或唯一 remote。
+- Force Restore 会明确丢弃目标 `.uasset` 的 worktree、index 和 loaded in-memory changes, reset index path 到 `HEAD`, 原子写入 revision, 并在失败时 rollback。它没有 Undo。
 
-## Installation and configuration
+## 外部 Git client 边界
 
-Install this plugin in the project's `Plugins/` directory, or install it in the engine's `Plugins/` directory. The plugin does not ship precompiled binaries; build it with the project's Unreal Editor target.
+branch、remote、commit、merge、push、pull、conflict resolution、asset delete 和 LFS lock 由项目的外部 Git GUI 或 command line client 负责。插件只对用户选中的路径执行 local Git 操作, 不执行目录级 `git clean`。
 
-The settings page only displays the resolved Git executable and local repository root. It does not persist a binary override. Configure the Editor process `PATH` when a different Git installation should be selected.
+## 安装与验证
 
-For repositories that use Git LFS for Unreal assets, keep explicit attributes for `*.uasset` and `*.umap` in `.gitattributes`, and install Git LFS so the resolved Git executable can run `git lfs pointer` and targeted `git lfs fetch`. The plugin does not ship a Git LFS executable. Configure authentication and remote policy in the external Git client.
-
-## Safety semantics
-
-- Mutating actions require explicit file selections. Directory-wide requests and selections spanning different repositories are rejected.
-- Read-only preflight and LFS download show cancelable progress. After confirmation, mutation and package reload remain modal and non-cancelable until completion.
-- Discard and historical restore perform a confirmation, file fingerprint, repository-generation, and index recheck before mutation.
-- Mutations use exact pathspecs, create temporary safety backups, and attempt rollback when a filesystem or Git step fails. They never invoke directory-level `git clean`.
-- Discard restores both the selected worktree and index entries from `HEAD`. Historical restore writes only the selected worktree file and leaves the index, branch, and remotes unchanged.
-- Unreal package revisions are validated before replacement. Package reload is requested after a successful disk mutation.
-
-## Editor automation API
-
-AngelScript and Blueprint automation can use the typed `GitLocalSourceControl` API. It exposes provider info plus async status, history, LFS fetch, discard, untracked delete, and revision restore operations. Each start function returns a `GitLocalSourceControlOperation`; call `Tick`, `Cancel`, `IsTerminal`, `GetPhase`, and `GetResult` on the Game Thread.
-
-The API accepts asset object paths rather than raw Git arguments. Mutation calls reject Map, loaded, dirty, or open assets, recheck package and Git state immediately before writing, serialize mutations per repository, and become non-cancelable after the mutation boundary. Module shutdown cancels read-only work and joins active mutations.
-
-## Build and tests
-
-From the repository root:
+将插件放入项目 `Plugins/` 或 Engine `Plugins/` 后, 使用项目 Unreal Editor target 构建。Git 从显式操作开始时的 Editor process `PATH` 解析, module startup 不执行 Git probe。
 
 ```text
 npm run build:regular
 npm run test:unreal:automation -- Cthulhu.GitSourceControl
+npm run as:diagnostics
 ```
 
-The automation tests create isolated temporary Git repositories and a local bare LFS remote. They require Git and Git LFS but do not contact an external server.
-
-## Known limitations
-
-- Remote state, branch coordination, server-side conflict handling, and LFS locking are outside the Editor provider and must be handled externally.
-- Historical LFS revisions require Git LFS through the resolved Git executable and a resolvable upstream, `origin`, or sole remote when the object is missing. Downloads are commit/path scoped, cancelable, time-bounded, and verified by SHA-256 and size.
-- Asset mutations and package reloads depend on the Unreal Editor's package state; save or reload prompts may still be required by the surrounding Editor workflow.
+插件需要可执行的 Git; 使用 Git LFS 的项目还需要 Git LFS 能通过该 Git executable 访问本地 object store。插件不提供 Git、Git LFS 或预编译 binary。
 
 ## Attribution and license
 
-This plugin is a refactor of the [UE4GitPlugin by Sebastien Rombauts](https://github.com/SRombauts/UE4GitPlugin), with production-oriented changes from Project Borealis. It is distributed under the MIT License; see [LICENSE.txt](LICENSE.txt).
+本插件源自 [UE4GitPlugin by Sebastien Rombauts](https://github.com/SRombauts/UE4GitPlugin), 并包含 Project Borealis 的 production changes。许可证为 MIT, 详见 [LICENSE.txt](LICENSE.txt)。

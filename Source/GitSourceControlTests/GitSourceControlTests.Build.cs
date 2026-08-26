@@ -12,10 +12,13 @@ public class GitSourceControlTests : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
+				"AssetTools",
 				"Core",
 				"CoreUObject",
-				"SourceControl",
+				"DataValidation",
+				"Engine",
 				"GitSourceControl",
+				"SourceControl",
 				"UnrealEd",
 				"Projects"
 			});

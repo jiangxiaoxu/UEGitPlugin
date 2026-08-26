@@ -7,18 +7,17 @@
 
 #include "Modules/ModuleInterface.h"
 #include "Modules/ModuleManager.h"
+#include "Delegates/Delegate.h"
 
 #include "GitSourceControlMenu.h"
-#include "GitSourceControlProvider.h"
 
 class FExtender;
 
 /**
- * Local Git revision control integration for Unreal Editor.
+ * Standalone local Git asset tools for Unreal Editor.
  *
- * Phase 1 provides local status, History, Diff, exact asset discard, untracked
- * file deletion, and historical revision restore. An external Git GUI owns all
- * remote operations, staging, commits, branch changes, and conflict resolution.
+ * The module deliberately does not implement or register an Unreal Source Control
+ * provider. Git discovery and commands begin only after an explicit plugin action.
  */
 class FGitSourceControlModule : public IModuleInterface
 {
@@ -26,22 +25,6 @@ public:
 	/** IModuleInterface implementation */
 	virtual void StartupModule() override;
 	virtual void ShutdownModule() override;
-
-	/** Access the Git revision control provider */
-	FGitSourceControlProvider& GetProvider()
-	{
-		return GitSourceControlProvider;
-	}
-
-	const FGitSourceControlProvider& GetProvider() const
-	{
-		return GitSourceControlProvider;
-	}
-
-	GITSOURCECONTROL_API static const TArray< FString > & GetEmptyStringArray()
-	{
-		return EmptyStringArray;
-	}
 
 	/**
 	 * Singleton-like access to this module's interface.  This is just for convenience!
@@ -54,28 +37,9 @@ public:
 		return FModuleManager::Get().LoadModuleChecked< FGitSourceControlModule >("GitSourceControl");
 	}
 
-	static inline FGitSourceControlModule* GetThreadSafe()
-	{
-		IModuleInterface* ModulePtr = FModuleManager::Get().GetModule("GitSourceControl");
-		if (!ModulePtr)
-		{
-			// Main thread should never have this unloaded.
-			check(!IsInGameThread());
-			return nullptr;
-		}
-		return static_cast<FGitSourceControlModule*>(ModulePtr);
-	}
-
-	/** Set list of error messages that occurred after last git command */
-	static void SetLastErrors(const TArray<FText>& InErrors);
-
 private:
-	/** The one and only Git revision control provider */
-	FGitSourceControlProvider GitSourceControlProvider;
-
 	/** Editor-only local Git actions. */
 	FGitSourceControlMenu GitSourceControlMenu;
-
-	static TArray<FString> EmptyStringArray;
-
+	void HandlePreExit();
+	FDelegateHandle PreExitHandle;
 };

@@ -4,13 +4,16 @@
 
 #include "GitSourceControlAssetOperations.h"
 
-#include "GitSourceControlState.h"
+#include "Algo/AllOf.h"
+#include "GitSourceControlFileStatus.h"
 #include "GitSourceControlUtils.h"
 #include "HAL/FileManager.h"
+#include "Engine/World.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/SecureHash.h"
 #include "UObject/PackageFileSummary.h"
+#include "UObject/Package.h"
 
 namespace GitSourceControlAssetOperationsPrivate
 {
@@ -38,13 +41,13 @@ namespace GitSourceControlAssetOperationsPrivate
 		return NormalizeKey(A).Equals(NormalizeKey(B), ESearchCase::CaseSensitive);
 	}
 
-	FGitSourceControlState* FindState(TMap<FString, FGitSourceControlState>& States, const FString& Filename)
+	FGitSourceControlFileStatus* FindState(TMap<FString, FGitSourceControlFileStatus>& States, const FString& Filename)
 	{
-		if (FGitSourceControlState* State = States.Find(Filename))
+		if (FGitSourceControlFileStatus* State = States.Find(Filename))
 		{
 			return State;
 		}
-		for (TPair<FString, FGitSourceControlState>& Pair : States)
+		for (TPair<FString, FGitSourceControlFileStatus>& Pair : States)
 		{
 			if (SamePath(Pair.Key, Filename))
 			{
@@ -153,18 +156,18 @@ namespace GitSourceControlAssetOperationsPrivate
 			return false;
 		}
 		StandardOutput.TrimStartAndEndInline();
-		if (StandardOutput.IsEmpty() || !StandardOutput.Equals(InCommitId, ESearchCase::CaseSensitive))
+		const bool bCompleteObjectId = (InCommitId.Len() == 40 || InCommitId.Len() == 64)
+			&& Algo::AllOf(InCommitId, [](const TCHAR Character)
+			{
+				return FChar::IsHexDigit(Character);
+			});
+		if (!bCompleteObjectId || StandardOutput.IsEmpty() || !StandardOutput.Equals(InCommitId, ESearchCase::IgnoreCase))
 		{
 			OutError = TEXT("Historical restore requires a complete immutable commit id.");
 			return false;
 		}
 		OutCommitId = MoveTemp(StandardOutput);
 		return true;
-	}
-
-	bool IsRenamePairPath(const TSet<FString>& RenamePairPathKeys, const FString& Filename)
-	{
-		return RenamePairPathKeys.Contains(NormalizeKey(Filename));
 	}
 
 	enum class ELfsPointerParseResult : uint8
@@ -309,9 +312,58 @@ namespace GitSourceControlAssetOperationsPrivate
 		return true;
 	}
 
+	FString NormalizeRepositoryRelativePath(const FString& InPath);
+
+	bool MakeRepositoryRelativePath(const FString& InRepositoryRoot, FString& InOutPath)
+	{
+		FString RepositoryRoot = FPaths::ConvertRelativePathToFull(InRepositoryRoot);
+		FPaths::NormalizeDirectoryName(RepositoryRoot);
+		if (!RepositoryRoot.EndsWith(TEXT("/")))
+		{
+			RepositoryRoot += TEXT("/");
+		}
+		FString Filename = FPaths::ConvertRelativePathToFull(InOutPath);
+		FPaths::NormalizeFilename(Filename);
+		if (!FPaths::IsUnderDirectory(Filename, RepositoryRoot) || !FPaths::MakePathRelativeTo(Filename, *RepositoryRoot))
+		{
+			return false;
+		}
+		InOutPath = MoveTemp(Filename);
+		return true;
+	}
+
+	bool EnsureHeadBlobAvailable(const FString& GitBinary, const FString& RepositoryRoot, const FString& HeadCommitId,
+		const FString& AbsoluteFilename, FString& OutError)
+	{
+		FString RelativePath = AbsoluteFilename;
+		if (!MakeRepositoryRelativePath(RepositoryRoot, RelativePath))
+		{
+			OutError = FString::Printf(TEXT("Could not resolve the Git-relative path for '%s'."), *AbsoluteFilename);
+			return false;
+		}
+		RelativePath = NormalizeRepositoryRelativePath(RelativePath);
+		const FString TemporaryPointerFilename = FPaths::CreateTempFilename(*FPaths::GetPath(AbsoluteFilename), TEXT(".git-source-control-lfs-check-"), TEXT(".tmp"));
+		const FString MaterializedFilename = TemporaryPointerFilename + TEXT(".materialized");
+		IFileManager::Get().Delete(*TemporaryPointerFilename, false, true, true);
+		bool bSuccess = false;
+		if (GitSourceControlUtils::DumpRevisionBlobToFile(GitBinary, RepositoryRoot, HeadCommitId + TEXT(":") + RelativePath, TemporaryPointerFilename, OutError))
+		{
+			bool bNeedsFetch = false;
+			bSuccess = MaterializeLocalLfsObject(GitBinary, RepositoryRoot, TemporaryPointerFilename, MaterializedFilename, bNeedsFetch, OutError);
+			if (!bSuccess && bNeedsFetch && GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, RepositoryRoot, HeadCommitId, RelativePath, OutError))
+			{
+				bNeedsFetch = false;
+				bSuccess = MaterializeLocalLfsObject(GitBinary, RepositoryRoot, TemporaryPointerFilename, MaterializedFilename, bNeedsFetch, OutError);
+			}
+		}
+		IFileManager::Get().Delete(*TemporaryPointerFilename, false, true, true);
+		IFileManager::Get().Delete(*MaterializedFilename, false, true, true);
+		return bSuccess;
+	}
+
 	bool ValidatePackageRevision(const FString& LogicalTargetFilename, const FString& MaterializedFilename, FString& OutError)
 	{
-		if (!LogicalTargetFilename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase) && !LogicalTargetFilename.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase))
+		if (!LogicalTargetFilename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase))
 		{
 			return true;
 		}
@@ -328,6 +380,22 @@ namespace GitSourceControlAssetOperationsPrivate
 			return false;
 		}
 		return true;
+	}
+
+	bool IsSupportedUAsset(const FString& Filename)
+	{
+		return Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase);
+	}
+
+	FString NormalizeRepositoryRelativePath(const FString& InPath)
+	{
+		FString Result = InPath;
+		Result.ReplaceInline(TEXT("\\"), TEXT("/"));
+		while (Result.StartsWith(TEXT("./")))
+		{
+			Result.RightChopInline(2);
+		}
+		return Result;
 	}
 }
 
@@ -365,6 +433,43 @@ namespace GitSourceControlAssetOperations
 			Result.bHashValid = false;
 		}
 		return Result;
+	}
+
+	bool FGitSourceControlAssetOperations::ValidateStandaloneMutationPreflight(const TArray<FString>& InFiles,
+		const TArray<UPackage*>& InLoadedPackages, FString& OutError)
+	{
+		OutError.Reset();
+		for (const FString& Filename : InFiles)
+		{
+			if (Filename.Contains(TEXT("__ExternalActors__"), ESearchCase::IgnoreCase) || Filename.Contains(TEXT("__ExternalObjects__"), ESearchCase::IgnoreCase))
+			{
+				OutError = FString::Printf(TEXT("Standalone Git asset operations do not support external package paths: %s"), *Filename);
+				return false;
+			}
+			if (!GitSourceControlAssetOperationsPrivate::IsSupportedUAsset(Filename))
+			{
+				OutError = FString::Printf(TEXT("Standalone Git asset operations support only tracked .uasset files; .umap support is reserved for a future release: %s"), *Filename);
+				return false;
+			}
+		}
+		for (UPackage* Package : InLoadedPackages)
+		{
+			if (Package == nullptr)
+			{
+				continue;
+			}
+			if (UWorld::FindWorldInPackage(Package) != nullptr)
+			{
+				OutError = FString::Printf(TEXT("Standalone Git asset operations do not support loaded world packages: %s"), *Package->GetName());
+				return false;
+			}
+			if (UObject* Asset = Package->FindAssetInPackage(); Asset != nullptr && Asset->IsPackageExternal())
+			{
+				OutError = FString::Printf(TEXT("Standalone Git asset operations do not support loaded external packages: %s"), *Package->GetName());
+				return false;
+			}
+		}
+		return true;
 	}
 
 	bool FGitSourceControlAssetOperations::ResolveSingleRepositoryRoot(const TArray<FString>& InFiles, const FString& InFallbackRepositoryRoot, FString& OutRepositoryRoot, FString& OutError)
@@ -430,7 +535,7 @@ namespace GitSourceControlAssetOperations
 		return true;
 	}
 
-	bool FGitSourceControlAssetOperations::QueryStates(const TArray<FString>& InFiles, TMap<FString, FGitSourceControlState>& OutStates, FGitAssetOperationResult& OutResult) const
+	bool FGitSourceControlAssetOperations::QueryStates(const TArray<FString>& InFiles, TMap<FString, FGitSourceControlFileStatus>& OutStates, FGitAssetOperationResult& OutResult) const
 	{
 		TArray<FString> Errors;
 		if (!GitSourceControlUtils::RunUpdateStatus(GitBinary, RepositoryRoot, false, InFiles, Errors, OutStates))
@@ -465,13 +570,8 @@ namespace GitSourceControlAssetOperations
 	}
 
 	bool FGitSourceControlAssetOperations::RecheckTargets(const TArray<FString>& Files, const TMap<FString, FGitAssetFileFingerprint>& Fingerprints,
-		const FGitIndexSnapshot& IndexSnapshot, uint64 Generation, const FString& ExpectedHeadCommitId, FGitAssetOperationResult& OutResult) const
+		const FGitIndexSnapshot& IndexSnapshot, const FString& ExpectedHeadCommitId, FGitAssetOperationResult& OutResult) const
 	{
-		if (GitSourceControlUtils::GetRepositoryGeneration(RepositoryRoot) != Generation)
-		{
-			OutResult.AddError(TEXT("The Git repository changed while the confirmation dialog was open. Refresh and retry."));
-			return false;
-		}
 		if (!ExpectedHeadCommitId.IsEmpty())
 		{
 			FString CurrentHeadCommitId;
@@ -510,54 +610,25 @@ namespace GitSourceControlAssetOperations
 		TArray<FString> Files;
 		if (!NormalizeFiles(InFiles, Files, OutResult)) return false;
 
-		// 单端点 status 可能将 rename 表现为 add 或 delete, 因此先扩展原子 old/new 配对.
-		TArray<FString> ExpandedFiles;
-		TArray<FGitRenamePair> RenamePairs;
-		TArray<FString> RenameErrors;
-		if (!GitSourceControlUtils::ExpandSelectedPathsWithRenamePairs(GitBinary, RepositoryRoot, Files, ExpandedFiles, RenamePairs, RenameErrors))
-		{
-			for (const FString& Error : RenameErrors)
-			{
-				OutResult.AddError(Error);
-			}
-			return false;
-		}
-		Files = MoveTemp(ExpandedFiles);
-		TSet<FString> RenamePairPathKeys;
-		for (const FGitRenamePair& RenamePair : RenamePairs)
-		{
-			RenamePairPathKeys.Add(GitSourceControlAssetOperationsPrivate::NormalizeKey(RenamePair.OldPath));
-			RenamePairPathKeys.Add(GitSourceControlAssetOperationsPrivate::NormalizeKey(RenamePair.NewPath));
-		}
-
-		TMap<FString, FGitSourceControlState> States;
+		TMap<FString, FGitSourceControlFileStatus> States;
 		if (!QueryStates(Files, States, OutResult)) return false;
 		TArray<FString> RestoreFiles;
-		TArray<FString> UntrackedRenameFiles;
 		for (const FString& Filename : Files)
 		{
-			FGitSourceControlState* State = GitSourceControlAssetOperationsPrivate::FindState(States, Filename);
-			const bool bIsRenamePairPath = GitSourceControlAssetOperationsPrivate::IsRenamePairPath(RenamePairPathKeys, Filename);
-			if (!State || State->IsConflicted() || State->State.TreeState == ETreeState::Ignored || State->State.TreeState == ETreeState::NotInRepo ||
-				((State->State.TreeState == ETreeState::Untracked || State->State.FileState == EFileState::Added) && !bIsRenamePairPath))
+			if (!GitSourceControlAssetOperationsPrivate::IsSupportedUAsset(Filename))
 			{
 				OutResult.FailedFiles.Add(Filename);
-				OutResult.AddError(FString::Printf(TEXT("File is not a non-conflicted tracked asset or an atomic Git rename counterpart: %s"), *Filename));
+				OutResult.AddError(FString::Printf(TEXT("Discard supports only tracked .uasset files; .umap support is reserved for a future release: %s"), *Filename));
 				return false;
 			}
-			if (State->State.TreeState == ETreeState::Untracked)
+			FGitSourceControlFileStatus* State = GitSourceControlAssetOperationsPrivate::FindState(States, Filename);
+			if (!State || State->IsConflicted() || !State->IsTracked() || State->FileState == EGitFileState::Added)
 			{
-				UntrackedRenameFiles.Add(Filename);
+				OutResult.FailedFiles.Add(Filename);
+				OutResult.AddError(FString::Printf(TEXT("Discard supports only non-conflicted tracked assets: %s"), *Filename));
+				return false;
 			}
-			else
-			{
-				RestoreFiles.Add(Filename);
-			}
-		}
-		if (RestoreFiles.IsEmpty())
-		{
-			OutResult.AddError(TEXT("A Git rename restore must contain at least one tracked source path."));
-			return false;
+			RestoreFiles.Add(Filename);
 		}
 
 		TMap<FString, FGitAssetFileFingerprint> Fingerprints;
@@ -578,38 +649,62 @@ namespace GitSourceControlAssetOperations
 			OutResult.AddError(Error);
 			return false;
 		}
+		FString HeadCommitId;
+		if (!GitSourceControlAssetOperationsPrivate::ReadHeadCommitId(GitBinary, RepositoryRoot, HeadCommitId, Error))
+		{
+			OutResult.AddError(Error);
+			return false;
+		}
+		if (!Confirm(TEXT("Discard the selected tracked Git changes."), Files, Callbacks, OutResult))
+		{
+			return false;
+		}
+		if (!PrepareForMutation(Files, Callbacks, OutResult))
+		{
+			return false;
+		}
+		auto ReloadAfterPreparedFailure = [&Callbacks, &Files]()
+		{
+			if (Callbacks.ReloadPackages)
+			{
+				Callbacks.ReloadPackages(Files);
+			}
+		};
+#if WITH_DEV_AUTOMATION_TESTS
+		if (Callbacks.BeforeCommitPointForTesting)
+		{
+			Callbacks.BeforeCommitPointForTesting();
+		}
+#endif
+		if (!RecheckTargets(Files, Fingerprints, IndexSnapshot, HeadCommitId, OutResult))
+		{
+			ReloadAfterPreparedFailure();
+			return false;
+		}
+		FString CommitPointError;
+		if (!FGitSourceControlAssetOperations::ValidateStandaloneMutationPreflight(Files, {}, CommitPointError))
+		{
+			OutResult.AddError(CommitPointError);
+			ReloadAfterPreparedFailure();
+			return false;
+		}
+		for (const FString& Filename : RestoreFiles)
+		{
+			if (!GitSourceControlAssetOperationsPrivate::EnsureHeadBlobAvailable(GitBinary, RepositoryRoot, HeadCommitId, Filename, Error))
+			{
+				OutResult.AddError(Error.IsEmpty() ? TEXT("Could not validate the HEAD package topology before discard.") : Error);
+				ReloadAfterPreparedFailure();
+				return false;
+			}
+		}
 		TArray<GitSourceControlAssetOperationsPrivate::FFileBackup> Backups;
 		if (!GitSourceControlAssetOperationsPrivate::CreateBackups(Files, Backups, Error))
 		{
 			OutResult.AddError(Error);
+			ReloadAfterPreparedFailure();
 			return false;
 		}
-		FString HeadCommitId;
-		if (!GitSourceControlAssetOperationsPrivate::ReadHeadCommitId(GitBinary, RepositoryRoot, HeadCommitId, Error))
-		{
-			GitSourceControlAssetOperationsPrivate::DeleteBackups(Backups);
-			OutResult.AddError(Error);
-			return false;
-		}
-		const uint64 Generation = GitSourceControlUtils::GetRepositoryGeneration(RepositoryRoot);
-		if (!Confirm(TEXT("Discard the selected tracked Git changes."), Files, Callbacks, OutResult) || !PrepareForMutation(Files, Callbacks, OutResult) || !RecheckTargets(Files, Fingerprints, IndexSnapshot, Generation, HeadCommitId, OutResult))
-		{
-			GitSourceControlAssetOperationsPrivate::DeleteBackups(Backups);
-			return false;
-		}
-		bool bMutated = GitSourceControlUtils::RunExactPathspecMutation(GitBinary, RepositoryRoot, TEXT("restore"), { TEXT("--source=HEAD"), TEXT("--staged"), TEXT("--worktree") }, RestoreFiles, Error);
-		if (bMutated)
-		{
-			for (const FString& Filename : UntrackedRenameFiles)
-			{
-				if (!IFileManager::Get().FileExists(*Filename) || !IFileManager::Get().Delete(*Filename, false, true, true))
-				{
-					bMutated = false;
-					Error = FString::Printf(TEXT("Could not atomically remove the untracked rename destination '%s'."), *Filename);
-					break;
-				}
-			}
-		}
+		const bool bMutated = GitSourceControlUtils::RunExactPathspecMutation(GitBinary, RepositoryRoot, TEXT("restore"), { TEXT("--source=HEAD"), TEXT("--staged"), TEXT("--worktree") }, RestoreFiles, Error);
 		if (!bMutated)
 		{
 			TArray<FString> FailedBackups;
@@ -638,110 +733,18 @@ namespace GitSourceControlAssetOperations
 		return true;
 	}
 
-	bool FGitSourceControlAssetOperations::DeleteUntrackedFiles(const TArray<FString>& InFiles, const FGitAssetOperationCallbacks& Callbacks, FGitAssetOperationResult& OutResult) const
-	{
-		OutResult = FGitAssetOperationResult();
-		TArray<FString> Files;
-		if (!NormalizeFiles(InFiles, Files, OutResult)) return false;
-		TMap<FString, FGitSourceControlState> States;
-		if (!QueryStates(Files, States, OutResult)) return false;
-		for (const FString& Filename : Files)
-		{
-			FGitSourceControlState* State = GitSourceControlAssetOperationsPrivate::FindState(States, Filename);
-			if (!State || State->IsConflicted() || (State->State.TreeState != ETreeState::Untracked && State->State.FileState != EFileState::Added))
-			{
-				OutResult.FailedFiles.Add(Filename);
-				OutResult.AddError(FString::Printf(TEXT("Only untracked or index-added files can be deleted: %s"), *Filename));
-				return false;
-			}
-		}
-		TMap<FString, FGitAssetFileFingerprint> Fingerprints;
-		for (const FString& Filename : Files)
-		{
-			const FGitAssetFileFingerprint Fingerprint = CaptureFingerprint(Filename);
-			if (!Fingerprint.bHashValid)
-			{
-				OutResult.AddError(FString::Printf(TEXT("Could not fingerprint '%s' before deletion."), *Filename));
-				return false;
-			}
-			Fingerprints.Add(Filename, Fingerprint);
-		}
-		FGitIndexSnapshot IndexSnapshot;
-		FString Error;
-		if (!GitSourceControlUtils::CaptureIndexEntriesForPaths(GitBinary, RepositoryRoot, Files, IndexSnapshot, Error))
-		{
-			OutResult.AddError(Error);
-			return false;
-		}
-		TArray<GitSourceControlAssetOperationsPrivate::FFileBackup> Backups;
-		if (!GitSourceControlAssetOperationsPrivate::CreateBackups(Files, Backups, Error))
-		{
-			OutResult.AddError(Error);
-			return false;
-		}
-		const uint64 Generation = GitSourceControlUtils::GetRepositoryGeneration(RepositoryRoot);
-		if (!Confirm(TEXT("Delete the selected untracked Git asset files. This cannot be undone by Git."), Files, Callbacks, OutResult) || !PrepareForMutation(Files, Callbacks, OutResult) || !RecheckTargets(Files, Fingerprints, IndexSnapshot, Generation, FString(), OutResult))
-		{
-			GitSourceControlAssetOperationsPrivate::DeleteBackups(Backups);
-			return false;
-		}
-		const bool bIndexUpdated = GitSourceControlUtils::RunExactPathspecMutation(GitBinary, RepositoryRoot, TEXT("rm"), { TEXT("--cached"), TEXT("--ignore-unmatch") }, Files, Error);
-		if (!bIndexUpdated)
-		{
-			TArray<FString> FailedBackups;
-			const bool bWorktreeRestored = GitSourceControlAssetOperationsPrivate::RestoreBackups(Backups, FailedBackups);
-			FString RestoreError;
-			GitSourceControlUtils::RestoreIndexEntries(GitBinary, RepositoryRoot, IndexSnapshot, RestoreError);
-			OutResult.AddError(Error);
-			if (!RestoreError.IsEmpty()) OutResult.AddError(RestoreError);
-			if (bWorktreeRestored)
-			{
-				GitSourceControlAssetOperationsPrivate::DeleteBackups(Backups);
-			}
-			else
-			{
-				OutResult.AddError(FString::Printf(TEXT("Worktree rollback was incomplete. Safety backups were preserved at:\n%s"), *FString::Join(FailedBackups, TEXT("\n"))));
-			}
-			return false;
-		}
-		for (const FString& Filename : Files)
-		{
-			if (IFileManager::Get().FileExists(*Filename) && !IFileManager::Get().Delete(*Filename, false, true, true))
-			{
-				OutResult.FailedFiles.Add(Filename);
-			}
-		}
-		if (!OutResult.FailedFiles.IsEmpty())
-		{
-			TArray<FString> FailedBackups;
-			const bool bWorktreeRestored = GitSourceControlAssetOperationsPrivate::RestoreBackups(Backups, FailedBackups);
-			FString RestoreError;
-			GitSourceControlUtils::RestoreIndexEntries(GitBinary, RepositoryRoot, IndexSnapshot, RestoreError);
-			OutResult.AddError(TEXT("One or more selected files could not be deleted; the Git index and files were restored."));
-			if (!RestoreError.IsEmpty()) OutResult.AddError(RestoreError);
-			if (bWorktreeRestored)
-			{
-				GitSourceControlAssetOperationsPrivate::DeleteBackups(Backups);
-			}
-			else
-			{
-				OutResult.AddError(FString::Printf(TEXT("Worktree rollback was incomplete. Safety backups were preserved at:\n%s"), *FString::Join(FailedBackups, TEXT("\n"))));
-			}
-			return false;
-		}
-		GitSourceControlAssetOperationsPrivate::DeleteBackups(Backups);
-		OutResult.bSucceeded = true;
-		OutResult.AffectedFiles = Files;
-		if (Callbacks.ReloadPackages) OutResult.bReloadSucceeded = Callbacks.ReloadPackages(Files);
-		return true;
-	}
-
 	bool FGitSourceControlAssetOperations::RestoreRevisionToWorkspace(const FString& InCurrentFilename, const FString& InCommitId, const FString& InHistoricalPath,
 		const FGitAssetOperationCallbacks& Callbacks, FGitAssetOperationResult& OutResult) const
 	{
 		OutResult = FGitAssetOperationResult();
 		TArray<FString> Files;
 		if (!NormalizeFiles({ InCurrentFilename }, Files, OutResult)) return false;
+		const FString Target = Files[0];
+		if (!GitSourceControlAssetOperationsPrivate::IsSupportedUAsset(Target))
+		{
+			OutResult.AddError(TEXT("Historical restore supports only tracked .uasset files; .umap support is reserved for a future release."));
+			return false;
+		}
 		bool bValidCommitId = InCommitId.Len() == 40 || InCommitId.Len() == 64;
 		for (const TCHAR Character : InCommitId)
 		{
@@ -754,15 +757,19 @@ namespace GitSourceControlAssetOperations
 			OutResult.AddError(TEXT("A complete commit id and historical path are required."));
 			return false;
 		}
-		TMap<FString, FGitSourceControlState> States;
-		if (!QueryStates(Files, States, OutResult)) return false;
-		if (FGitSourceControlState* State = GitSourceControlAssetOperationsPrivate::FindState(States, Files[0]))
+		FString CurrentRelativePath = Target;
+		if (!GitSourceControlAssetOperationsPrivate::MakeRepositoryRelativePath(RepositoryRoot, CurrentRelativePath))
 		{
-			if (State->IsConflicted() || State->State.TreeState == ETreeState::Untracked || State->State.TreeState == ETreeState::Ignored || State->State.TreeState == ETreeState::NotInRepo || State->State.FileState == EFileState::Added)
-			{
-				OutResult.AddError(TEXT("Historical restore is unavailable for conflicted, untracked, ignored, or newly added files."));
-				return false;
-			}
+			OutResult.AddError(TEXT("Could not resolve the current Git-relative asset path."));
+			return false;
+		}
+		CurrentRelativePath = GitSourceControlAssetOperationsPrivate::NormalizeRepositoryRelativePath(CurrentRelativePath);
+		HistoricalPath = GitSourceControlAssetOperationsPrivate::NormalizeRepositoryRelativePath(HistoricalPath);
+		// Git path identity is case-sensitive even when the workspace filesystem is not.
+		if (!HistoricalPath.Equals(CurrentRelativePath, ESearchCase::CaseSensitive))
+		{
+			OutResult.AddError(TEXT("Historical restore is supported only when the revision path matches the current Git path. Use Diff or Fetch for a renamed revision."));
+			return false;
 		}
 		FString ResolvedCommitId;
 		FString Error;
@@ -771,8 +778,6 @@ namespace GitSourceControlAssetOperations
 			OutResult.AddError(Error);
 			return false;
 		}
-
-		const FString Target = Files[0];
 		const FGitAssetFileFingerprint Fingerprint = CaptureFingerprint(Target);
 		if (!Fingerprint.bHashValid)
 		{
@@ -791,7 +796,6 @@ namespace GitSourceControlAssetOperations
 			OutResult.AddError(Error);
 			return false;
 		}
-		const uint64 Generation = GitSourceControlUtils::GetRepositoryGeneration(RepositoryRoot);
 		const FString TemporaryFilename = FPaths::CreateTempFilename(*FPaths::GetPath(Target), TEXT(".git-source-control-txn-revision-"), TEXT(".tmp"));
 		IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 		const FString RevisionSpec = ResolvedCommitId + TEXT(":") + HistoricalPath;
@@ -834,25 +838,80 @@ namespace GitSourceControlAssetOperations
 			OutResult.AddError(Error);
 			return false;
 		}
+		TMap<FString, FGitAssetFileFingerprint> ExpectedFingerprints;
+		ExpectedFingerprints.Add(Target, Fingerprint);
+		if (!Confirm(FString::Printf(TEXT("Restore revision %s to the workspace. The Git index will remain unchanged."), *ResolvedCommitId.Left(12)), Files, Callbacks, OutResult))
+		{
+			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
+			return false;
+		}
+		if (!PrepareForMutation(Files, Callbacks, OutResult))
+		{
+			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
+			return false;
+		}
+		auto ReloadAfterPreparedFailure = [&Callbacks, &Files]()
+		{
+			if (Callbacks.ReloadPackages)
+			{
+				Callbacks.ReloadPackages(Files);
+			}
+		};
+#if WITH_DEV_AUTOMATION_TESTS
+		if (Callbacks.BeforeCommitPointForTesting)
+		{
+			Callbacks.BeforeCommitPointForTesting();
+		}
+#endif
+		if (!RecheckTargets(Files, ExpectedFingerprints, IndexSnapshot, HeadCommitId, OutResult))
+		{
+			ReloadAfterPreparedFailure();
+			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
+			return false;
+		}
+		FString CommitPointError;
+		if (!FGitSourceControlAssetOperations::ValidateStandaloneMutationPreflight(Files, {}, CommitPointError))
+		{
+			OutResult.AddError(CommitPointError);
+			ReloadAfterPreparedFailure();
+			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
+			return false;
+		}
 		TArray<GitSourceControlAssetOperationsPrivate::FFileBackup> Backups;
 		if (!GitSourceControlAssetOperationsPrivate::CreateBackups(Files, Backups, Error))
 		{
-			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 			OutResult.AddError(Error);
-			return false;
-		}
-		TMap<FString, FGitAssetFileFingerprint> ExpectedFingerprints;
-		ExpectedFingerprints.Add(Target, Fingerprint);
-		if (!Confirm(FString::Printf(TEXT("Restore revision %s to the workspace. The Git index will remain unchanged."), *ResolvedCommitId.Left(12)), Files, Callbacks, OutResult) || !PrepareForMutation(Files, Callbacks, OutResult) || !RecheckTargets(Files, ExpectedFingerprints, IndexSnapshot, Generation, HeadCommitId, OutResult))
-		{
-			GitSourceControlAssetOperationsPrivate::DeleteBackups(Backups);
+			ReloadAfterPreparedFailure();
 			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 			return false;
 		}
-		if (!IFileManager::Get().Move(*Target, *TemporaryFilename, true, true, false, true))
+		if (!GitSourceControlUtils::RunExactPathspecMutation(GitBinary, RepositoryRoot, TEXT("reset"), { TEXT("-q"), TEXT("HEAD") }, Files, Error))
+		{
+			FString RestoreError;
+			GitSourceControlUtils::RestoreIndexEntries(GitBinary, RepositoryRoot, IndexSnapshot, RestoreError);
+			GitSourceControlAssetOperationsPrivate::DeleteBackups(Backups);
+			OutResult.AddError(Error);
+			if (!RestoreError.IsEmpty())
+			{
+				OutResult.AddError(RestoreError);
+			}
+			ReloadAfterPreparedFailure();
+			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
+			return false;
+		}
+		bool bCanReplaceWorktree = true;
+#if WITH_DEV_AUTOMATION_TESTS
+		if (Callbacks.AllowWorktreeReplaceForTesting)
+		{
+			bCanReplaceWorktree = Callbacks.AllowWorktreeReplaceForTesting();
+		}
+#endif
+		if (!bCanReplaceWorktree || !IFileManager::Get().Move(*Target, *TemporaryFilename, true, true, false, true))
 		{
 			TArray<FString> FailedBackups;
 			const bool bWorktreeRestored = GitSourceControlAssetOperationsPrivate::RestoreBackups(Backups, FailedBackups);
+			FString RestoreError;
+			GitSourceControlUtils::RestoreIndexEntries(GitBinary, RepositoryRoot, IndexSnapshot, RestoreError);
 			if (bWorktreeRestored)
 			{
 				GitSourceControlAssetOperationsPrivate::DeleteBackups(Backups);
@@ -861,12 +920,18 @@ namespace GitSourceControlAssetOperations
 			{
 				OutResult.AddError(FString::Printf(TEXT("Workspace rollback was incomplete. Safety backups were preserved at:\n%s"), *FString::Join(FailedBackups, TEXT("\n"))));
 			}
+			if (!RestoreError.IsEmpty())
+			{
+				OutResult.AddError(RestoreError);
+			}
+			ReloadAfterPreparedFailure();
 			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
-			OutResult.AddError(FString::Printf(TEXT("Could not replace workspace file '%s'."), *Target));
+			OutResult.AddError(bCanReplaceWorktree
+				? FString::Printf(TEXT("Could not replace workspace file '%s'."), *Target)
+				: TEXT("Worktree replacement was rejected by the force-restore rollback test seam."));
 			return false;
 		}
 		GitSourceControlAssetOperationsPrivate::DeleteBackups(Backups);
-		GitSourceControlUtils::InvalidateRepository(RepositoryRoot);
 		OutResult.bSucceeded = true;
 		OutResult.AffectedFiles = Files;
 		if (Callbacks.ReloadPackages) OutResult.bReloadSucceeded = Callbacks.ReloadPackages(Files);

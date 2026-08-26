@@ -6,27 +6,65 @@
 #include "GitSourceControlRevision.h"
 
 #include "Algo/AllOf.h"
-#include "GitSourceControlModule.h"
-#include "GitSourceControlProvider.h"
+#include "GitStandaloneLog.h"
 #include "GitSourceControlUtils.h"
-#include "Async/Async.h"
-#include "Framework/Application/SlateApplication.h"
-#include "HAL/Event.h"
 #include "HAL/FileManager.h"
-#include "HAL/PlatformProcess.h"
-#include "Misc/App.h"
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#endif
 #include "Misc/FileHelper.h"
-#include "Misc/MessageDialog.h"
+#include "Misc/PackageName.h"
 #include "Misc/Paths.h"
-#include "Misc/ScopedSlowTask.h"
 #include "Misc/SecureHash.h"
 #include "Misc/ScopeLock.h"
+#include "UObject/Package.h"
+#include "UObject/UObjectGlobals.h"
 
 #define LOCTEXT_NAMESPACE "GitSourceControl"
 
 namespace GitSourceControlRevisionPrivate
 {
-	constexpr double LfsBridgeWaitTimeoutSeconds = 100.0;
+	constexpr TCHAR TemporaryExportDirectoryName[] = TEXT("UEGitPlugin");
+	constexpr TCHAR TemporaryExportFilenamePrefix[] = TEXT("UEGit-Diff-");
+	FCriticalSection TemporaryExportsLock;
+	TSet<FString> TemporaryExports;
+
+	FString GetTemporaryExportDirectory()
+	{
+		return FPaths::Combine(FPaths::DiffDir(), TemporaryExportDirectoryName);
+	}
+
+	FString NormalizePathForComparison(const FString& InFilename)
+	{
+		FString Normalized = FPaths::ConvertRelativePathToFull(InFilename);
+		FPaths::NormalizeFilename(Normalized);
+		while (Normalized.EndsWith(TEXT("/")))
+		{
+			Normalized.LeftChopInline(1, EAllowShrinking::No);
+		}
+		return Normalized;
+	}
+
+	bool IsManagedTemporaryExport(const FString& InFilename)
+	{
+		if (InFilename.IsEmpty())
+		{
+			return false;
+		}
+
+		const FString NormalizedFilename = NormalizePathForComparison(InFilename);
+		const FString NormalizedDirectory = NormalizePathForComparison(GetTemporaryExportDirectory());
+		const FString DirectoryPrefix = NormalizedDirectory + TEXT("/");
+		return NormalizedFilename.StartsWith(DirectoryPrefix, ESearchCase::IgnoreCase)
+			&& FPaths::GetPath(NormalizedFilename).Equals(NormalizedDirectory, ESearchCase::IgnoreCase)
+			&& FPaths::GetCleanFilename(NormalizedFilename).StartsWith(TemporaryExportFilenamePrefix, ESearchCase::CaseSensitive);
+	}
+
+	const TArray<FString>& GetEmptyStringArray()
+	{
+		static const TArray<FString> Empty;
+		return Empty;
+	}
 	bool IsLfsPointerFile(const FString& Filename)
 	{
 		TArray<uint8> Data;
@@ -42,8 +80,23 @@ namespace GitSourceControlRevisionPrivate
 
 	bool IsPackageFile(const FString& Filename)
 	{
-		return Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase)
-			|| Filename.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase);
+		return Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase);
+	}
+
+	bool LoadCurrentPackageForDiff(const FString& LocalFilename)
+	{
+		if (!IsInGameThread() || !IsPackageFile(LocalFilename))
+		{
+			return true;
+		}
+
+		FString PackageName;
+		if (!FPackageName::TryConvertFilenameToLongPackageName(LocalFilename, PackageName))
+		{
+			return false;
+		}
+		UPackage* Package = LoadPackage(nullptr, *PackageName, LOAD_None);
+		return Package != nullptr && Package->FindAssetInPackage() != nullptr;
 	}
 
 	bool HasValidPackageHeader(const FString& Filename)
@@ -129,7 +182,7 @@ namespace GitSourceControlRevisionPrivate
 		FString StorageErrors;
 		FString LfsStorage;
 		if (GitSourceControlUtils::RunCommandInternalRaw(TEXT("config"), GitBinary, RepositoryRoot,
-			{ TEXT("--path"), TEXT("--get"), TEXT("lfs.storage") }, FGitSourceControlModule::GetEmptyStringArray(),
+			{ TEXT("--path"), TEXT("--get"), TEXT("lfs.storage") }, GetEmptyStringArray(),
 			StorageOutput, StorageErrors, 0, false))
 		{
 			LfsStorage = MoveTemp(StorageOutput);
@@ -142,7 +195,7 @@ namespace GitSourceControlRevisionPrivate
 			FString Errors;
 			if (!GitSourceControlUtils::RunCommandInternalRaw(
 				TEXT("rev-parse"), GitBinary, RepositoryRoot, { TEXT("--git-common-dir") },
-				FGitSourceControlModule::GetEmptyStringArray(), CommonGitDir, Errors))
+				GetEmptyStringArray(), CommonGitDir, Errors))
 			{
 				OutError = Errors.IsEmpty() ? TEXT("Could not resolve local Git LFS storage.") : Errors;
 				return false;
@@ -184,173 +237,106 @@ namespace GitSourceControlRevisionPrivate
 		Sha.Final();
 		uint8 Hash[FSHA1::DigestSize];
 		Sha.GetHash(Hash);
-		return FPaths::Combine(FPaths::DiffDir(), FString::Printf(TEXT("git-%s-%s-%s"), *CommitId, *BytesToHex(Hash, UE_ARRAY_COUNT(Hash)), *FPaths::GetCleanFilename(Filename)));
+		const FString Extension = FPaths::GetExtension(Filename, true);
+		const FString Prefix = FString::Printf(TEXT("%s%s-%s-"), TemporaryExportFilenamePrefix, *CommitId.Left(12), *BytesToHex(Hash, UE_ARRAY_COUNT(Hash)));
+		return FPaths::CreateTempFilename(*GetTemporaryExportDirectory(), *Prefix, Extension.IsEmpty() ? TEXT(".tmp") : *Extension);
 	}
 
-	struct FLfsFetchBridgeState final
+	void RegisterTemporaryExport(const FString& Filename)
 	{
-		FLfsFetchBridgeState()
-			: CancellationContext(MakeShared<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>())
-			, CompletionEvent(FPlatformProcess::GetSynchEventFromPool(true))
+		if (!IsManagedTemporaryExport(Filename))
 		{
+			return;
 		}
-
-		~FLfsFetchBridgeState()
-		{
-			if (CompletionEvent != nullptr)
-			{
-				FPlatformProcess::ReturnSynchEventToPool(CompletionEvent);
-				CompletionEvent = nullptr;
-			}
-		}
-
-		void Complete(const bool bInSuccess, const FString& InError)
-		{
-			{
-				FScopeLock Lock(&ResultLock);
-				bSuccess = bInSuccess;
-				Error = InError;
-			}
-			if (CompletionEvent != nullptr)
-			{
-				CompletionEvent->Trigger();
-			}
-		}
-
-		void ReadResult(bool& bOutSuccess, FString& OutError)
-		{
-			FScopeLock Lock(&ResultLock);
-			bOutSuccess = bSuccess;
-			OutError = Error;
-		}
-
-		TSharedRef<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe> CancellationContext;
-		FEvent* CompletionEvent = nullptr;
-		FCriticalSection ResultLock;
-		bool bSuccess = false;
-		FString Error;
-		TAtomic<bool> bAbandoned = false;
-	};
+		FScopeLock Lock(&TemporaryExportsLock);
+		TemporaryExports.Add(Filename);
+	}
 
 	bool FetchMissingLfsContent(const FString& GitBinary, const FString& RepositoryRoot, const FString& CommitId, const FString& HistoricalPath, FString& OutError)
 	{
-		const bool bCanShowProgress = !FApp::IsUnattended() && !IsRunningCommandlet() && FSlateApplication::IsInitialized();
-		if (!bCanShowProgress)
-		{
-			const TSharedRef<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe> CancellationContext =
-				MakeShared<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>();
-			GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(CancellationContext);
-			return GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, RepositoryRoot, CommitId, HistoricalPath, OutError);
-		}
-
-		const TSharedRef<FLfsFetchBridgeState, ESPMode::ThreadSafe> Bridge = MakeShared<FLfsFetchBridgeState, ESPMode::ThreadSafe>();
-		auto RunFetchOnGameThread = [GitBinary, RepositoryRoot, CommitId, HistoricalPath, Bridge]()
-		{
-			if (Bridge->bAbandoned.Load())
-			{
-				Bridge->Complete(false, TEXT("Git LFS download was cancelled before the progress dialog could start."));
-				return;
-			}
-
-			FScopedSlowTask SlowTask(1.0f, LOCTEXT("FetchingLfsRevision", "Downloading required Git LFS revision content..."), true);
-			SlowTask.MakeDialog(true);
-			const TSharedRef<FString, ESPMode::ThreadSafe> FetchError = MakeShared<FString, ESPMode::ThreadSafe>();
-			TFuture<bool> FetchFuture = Async(EAsyncExecution::ThreadPool, [GitBinary, RepositoryRoot, CommitId, HistoricalPath, Bridge, FetchError]()
-			{
-				GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(Bridge->CancellationContext);
-				const bool bSuccess = GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, RepositoryRoot, CommitId, HistoricalPath, *FetchError);
-				return bSuccess;
-			});
-			while (!FetchFuture.IsReady())
-			{
-				if (SlowTask.ShouldCancel())
-				{
-					Bridge->CancellationContext->Cancel();
-				}
-				FSlateApplication::Get().PumpMessages();
-				FPlatformProcess::Sleep(0.01f);
-			}
-			const bool bSucceeded = FetchFuture.Get();
-			Bridge->Complete(bSucceeded, *FetchError);
-		};
-
-		if (IsInGameThread())
-		{
-			RunFetchOnGameThread();
-		}
-		else
-		{
-			AsyncTask(ENamedThreads::GameThread, [RunFetchOnGameThread]() mutable
-			{
-				RunFetchOnGameThread();
-			});
-			if (Bridge->CompletionEvent == nullptr || !Bridge->CompletionEvent->Wait(static_cast<uint32>(LfsBridgeWaitTimeoutSeconds * 1000.0)))
-			{
-				Bridge->bAbandoned.Store(true);
-				Bridge->CancellationContext->Cancel();
-				OutError = TEXT("Git LFS download did not start or finish before the 100 second safety timeout.");
-				return false;
-			}
-		}
-
-		bool bSucceeded = false;
-		Bridge->ReadResult(bSucceeded, OutError);
-		if (!bSucceeded && !Bridge->CancellationContext->IsCancellationRequested())
-		{
-			const FString ErrorForDialog = OutError;
-			auto ShowFailureDialog = [ErrorForDialog]()
-			{
-				FMessageDialog::Open(EAppMsgType::Ok,
-					FText::Format(LOCTEXT("FetchLfsRevisionFailed", "Could not download the required Git LFS revision content.\n\n{0}"), FText::FromString(ErrorForDialog)),
-					LOCTEXT("FetchLfsRevisionFailedTitle", "Git LFS Download Failed"));
-			};
-			if (IsInGameThread())
-			{
-				ShowFailureDialog();
-			}
-			else
-			{
-				AsyncTask(ENamedThreads::GameThread, [ShowFailureDialog]() mutable
-				{
-					ShowFailureDialog();
-				});
-			}
-		}
-		return bSucceeded;
+		return GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, RepositoryRoot, CommitId, HistoricalPath, OutError);
 	}
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStandaloneRevisionUAssetScopeTest, "Cthulhu.GitSourceControl.Standalone.RevisionUAssetScope",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitStandaloneRevisionUAssetScopeTest::RunTest(const FString& Parameters)
+{
+	TestTrue(TEXT("Revision adapter accepts .uasset"), GitSourceControlRevisionPrivate::IsPackageFile(TEXT("Content/Example.uasset")));
+	TestFalse(TEXT("Revision adapter rejects future .umap scope"), GitSourceControlRevisionPrivate::IsPackageFile(TEXT("Content/Example.umap")));
+	TestFalse(TEXT("Revision adapter rejects non-package files"), GitSourceControlRevisionPrivate::IsPackageFile(TEXT("Content/Example.txt")));
+	const FString ManagedExport = FPaths::Combine(GitSourceControlRevisionPrivate::GetTemporaryExportDirectory(), TEXT("UEGit-Diff-test.uasset"));
+	const FString OtherDirectoryFile = FPaths::Combine(FPaths::DiffDir(), TEXT("UEGit-Diff-test.uasset"));
+	const FString OtherPrefixFile = FPaths::Combine(GitSourceControlRevisionPrivate::GetTemporaryExportDirectory(), TEXT("other-test.uasset"));
+	TestTrue(TEXT("Session export cleanup scope is a dedicated directory and prefix"), GitSourceControlRevisionPrivate::IsManagedTemporaryExport(ManagedExport));
+	TestFalse(TEXT("Session export cleanup does not include the parent Diff directory"), GitSourceControlRevisionPrivate::IsManagedTemporaryExport(OtherDirectoryFile));
+	TestFalse(TEXT("Session export cleanup does not include unrelated files in its directory"), GitSourceControlRevisionPrivate::IsManagedTemporaryExport(OtherPrefixFile));
+	IFileManager::Get().MakeDirectory(*GitSourceControlRevisionPrivate::GetTemporaryExportDirectory(), true);
+	TestTrue(TEXT("Managed session export can be retained after a successful Diff"), FFileHelper::SaveStringToFile(TEXT("test"), *ManagedExport));
+	GitSourceControlRevisionPrivate::RegisterTemporaryExport(ManagedExport);
+	TestTrue(TEXT("Successful Diff export remains available until explicit cleanup"), IFileManager::Get().FileExists(*ManagedExport));
+	GitSourceControlRevision::ReleaseTemporaryExport(ManagedExport);
+	TestFalse(TEXT("Failed or abandoned Diff export is released immediately"), IFileManager::Get().FileExists(*ManagedExport));
+	TestTrue(TEXT("Release ignores files outside the plugin-owned session directory"), FFileHelper::SaveStringToFile(TEXT("test"), *OtherDirectoryFile));
+	GitSourceControlRevision::ReleaseTemporaryExport(OtherDirectoryFile);
+	TestTrue(TEXT("Release leaves unrelated files untouched"), IFileManager::Get().FileExists(*OtherDirectoryFile));
+	IFileManager::Get().Delete(*OtherDirectoryFile, false, true, true);
+	FGitSourceControlRevision Revision;
+	Revision.LocalFilename = TEXT("Content/Example.uasset");
+	Revision.Filename = TEXT("Content/Example.umap");
+	FString ExportFilename;
+	TestFalse(TEXT("Revision export rejects a .umap historical path"), Revision.Get(ExportFilename));
+	return true;
+}
+#endif
 
 #if ENGINE_MAJOR_VERSION >= 5
 bool FGitSourceControlRevision::Get(FString& InOutFilename, EConcurrency::Type InConcurrency) const
 {
 	if (InConcurrency != EConcurrency::Synchronous)
 	{
-		UE_LOG(LogSourceControl, Verbose, TEXT("Revision export is synchronous because Unreal requires the completed file immediately."));
+		UE_LOG(LogGitStandalone, Verbose, TEXT("Revision export is synchronous because Unreal requires the completed file immediately."));
 	}
 #else
 bool FGitSourceControlRevision::Get(FString& InOutFilename) const
 {
 #endif
+	if (!GitSourceControlRevisionPrivate::IsPackageFile(Filename) || !GitSourceControlRevisionPrivate::IsPackageFile(LocalFilename))
+	{
+		UE_LOG(LogGitStandalone, Warning, TEXT("Revision export supports only .uasset files."));
+		return false;
+	}
+	// Engine SourceControl history 对 workspace side 只执行 FindObject.
+	// 在导出历史 package 前加载当前 package, 使原生 History/Diff 不依赖调用入口是否已打开资产.
+	if (!GitSourceControlRevisionPrivate::LoadCurrentPackageForDiff(LocalFilename))
+	{
+		UE_LOG(LogGitStandalone, Warning, TEXT("Could not load current package '%s' before exporting a revision for Diff."), *LocalFilename);
+		return false;
+	}
 	if (InOutFilename.IsEmpty())
 	{
-		IFileManager::Get().MakeDirectory(*FPaths::DiffDir(), true);
+		IFileManager::Get().MakeDirectory(*GitSourceControlRevisionPrivate::GetTemporaryExportDirectory(), true);
 		InOutFilename = FPaths::ConvertRelativePathToFull(GitSourceControlRevisionPrivate::MakeRevisionTempFilename(CommitId, Filename));
 	}
 
-	return ExportToFile(InOutFilename);
+	if (!ExportToFile(InOutFilename))
+	{
+		return false;
+	}
+	GitSourceControlRevisionPrivate::RegisterTemporaryExport(InOutFilename);
+	return true;
 }
 
 bool FGitSourceControlRevision::ExportToFile(const FString& InFilename) const
 {
-	const FGitSourceControlModule* Module = FGitSourceControlModule::GetThreadSafe();
-	if (!Module || CommitId.IsEmpty() || Filename.IsEmpty())
+	if (!GitSourceControlRevisionPrivate::IsPackageFile(Filename) || !GitSourceControlRevisionPrivate::IsPackageFile(LocalFilename) ||
+		GitBinary.IsEmpty() || RepositoryRoot.IsEmpty() || CommitId.IsEmpty() || Filename.IsEmpty())
 	{
 		return false;
 	}
 
-	const FGitSourceControlProvider& Provider = Module->GetProvider();
-	const FString RepositoryRoot = PathToRepoRoot.IsEmpty() ? Provider.GetPathToRepositoryRoot() : PathToRepoRoot;
-	const FString& GitBinary = Provider.GetGitBinaryPath();
 	const FString TemporaryFilename = InFilename + TEXT(".git-export-tmp");
 	IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 
@@ -366,7 +352,6 @@ bool FGitSourceControlRevision::ExportToFile(const FString& InFilename) const
 		{
 			bSuccess = GitSourceControlRevisionPrivate::MaterializeLocalLfsObject(GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsFetch, ExportError);
 		}
-		IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 		if (bSuccess)
 		{
 			bSuccess = IFileManager::Get().Move(*TemporaryFilename, *MaterializedFilename, true, true, false, true);
@@ -374,13 +359,13 @@ bool FGitSourceControlRevision::ExportToFile(const FString& InFilename) const
 		else
 		{
 			IFileManager::Get().Delete(*MaterializedFilename, false, true, true);
-			UE_LOG(LogSourceControl, Warning, TEXT("Git LFS revision export failed for '%s': %s"), *Filename, *ExportError);
+			UE_LOG(LogGitStandalone, Warning, TEXT("Git LFS revision export failed for '%s': %s"), *Filename, *ExportError);
 		}
 	}
 
 	if (bSuccess && GitSourceControlRevisionPrivate::IsPackageFile(Filename) && !GitSourceControlRevisionPrivate::HasValidPackageHeader(TemporaryFilename))
 	{
-		UE_LOG(LogSourceControl, Warning, TEXT("Git revision export for '%s' is not a valid Unreal package."), *Filename);
+		UE_LOG(LogGitStandalone, Warning, TEXT("Git revision export for '%s' is not a valid Unreal package."), *Filename);
 		bSuccess = false;
 	}
 
@@ -388,13 +373,19 @@ bool FGitSourceControlRevision::ExportToFile(const FString& InFilename) const
 	{
 		if (!ExportError.IsEmpty())
 		{
-			UE_LOG(LogSourceControl, Warning, TEXT("Git revision export failed for '%s': %s"), *Filename, *ExportError);
+			UE_LOG(LogGitStandalone, Warning, TEXT("Git revision export failed for '%s': %s"), *Filename, *ExportError);
 		}
 		IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 		return false;
 	}
 
-	return IFileManager::Get().Move(*InFilename, *TemporaryFilename, true, true, false, true);
+	if (!IFileManager::Get().Move(*InFilename, *TemporaryFilename, true, true, false, true))
+	{
+		IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
+		UE_LOG(LogGitStandalone, Warning, TEXT("Could not move Git revision export '%s' into '%s'."), *TemporaryFilename, *InFilename);
+		return false;
+	}
+	return true;
 }
 
 bool FGitSourceControlRevision::GetAnnotated(TArray<FAnnotationLine>& OutLines) const
@@ -461,6 +452,53 @@ int32 FGitSourceControlRevision::GetCheckInIdentifier() const
 int32 FGitSourceControlRevision::GetFileSize() const
 {
 	return FileSize;
+}
+
+void GitSourceControlRevision::CleanupTemporaryExports()
+{
+	TArray<FString> Files;
+	{
+		FScopeLock Lock(&GitSourceControlRevisionPrivate::TemporaryExportsLock);
+		for (const FString& Filename : GitSourceControlRevisionPrivate::TemporaryExports)
+		{
+			Files.Add(Filename);
+		}
+		GitSourceControlRevisionPrivate::TemporaryExports.Reset();
+	}
+	for (const FString& Filename : Files)
+	{
+		ReleaseTemporaryExport(Filename);
+	}
+
+	TArray<FString> SessionExports;
+	const FString ExportDirectory = GitSourceControlRevisionPrivate::GetTemporaryExportDirectory();
+	IFileManager::Get().FindFilesRecursive(SessionExports, *ExportDirectory,
+		*(FString(GitSourceControlRevisionPrivate::TemporaryExportFilenamePrefix) + TEXT("*")), true, false);
+	for (const FString& Filename : SessionExports)
+	{
+		if (GitSourceControlRevisionPrivate::IsManagedTemporaryExport(Filename))
+		{
+			ReleaseTemporaryExport(Filename);
+		}
+	}
+}
+
+void GitSourceControlRevision::ReleaseTemporaryExport(const FString& Filename)
+{
+	if (Filename.IsEmpty())
+	{
+		return;
+	}
+	if (!GitSourceControlRevisionPrivate::IsManagedTemporaryExport(Filename))
+	{
+		return;
+	}
+	{
+		FScopeLock Lock(&GitSourceControlRevisionPrivate::TemporaryExportsLock);
+		GitSourceControlRevisionPrivate::TemporaryExports.Remove(Filename);
+	}
+	IFileManager::Get().Delete(*Filename, false, true, true);
+	IFileManager::Get().Delete(*(Filename + TEXT(".git-export-tmp")), false, true, true);
 }
 
 #undef LOCTEXT_NAMESPACE

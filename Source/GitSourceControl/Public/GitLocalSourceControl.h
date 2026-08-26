@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "GitSourceControlHistoryMode.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "UObject/Object.h"
 
@@ -17,13 +18,13 @@ enum class EGitLocalSourceControlOperationPhase : uint8
 	FetchingLfs,
 	Preparing,
 	Mutating,
-	Refreshing,
+	Reloading,
 	Completed,
 	Cancelled,
 	Failed,
 };
 
-/** 当前 Editor 可用的本地 Git provider 快照. */
+/** 当前 Editor 可用的 standalone local Git repository snapshot. */
 USTRUCT(BlueprintType)
 struct GITSOURCECONTROL_API FGitLocalSourceControlProviderInfo
 {
@@ -146,25 +147,19 @@ public:
 	static FGitLocalSourceControlProviderInfo GetProviderInfo();
 
 	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
-	static UGitLocalSourceControlOperation* StartLoadHistory(const FString& AssetObjectPath);
+	/** 加载单个资产的当前路径历史或已提交 R100 rename 链. */
+	static UGitLocalSourceControlOperation* StartLoadHistory(const FString& AssetObjectPath, EGitLocalSourceControlHistoryMode Mode);
 
 	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
 	static UGitLocalSourceControlOperation* StartFetchLfsRevision(const FString& AssetObjectPath, const FString& Revision);
 
-	/** Restores one historical revision to a clean, closed non-map asset workspace file. */
+/** Force-restores one same-path historical revision. Working, staged, conflicted, untracked, and in-memory changes are discarded without undo. */
 	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
 	static UGitLocalSourceControlOperation* StartRestoreRevision(const FString& AssetObjectPath, const FString& Revision);
 
-	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
-	static UGitLocalSourceControlOperation* StartRefreshStatus(const TArray<FString>& AssetObjectPaths);
-
-	/** Discards index and worktree changes only for clean, closed selected asset files. */
+	/** Discards index and worktree changes only for clean tracked .uasset files and schedules reload after completion. */
 	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
 	static UGitLocalSourceControlOperation* StartDiscardTracked(const TArray<FString>& AssetObjectPaths);
-
-	/** Deletes only clean, closed selected untracked asset files. */
-	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
-	static UGitLocalSourceControlOperation* StartDeleteUntracked(const TArray<FString>& AssetObjectPaths);
 };
 
 /** Cancels and joins API workers before the owning Editor module unloads. */

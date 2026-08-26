@@ -6,9 +6,10 @@
 #include "GitSourceControlUtils.h"
 
 #include "Algo/AllOf.h"
-#include "GitSourceControlCommand.h"
-#include "GitSourceControlModule.h"
-#include "GitSourceControlProvider.h"
+#include "DiffUtils.h"
+#include "GitSourceControlRevision.h"
+#include "GitStandaloneHistory.h"
+#include "GitStandaloneLog.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 
@@ -39,7 +40,7 @@ FGitScopedTempFile::FGitScopedTempFile(const FText& InText)
 	Filename = FPaths::CreateTempFilename(*FPaths::ProjectLogDir(), TEXT("Git-Temp"), TEXT(".txt"));
 	if (!FFileHelper::SaveStringToFile(InText.ToString(), *Filename, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
 	{
-		UE_LOG(LogSourceControl, Error, TEXT("Failed to write to temp file: %s"), *Filename);
+		UE_LOG(LogGitStandalone, Error, TEXT("Failed to write to temp file: %s"), *Filename);
 	}
 }
 
@@ -49,7 +50,7 @@ FGitScopedTempFile::~FGitScopedTempFile()
 	{
 		if (!FPlatformFileManager::Get().GetPlatformFile().DeleteFile(*Filename))
 		{
-			UE_LOG(LogSourceControl, Error, TEXT("Failed to delete temp file: %s"), *Filename);
+			UE_LOG(LogGitStandalone, Error, TEXT("Failed to delete temp file: %s"), *Filename);
 		}
 	}
 }
@@ -81,7 +82,7 @@ namespace GitSourceControlUtils
 				{
 					// TestPath.IsEmpty() meaning is that FilePath is not git file. So it need to removed to git command file list.
 					PackageNotIncludedInGit.Add(FilePath);
-					UE_LOG(LogSourceControl, Warning, TEXT("Package file to update has included dependent file is not git or Can't find directory path for file : %s"), *FilePath);
+					UE_LOG(LogGitStandalone, Warning, TEXT("Package file to update has included dependent file is not git or Can't find directory path for file : %s"), *FilePath);
 
 					break;
 				}
@@ -95,7 +96,7 @@ namespace GitSourceControlUtils
 					FPaths::NormalizeDirectoryName(PathToRepositoryRootNormalized);
 					if (!FPaths::IsSamePath(RetNormalized, PathToRepositoryRootNormalized) && Ret != FPaths::GetPath(GitTestPath))
 					{
-						UE_LOG(LogSourceControl, Error, TEXT("Selected files belong to different submodules"));
+						UE_LOG(LogGitStandalone, Error, TEXT("Selected files belong to different submodules"));
 						return PathToRepositoryRoot;
 					}
 					Ret = TestPath;
@@ -129,6 +130,18 @@ namespace GitSourceControlUtilsPrivate
 constexpr double GitCommandTimeoutSeconds = 30.0;
 constexpr double GitNetworkCommandTimeoutSeconds = 90.0;
 
+#if WITH_DEV_AUTOMATION_TESTS
+TAtomic<uint64> GitProcessLaunchCount = 0;
+TAtomic<uint64> GitLfsFetchLaunchCount = 0;
+TAtomic<uint64> GitProcessLaunchCountAtModuleStartup = MAX_uint64;
+#endif
+
+const TArray<FString>& GetEmptyStringArray()
+{
+	static const TArray<FString> Empty;
+	return Empty;
+}
+
 struct FGitProcessResult
 {
 	int32 ReturnCode = -1;
@@ -141,9 +154,6 @@ struct FGitProcessResult
 
 FCriticalSection GitRepositoryGatesLock;
 TMap<FString, TSharedRef<FCriticalSection, ESPMode::ThreadSafe>> GitRepositoryGates;
-FCriticalSection GitRepositoryGenerationsLock;
-TMap<FString, uint64> GitRepositoryGenerations;
-thread_local const FGitSourceControlCommand* ActiveGitCommand = nullptr;
 thread_local TSharedPtr<FGitOperationCancellationContext, ESPMode::ThreadSafe> ActiveGitCancellationContext;
 
 FString NormalizeRepositoryKey(const FString& InRepositoryRoot)
@@ -207,15 +217,9 @@ TSharedRef<FCriticalSection, ESPMode::ThreadSafe> GetRepositoryGate(const FStrin
 	return NewGate;
 }
 
-bool IsActiveCommandCancelled()
-{
-	return ActiveGitCommand != nullptr && ActiveGitCommand->IsCanceled();
-}
-
 bool IsGitOperationCancelled()
 {
-	return IsActiveCommandCancelled()
-		|| (ActiveGitCancellationContext.IsValid() && ActiveGitCancellationContext->IsCancellationRequested());
+	return ActiveGitCancellationContext.IsValid() && ActiveGitCancellationContext->IsCancellationRequested();
 }
 
 FString BytesToString(const TArray<uint8>& InBytes)
@@ -316,6 +320,10 @@ FGitProcessResult ExecuteGitProcess(const FString& InPathToGitBinary, const FStr
 		return Result;
 	}
 
+#if WITH_DEV_AUTOMATION_TESTS
+	++GitProcessLaunchCount;
+#endif
+
 	if (InStandardInput != nullptr)
 	{
 		int32 BytesWritten = 0;
@@ -370,14 +378,11 @@ FGitProcessResult ExecuteGitProcessOffGameThread(const FString& InPathToGitBinar
 		return ExecuteGitProcess(InPathToGitBinary, InRepositoryRoot, InArguments, nullptr, InTimeoutSeconds);
 	}
 
-	const FGitSourceControlCommand* Command = ActiveGitCommand;
 	const TSharedPtr<FGitOperationCancellationContext, ESPMode::ThreadSafe> CancellationContext = ActiveGitCancellationContext;
-	return Async(EAsyncExecution::ThreadPool, [InPathToGitBinary, InRepositoryRoot, InArguments, InTimeoutSeconds, Command, CancellationContext]()
+	return Async(EAsyncExecution::ThreadPool, [InPathToGitBinary, InRepositoryRoot, InArguments, InTimeoutSeconds, CancellationContext]()
 	{
-		ActiveGitCommand = Command;
 		ActiveGitCancellationContext = CancellationContext;
 		FGitProcessResult Result = ExecuteGitProcess(InPathToGitBinary, InRepositoryRoot, InArguments, nullptr, InTimeoutSeconds);
-		ActiveGitCommand = nullptr;
 		ActiveGitCancellationContext.Reset();
 		return Result;
 	}).Get();
@@ -390,14 +395,11 @@ FGitProcessResult ExecuteGitProcessOffGameThreadWithInput(const FString& InPathT
 		return ExecuteGitProcess(InPathToGitBinary, InRepositoryRoot, InArguments, &InStandardInput);
 	}
 
-	const FGitSourceControlCommand* Command = ActiveGitCommand;
 	const TSharedPtr<FGitOperationCancellationContext, ESPMode::ThreadSafe> CancellationContext = ActiveGitCancellationContext;
-	return Async(EAsyncExecution::ThreadPool, [InPathToGitBinary, InRepositoryRoot, InArguments, StandardInput = InStandardInput, Command, CancellationContext]()
+	return Async(EAsyncExecution::ThreadPool, [InPathToGitBinary, InRepositoryRoot, InArguments, StandardInput = InStandardInput, CancellationContext]()
 	{
-		ActiveGitCommand = Command;
 		ActiveGitCancellationContext = CancellationContext;
 		FGitProcessResult Result = ExecuteGitProcess(InPathToGitBinary, InRepositoryRoot, InArguments, &StandardInput);
-		ActiveGitCommand = nullptr;
 		ActiveGitCancellationContext.Reset();
 		return Result;
 	}).Get();
@@ -540,7 +542,7 @@ bool ResolveLfsFetchRemote(const FString& InPathToGitBinary, const FString& InRe
 	FString RemoteOutput;
 	FString RemoteErrors;
 	if (!GitSourceControlUtils::RunCommandInternalRaw(TEXT("remote"), InPathToGitBinary, InRepositoryRoot,
-		FGitSourceControlModule::GetEmptyStringArray(), FGitSourceControlModule::GetEmptyStringArray(), RemoteOutput, RemoteErrors))
+		GetEmptyStringArray(), GetEmptyStringArray(), RemoteOutput, RemoteErrors))
 	{
 		OutError = RemoteErrors.IsEmpty() ? TEXT("Could not list Git remotes for Git LFS download.") : RemoteErrors;
 		return false;
@@ -560,7 +562,7 @@ bool ResolveLfsFetchRemote(const FString& InPathToGitBinary, const FString& InRe
 	FString BranchName;
 	FString BranchErrors;
 	if (GitSourceControlUtils::RunCommandInternalRaw(TEXT("symbolic-ref"), InPathToGitBinary, InRepositoryRoot,
-		{ TEXT("--quiet"), TEXT("--short"), TEXT("HEAD") }, FGitSourceControlModule::GetEmptyStringArray(), BranchName, BranchErrors, 0))
+		{ TEXT("--quiet"), TEXT("--short"), TEXT("HEAD") }, GetEmptyStringArray(), BranchName, BranchErrors, 0))
 	{
 		BranchName.TrimStartAndEndInline();
 		if (!BranchName.IsEmpty())
@@ -568,10 +570,19 @@ bool ResolveLfsFetchRemote(const FString& InPathToGitBinary, const FString& InRe
 			FString UpstreamRemote;
 			FString UpstreamErrors;
 			if (GitSourceControlUtils::RunCommandInternalRaw(TEXT("config"), InPathToGitBinary, InRepositoryRoot,
-				{ TEXT("--get"), FString::Printf(TEXT("branch.%s.remote"), *BranchName) }, FGitSourceControlModule::GetEmptyStringArray(), UpstreamRemote, UpstreamErrors, 0))
+				{ TEXT("--get"), FString::Printf(TEXT("branch.%s.remote"), *BranchName) }, GetEmptyStringArray(), UpstreamRemote, UpstreamErrors, 0))
 			{
 				UpstreamRemote.TrimStartAndEndInline();
-				if (FindConfiguredRemote(Remotes, UpstreamRemote, OutRemote))
+				FString UpstreamMerge;
+				FString UpstreamMergeErrors;
+				FString VerifiedUpstream;
+				FString VerifiedUpstreamErrors;
+				const bool bHasConfiguredMerge = GitSourceControlUtils::RunCommandInternalRaw(TEXT("config"), InPathToGitBinary, InRepositoryRoot,
+					{ TEXT("--get"), FString::Printf(TEXT("branch.%s.merge"), *BranchName) }, GetEmptyStringArray(), UpstreamMerge, UpstreamMergeErrors, 0, false);
+				const bool bHasResolvedTrackingUpstream = GitSourceControlUtils::RunCommandInternalRaw(TEXT("rev-parse"), InPathToGitBinary, InRepositoryRoot,
+					{ TEXT("--verify"), TEXT("@{upstream}") }, GetEmptyStringArray(), VerifiedUpstream, VerifiedUpstreamErrors, 0, false);
+				UpstreamMerge.TrimStartAndEndInline();
+				if (bHasConfiguredMerge && !UpstreamMerge.IsEmpty() && bHasResolvedTrackingUpstream && FindConfiguredRemote(Remotes, UpstreamRemote, OutRemote))
 				{
 					return true;
 				}
@@ -579,10 +590,6 @@ bool ResolveLfsFetchRemote(const FString& InPathToGitBinary, const FString& InRe
 		}
 	}
 
-	if (FindConfiguredRemote(Remotes, TEXT("upstream"), OutRemote) || FindConfiguredRemote(Remotes, TEXT("origin"), OutRemote))
-	{
-		return true;
-	}
 	if (Remotes.Num() == 1)
 	{
 		OutRemote = Remotes[0];
@@ -590,8 +597,8 @@ bool ResolveLfsFetchRemote(const FString& InPathToGitBinary, const FString& InRe
 	}
 
 	OutError = Remotes.IsEmpty()
-		? TEXT("Git LFS content is missing locally and this repository has no remote. Configure an upstream or origin remote, then retry.")
-		: TEXT("Git LFS content is missing locally and no default remote could be selected. Configure the current branch upstream or an origin remote, then retry.");
+		? TEXT("Git LFS content is missing locally and this repository has no remote. Configure a branch upstream or a single remote, then retry.")
+		: TEXT("Git LFS content is missing locally and no remote could be selected. Configure the current branch upstream or leave exactly one remote, then retry.");
 	return false;
 }
 } // namespace GitSourceControlUtilsPrivate
@@ -626,33 +633,6 @@ FGitOperationCancellationScope::~FGitOperationCancellationScope()
 	}
 }
 
-void SetActiveCommand(const FGitSourceControlCommand* InCommand)
-{
-	ActiveGitCommand = InCommand;
-}
-
-void ClearActiveCommand(const FGitSourceControlCommand* InCommand)
-{
-	if (ActiveGitCommand == InCommand)
-	{
-		ActiveGitCommand = nullptr;
-	}
-}
-
-void InvalidateRepository(const FString& InRepositoryRoot)
-{
-	const FString Key = NormalizeRepositoryKey(InRepositoryRoot);
-	FScopeLock Lock(&GitRepositoryGenerationsLock);
-	++GitRepositoryGenerations.FindOrAdd(Key);
-}
-
-uint64 GetRepositoryGeneration(const FString& InRepositoryRoot)
-{
-	const FString Key = NormalizeRepositoryKey(InRepositoryRoot);
-	FScopeLock Lock(&GitRepositoryGenerationsLock);
-	return GitRepositoryGenerations.FindOrAdd(Key);
-}
-
 // Launch a local Git command with a cancellable, timeout-bound child process.
 bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, FString& OutResults, FString& OutErrors, const int32 ExpectedReturnCode /* = 0 */, const bool bLogFailure /* = true */)
 {
@@ -680,7 +660,7 @@ bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitB
 		}
 	}
 
-	UE_LOG(LogSourceControl, Verbose, TEXT("Run local Git command: git %s"), *InCommand);
+	UE_LOG(LogGitStandalone, Verbose, TEXT("Run local Git command: git %s"), *InCommand);
 	const FGitProcessResult ProcessResult = ExecuteGitProcessOffGameThread(InPathToGitBinary, InRepositoryRoot, Arguments);
 	OutResults = BytesToString(ProcessResult.StandardOutput);
 	OutErrors = BytesToString(ProcessResult.StandardError);
@@ -698,7 +678,7 @@ bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitB
 	{
 		if (bLogFailure)
 		{
-			UE_LOG(LogSourceControl, Warning, TEXT("Git command '%s' failed with exit code %d: %s"), *InCommand, ProcessResult.ReturnCode, *OutErrors);
+			UE_LOG(LogGitStandalone, Warning, TEXT("Git command '%s' failed with exit code %d: %s"), *InCommand, ProcessResult.ReturnCode, *OutErrors);
 		}
 		return false;
 	}
@@ -963,11 +943,128 @@ FString FindGitBinaryPath()
 	return GitBinaryPath;
 }
 
+bool ResolveStandaloneRepositoryForFile(const FString& InFilename, FString& OutGitBinary, FString& OutRepositoryRoot, FString& OutError)
+{
+	OutGitBinary.Reset();
+	OutRepositoryRoot.Reset();
+	OutError.Reset();
+	FString Filename = FPaths::ConvertRelativePathToFull(InFilename);
+	FPaths::NormalizeFilename(Filename);
+	if (Filename.IsEmpty())
+	{
+		OutError = TEXT("A workspace filename is required.");
+		return false;
+	}
+
+	OutGitBinary = FindGitBinaryPath();
+	if (OutGitBinary.IsEmpty())
+	{
+		OutError = TEXT("Could not locate a usable local Git executable.");
+		return false;
+	}
+	if (!FindRootDirectory(Filename, OutRepositoryRoot))
+	{
+		OutError = FString::Printf(TEXT("The file is not inside a Git repository: %s"), *Filename);
+		OutRepositoryRoot.Reset();
+		return false;
+	}
+	OutRepositoryRoot = FPaths::ConvertRelativePathToFull(OutRepositoryRoot);
+	FPaths::NormalizeDirectoryName(OutRepositoryRoot);
+	return true;
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+namespace Testing
+{
+	void ResetGitProcessLaunchCount()
+	{
+		GitSourceControlUtilsPrivate::GitProcessLaunchCount.Store(0);
+		GitSourceControlUtilsPrivate::GitLfsFetchLaunchCount.Store(0);
+	}
+
+	uint64 GetGitProcessLaunchCount()
+	{
+		return GitSourceControlUtilsPrivate::GitProcessLaunchCount.Load();
+	}
+
+	uint64 GetGitLfsFetchLaunchCount()
+	{
+		return GitSourceControlUtilsPrivate::GitLfsFetchLaunchCount.Load();
+	}
+
+	uint64 GetGitProcessLaunchCountAtModuleStartup()
+	{
+		return GitSourceControlUtilsPrivate::GitProcessLaunchCountAtModuleStartup.Load();
+	}
+
+	void CaptureGitProcessLaunchCountAtModuleStartup()
+	{
+		GitSourceControlUtilsPrivate::GitProcessLaunchCountAtModuleStartup.Store(GitSourceControlUtilsPrivate::GitProcessLaunchCount.Load());
+	}
+
+	bool LoadStandaloneHistory(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InFilename,
+		const EGitLocalSourceControlHistoryMode InMode, FString& OutCapturedHead, bool& bOutHeadChanged,
+		TArray<FGitStandaloneHistoryTestEntry>& OutHistory, FString& OutError)
+	{
+		OutHistory.Reset();
+		OutError.Reset();
+		TArray<FString> Errors;
+		TGitSourceControlHistory History;
+		if (!RunGetHistory(InGitBinary, InRepositoryRoot, InFilename, false, InMode, OutCapturedHead, bOutHeadChanged, Errors, History))
+		{
+			OutError = FString::Join(Errors, TEXT("\n"));
+			return false;
+		}
+		for (const TSharedRef<FGitSourceControlRevision, ESPMode::ThreadSafe>& Revision : History)
+		{
+			FGitStandaloneHistoryTestEntry& Entry = OutHistory.AddDefaulted_GetRef();
+			Entry.CommitId = Revision->CommitId;
+			Entry.HistoricalPath = Revision->Filename;
+			Entry.LocalFilename = Revision->LocalFilename;
+			Entry.Description = Revision->Description;
+			Entry.Author = Revision->UserName;
+			Entry.Action = Revision->Action;
+		}
+		return true;
+	}
+
+	TSharedPtr<FGitSourceControlRevision, ESPMode::ThreadSafe> MakeStandaloneRevision(const FString& InGitBinary, const FString& InRepositoryRoot,
+		const FString& InLocalFilename, const FString& InCommitId, const FString& InHistoricalPath)
+	{
+		TSharedPtr<FGitSourceControlRevision, ESPMode::ThreadSafe> Revision = MakeShared<FGitSourceControlRevision, ESPMode::ThreadSafe>();
+		Revision->GitBinary = InGitBinary;
+		Revision->RepositoryRoot = InRepositoryRoot;
+		Revision->LocalFilename = InLocalFilename;
+		Revision->CommitId = InCommitId;
+		Revision->Filename = InHistoricalPath;
+		return Revision;
+	}
+
+	bool ExportStandaloneRevisionForDiff(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InLocalFilename,
+		const FString& InCommitId, const FString& InHistoricalPath, FString& OutTempFilename)
+	{
+		const TSharedPtr<FGitSourceControlRevision, ESPMode::ThreadSafe> Revision = MakeStandaloneRevision(
+			InGitBinary, InRepositoryRoot, InLocalFilename, InCommitId, InHistoricalPath);
+		OutTempFilename.Reset();
+		return Revision->Get(OutTempFilename);
+	}
+
+	UPackage* LoadStandaloneRevisionPackageForDiff(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InLocalFilename,
+		const FString& InCommitId, const FString& InHistoricalPath)
+	{
+		const TSharedPtr<FGitSourceControlRevision, ESPMode::ThreadSafe> Revision = MakeStandaloneRevision(
+			InGitBinary, InRepositoryRoot, InLocalFilename, InCommitId, InHistoricalPath);
+		const TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> SourceRevision = StaticCastSharedPtr<ISourceControlRevision>(Revision);
+		return DiffUtils::LoadPackageForDiff(SourceRevision);
+	}
+}
+#endif
+
 bool CheckGitAvailability(const FString& InPathToGitBinary, FGitVersion* OutVersion)
 {
 	FString InfoMessages;
 	FString ErrorMessages;
-	bool bGitAvailable = RunCommandInternalRaw(TEXT("version"), InPathToGitBinary, FString(), FGitSourceControlModule::GetEmptyStringArray(), FGitSourceControlModule::GetEmptyStringArray(), InfoMessages, ErrorMessages);
+	bool bGitAvailable = RunCommandInternalRaw(TEXT("version"), InPathToGitBinary, FString(), GetEmptyStringArray(), GetEmptyStringArray(), InfoMessages, ErrorMessages);
 	if (bGitAvailable)
 	{
 		if (!InfoMessages.StartsWith("git version"))
@@ -1061,7 +1158,10 @@ bool FetchLfsContentForRevision(const FString& InPathToGitBinary, const FString&
 
 	const FString Arguments = FString::Printf(TEXT("lfs fetch %s %s --include=%s --exclude="),
 		*QuoteGitFileArgument(Remote), *QuoteGitFileArgument(InFullCommitId), *QuoteGitFileArgument(HistoricalPath));
-	UE_LOG(LogSourceControl, Log, TEXT("Fetching requested Git LFS revision content from remote '%s'."), *Remote);
+	UE_LOG(LogGitStandalone, Log, TEXT("Fetching requested Git LFS revision content from remote '%s'."), *Remote);
+#if WITH_DEV_AUTOMATION_TESTS
+	++GitSourceControlUtilsPrivate::GitLfsFetchLaunchCount;
+#endif
 	const FGitProcessResult ProcessResult = ExecuteGitProcessOffGameThread(InPathToGitBinary, InRepositoryRoot, Arguments, GitNetworkCommandTimeoutSeconds);
 	if (ProcessResult.bCancelled)
 	{
@@ -1124,11 +1224,11 @@ void ParseGitVersion(const FString& InVersionString, FGitVersion* OutVersion)
 				}
 				if (OutVersion->bIsFork)
 				{
-					UE_LOG(LogSourceControl, Log, TEXT("Git version %d.%d.%d.%s.%d.%d.%d"), OutVersion->Major, OutVersion->Minor, OutVersion->Patch, *OutVersion->Fork, OutVersion->ForkMajor, OutVersion->ForkMinor, OutVersion->ForkPatch);
+					UE_LOG(LogGitStandalone, Log, TEXT("Git version %d.%d.%d.%s.%d.%d.%d"), OutVersion->Major, OutVersion->Minor, OutVersion->Patch, *OutVersion->Fork, OutVersion->ForkMajor, OutVersion->ForkMinor, OutVersion->ForkPatch);
 				}
 				else
 				{
-					UE_LOG(LogSourceControl, Log, TEXT("Git version %d.%d.%d"), OutVersion->Major, OutVersion->Minor, OutVersion->Patch);
+					UE_LOG(LogGitStandalone, Log, TEXT("Git version %d.%d.%d"), OutVersion->Major, OutVersion->Minor, OutVersion->Patch);
 				}
 			}
 		}
@@ -1187,7 +1287,7 @@ void GetUserConfig(const FString& InPathToGitBinary, const FString& InRepository
 	TArray<FString> ErrorMessages;
 	TArray<FString> Parameters;
 	Parameters.Add(TEXT("user.name"));
-	bResults = RunCommandInternal(TEXT("config"), InPathToGitBinary, InRepositoryRoot, Parameters, FGitSourceControlModule::GetEmptyStringArray(), InfoMessages, ErrorMessages);
+	bResults = RunCommandInternal(TEXT("config"), InPathToGitBinary, InRepositoryRoot, Parameters, GetEmptyStringArray(), InfoMessages, ErrorMessages);
 	if (bResults && InfoMessages.Num() > 0)
 	{
 		OutUserName = InfoMessages[0];
@@ -1200,7 +1300,7 @@ void GetUserConfig(const FString& InPathToGitBinary, const FString& InRepository
 	Parameters.Reset(1);
 	Parameters.Add(TEXT("user.email"));
 	InfoMessages.Reset();
-	bResults &= RunCommandInternal(TEXT("config"), InPathToGitBinary, InRepositoryRoot, Parameters, FGitSourceControlModule::GetEmptyStringArray(), InfoMessages, ErrorMessages);
+	bResults &= RunCommandInternal(TEXT("config"), InPathToGitBinary, InRepositoryRoot, Parameters, GetEmptyStringArray(), InfoMessages, ErrorMessages);
 	if (bResults && InfoMessages.Num() > 0)
 	{
 		OutUserEmail = InfoMessages[0];
@@ -1504,27 +1604,24 @@ bool ExtractPorcelainV2Path(const FString& InRecord, const int32 InFieldsBeforeP
 	return false;
 }
 
-void ApplyPorcelainV2State(const FString& InAbsoluteFilename, const TCHAR InRecordType, const FString& InXY, FGitSourceControlState& OutState)
+void ApplyPorcelainV2State(const TCHAR InRecordType, const FString& InXY, FGitSourceControlFileStatus& OutState)
 {
-	OutState = FGitSourceControlState(InAbsoluteFilename);
-	OutState.State.LockState = ELockState::Unset;
-	OutState.State.RemoteState = ERemoteState::Unset;
 	if (InRecordType == TEXT('?'))
 	{
-		OutState.State.FileState = EFileState::Unknown;
-		OutState.State.TreeState = ETreeState::Untracked;
+		OutState.FileState = EGitFileState::Unknown;
+		OutState.TreeState = EGitTreeState::Untracked;
 		return;
 	}
 	if (InRecordType == TEXT('!'))
 	{
-		OutState.State.FileState = EFileState::Unknown;
-		OutState.State.TreeState = ETreeState::Ignored;
+		OutState.FileState = EGitFileState::Unknown;
+		OutState.TreeState = EGitTreeState::Ignored;
 		return;
 	}
 	if (InRecordType == TEXT('u') || InXY.Len() != 2)
 	{
-		OutState.State.FileState = EFileState::Unmerged;
-		OutState.State.TreeState = ETreeState::Working;
+		OutState.FileState = EGitFileState::Unmerged;
+		OutState.TreeState = EGitTreeState::Working;
 		return;
 	}
 
@@ -1532,51 +1629,51 @@ void ApplyPorcelainV2State(const FString& InAbsoluteFilename, const TCHAR InReco
 	const TCHAR WorktreeState = InXY[1];
 	if (IndexState == TEXT('U') || WorktreeState == TEXT('U') || (IndexState == TEXT('A') && WorktreeState == TEXT('A')) || (IndexState == TEXT('D') && WorktreeState == TEXT('D')))
 	{
-		OutState.State.FileState = EFileState::Unmerged;
-		OutState.State.TreeState = ETreeState::Working;
+		OutState.FileState = EGitFileState::Unmerged;
+		OutState.TreeState = EGitTreeState::Working;
 		return;
 	}
 
-	OutState.State.TreeState = IndexState == TEXT('.') ? ETreeState::Working : (WorktreeState == TEXT('.') ? ETreeState::Staged : ETreeState::Working);
+	OutState.TreeState = IndexState == TEXT('.') ? EGitTreeState::Working : (WorktreeState == TEXT('.') ? EGitTreeState::Staged : EGitTreeState::Working);
 	if (IndexState == TEXT('A'))
 	{
-		OutState.State.FileState = EFileState::Added;
+		OutState.FileState = EGitFileState::Added;
 	}
 	else if (IndexState == TEXT('D'))
 	{
-		OutState.State.FileState = EFileState::Deleted;
+		OutState.FileState = EGitFileState::Deleted;
 	}
 	else if (WorktreeState == TEXT('D'))
 	{
-		OutState.State.FileState = EFileState::Deleted;
+		OutState.FileState = EGitFileState::Deleted;
 	}
 	else if (IndexState == TEXT('R'))
 	{
-		OutState.State.FileState = EFileState::Renamed;
+		OutState.FileState = EGitFileState::Renamed;
 	}
 	else if (IndexState == TEXT('C'))
 	{
-		OutState.State.FileState = EFileState::Copied;
+		OutState.FileState = EGitFileState::Copied;
 	}
 	else
 	{
-		OutState.State.FileState = EFileState::Modified;
+		OutState.FileState = EGitFileState::Modified;
 	}
 }
 
-void AddPorcelainV2State(const FString& InRepositoryRoot, const FString& InRelativePath, const TCHAR InRecordType, const FString& InXY, TMap<FString, FGitSourceControlState>& OutStates)
+void AddPorcelainV2State(const FString& InRepositoryRoot, const FString& InRelativePath, const TCHAR InRecordType, const FString& InXY, TMap<FString, FGitSourceControlFileStatus>& OutStates)
 {
 	if (InRelativePath.IsEmpty())
 	{
 		return;
 	}
 	const FString AbsolutePath = MakeAbsoluteStatusPath(InRepositoryRoot, InRelativePath);
-	FGitSourceControlState State(AbsolutePath);
-	ApplyPorcelainV2State(AbsolutePath, InRecordType, InXY, State);
+	FGitSourceControlFileStatus State;
+	ApplyPorcelainV2State(InRecordType, InXY, State);
 	OutStates.Add(NormalizeFileKey(AbsolutePath), MoveTemp(State));
 }
 
-void ParsePorcelainV2Status(const TArray<uint8>& InOutput, const FString& InRepositoryRoot, TMap<FString, FGitSourceControlState>& OutStates)
+void ParsePorcelainV2Status(const TArray<uint8>& InOutput, const FString& InRepositoryRoot, TMap<FString, FGitSourceControlFileStatus>& OutStates)
 {
 	int32 Offset = 0;
 	FString Record;
@@ -1898,7 +1995,8 @@ bool ExpandSelectedPathsWithRenamePairs(const FString& InPathToGitBinary, const 
 	// add a second status or ls-files query.
 	TArray<uint8> RenameOutput;
 	if (!RunLocalCommand(InPathToGitBinary, RepositoryRoot,
-		TEXT("--no-optional-locks --literal-pathspecs diff --name-status -z --find-renames --diff-filter=R HEAD --"), RenameOutput, OutErrorMessages))
+		// Manual port of upstream 9d5f309 intent: keep machine-parsed rename records free of ANSI sequences.
+		TEXT("--no-optional-locks --literal-pathspecs diff --no-color --name-status -z --find-renames --diff-filter=R HEAD --"), RenameOutput, OutErrorMessages))
 	{
 		return false;
 	}
@@ -2056,9 +2154,36 @@ bool RestoreIndexEntries(const FString& InPathToGitBinary, const FString& InRepo
 		OutError = TEXT("Index snapshot belongs to a different Git repository.");
 		return false;
 	}
+	FString ObjectFormatOutput;
+	FString ObjectFormatErrors;
+	if (!RunCommandInternalRaw(TEXT("rev-parse"), InPathToGitBinary, InSnapshot.RepositoryRoot,
+		{ TEXT("--show-object-format") }, GetEmptyStringArray(), ObjectFormatOutput, ObjectFormatErrors, 0, false))
+	{
+		OutError = ObjectFormatErrors.IsEmpty() ? TEXT("Could not determine the Git object format for index rollback.") : ObjectFormatErrors;
+		return false;
+	}
+	ObjectFormatOutput.TrimStartAndEndInline();
+	const int32 ObjectIdLength = ObjectFormatOutput == TEXT("sha256") ? 64 : 40;
+	const FString ZeroObjectId = FString::ChrN(ObjectIdLength, TEXT('0'));
+	TArray<uint8> RestoreInput;
+	for (const FString& File : InSnapshot.Paths)
+	{
+		FString RelativeFile = File;
+		if (!MakeRepositoryRelativePath(InSnapshot.RepositoryRoot, RelativeFile))
+		{
+			OutError = FString::Printf(TEXT("Index snapshot path is outside the repository: %s"), *File);
+			return false;
+		}
+		FPaths::NormalizeFilename(RelativeFile);
+		const FString RemovalRecord = FString::Printf(TEXT("0 %s 0\t%s"), *ZeroObjectId, *RelativeFile);
+		FTCHARToUTF8 Utf8(*RemovalRecord);
+		RestoreInput.Append(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
+		RestoreInput.Add(0);
+	}
+	RestoreInput.Append(InSnapshot.IndexInfo);
 
 	const FGitProcessResult Result = ExecuteGitProcessOffGameThreadWithInput(InPathToGitBinary, InSnapshot.RepositoryRoot,
-		TEXT("update-index -z --index-info"), InSnapshot.IndexInfo);
+		TEXT("update-index -z --index-info"), RestoreInput);
 	if (Result.bCancelled)
 	{
 		OutError = TEXT("Git index restore was cancelled.");
@@ -2078,7 +2203,6 @@ bool RestoreIndexEntries(const FString& InPathToGitBinary, const FString& InRepo
 		}
 		return false;
 	}
-	InvalidateRepository(InSnapshot.RepositoryRoot);
 	return true;
 }
 
@@ -2088,9 +2212,10 @@ bool RunExactPathspecMutation(const FString& InPathToGitBinary, const FString& I
 	OutError.Reset();
 	const bool bRestore = InVerb == TEXT("restore");
 	const bool bRemoveCached = InVerb == TEXT("rm");
-	if ((!bRestore && !bRemoveCached) || InFiles.IsEmpty())
+	const bool bReset = InVerb == TEXT("reset");
+	if ((!bRestore && !bRemoveCached && !bReset) || InFiles.IsEmpty())
 	{
-		OutError = TEXT("Only explicit local Git restore or cached-index removal mutations are supported.");
+		OutError = TEXT("Only explicit local Git restore, index reset, or cached-index removal mutations are supported.");
 		return false;
 	}
 	if (InParameters.Num() != (bRestore ? 3 : 2))
@@ -2103,7 +2228,9 @@ bool RunExactPathspecMutation(const FString& InPathToGitBinary, const FString& I
 	{
 		const bool bAllowed = bRestore
 			? Parameter == TEXT("--source=HEAD") || Parameter == TEXT("--staged") || Parameter == TEXT("--worktree")
-			: Parameter == TEXT("--cached") || Parameter == TEXT("--ignore-unmatch");
+			: bReset
+				? Parameter == TEXT("-q") || Parameter == TEXT("HEAD")
+				: Parameter == TEXT("--cached") || Parameter == TEXT("--ignore-unmatch");
 		if (!bAllowed || RequestedParameters.Contains(Parameter))
 		{
 			OutError = TEXT("The requested Git mutation parameters are not permitted.");
@@ -2150,13 +2277,12 @@ bool RunExactPathspecMutation(const FString& InPathToGitBinary, const FString& I
 		OutError = Errors.IsEmpty() ? TEXT("Git mutation failed.") : Errors[0];
 		return false;
 	}
-	InvalidateRepository(RepositoryRoot);
 	return true;
 }
 
 // Run a local, path-scoped Git status query. Directories and empty scopes are deliberately rejected.
 bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles,
-					 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlState>& OutStates)
+					 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlFileStatus>& OutStates)
 {
 	static_cast<void>(InUsingLfsLocking);
 	OutStates.Reset();
@@ -2204,24 +2330,22 @@ bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InReposito
 		return false;
 	}
 
-	TMap<FString, FGitSourceControlState> ParsedStates;
+	TMap<FString, FGitSourceControlFileStatus> ParsedStates;
 	ParsePorcelainV2Status(StatusOutput, RepositoryRoot, ParsedStates);
 	TSet<FString> TrackedPaths;
 	ParseTrackedPaths(TrackedOutput, RepositoryRoot, TrackedPaths);
 	for (const FString& File : Files)
 	{
 		const FString Key = NormalizeFileKey(File);
-		if (FGitSourceControlState* ParsedState = ParsedStates.Find(Key))
+		if (FGitSourceControlFileStatus* ParsedState = ParsedStates.Find(Key))
 		{
 			OutStates.Add(File, MoveTemp(*ParsedState));
 			continue;
 		}
 
-		FGitSourceControlState State(File);
-		State.State.FileState = EFileState::Unknown;
-		State.State.TreeState = TrackedPaths.Contains(Key) ? ETreeState::Unmodified : ETreeState::NotInRepo;
-		State.State.LockState = ELockState::Unset;
-		State.State.RemoteState = ERemoteState::Unset;
+		FGitSourceControlFileStatus State;
+		State.FileState = EGitFileState::Unknown;
+		State.TreeState = TrackedPaths.Contains(Key) ? EGitTreeState::Unmodified : EGitTreeState::NotInRepo;
 		OutStates.Add(File, MoveTemp(State));
 	}
 
@@ -2274,7 +2398,7 @@ static FString LogStatusToString(TCHAR InStatus)
 	return FString();
 }
 
-static bool ParseMachineHistory(const TArray<uint8>& InOutput, const FString& InRepositoryRoot, TGitSourceControlHistory& OutHistory)
+static bool ParseMachineHistory(const TArray<uint8>& InOutput, const FString& InGitBinary, const FString& InRepositoryRoot, TGitSourceControlHistory& OutHistory)
 {
 	TSharedPtr<FGitSourceControlRevision, ESPMode::ThreadSafe> CurrentRevision;
 	int32 Offset = 0;
@@ -2316,7 +2440,8 @@ static bool ParseMachineHistory(const TArray<uint8>& InOutput, const FString& In
 			CurrentRevision->Date = FDateTime::FromUnixTimestamp(FCString::Atoi64(*Fields[2]));
 			CurrentRevision->Description = Fields[3];
 			CurrentRevision->FileSize = 0;
-			CurrentRevision->PathToRepoRoot = InRepositoryRoot;
+			CurrentRevision->GitBinary = InGitBinary;
+			CurrentRevision->RepositoryRoot = InRepositoryRoot;
 			continue;
 		}
 
@@ -2379,11 +2504,149 @@ static bool ParseMachineHistory(const TArray<uint8>& InOutput, const FString& In
 	return OutHistory.Num() > 0;
 }
 
-// Query one file's history with one NUL-delimited local Git process. Blob details are deferred until the revision is opened.
-bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InFile, bool bMergeConflict,
-				   TArray<FString>& OutErrorMessages, TGitSourceControlHistory& OutHistory)
+namespace GitSourceControlHistoryPrivate
+{
+constexpr int32 MaxHistoryEntries = 250;
+
+bool ResolveHead(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutHead, TArray<FString>& OutErrorMessages)
+{
+	OutHead.Reset();
+	TArray<uint8> Output;
+	if (!RunLocalCommand(InPathToGitBinary, InRepositoryRoot, TEXT("--no-optional-locks rev-parse --verify HEAD"), Output, OutErrorMessages))
+	{
+		return false;
+	}
+	OutHead = BytesToString(Output);
+	OutHead.TrimStartAndEndInline();
+	if (OutHead.IsEmpty())
+	{
+		OutErrorMessages.Add(TEXT("Git did not return HEAD for the history snapshot."));
+		return false;
+	}
+	return true;
+}
+
+bool LoadSegment(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InStartCommit, const FString& InRelativePath,
+	const FString& InLocalFilename, const int32 InMaxCount, TArray<FString>& OutErrorMessages, TGitSourceControlHistory& OutHistory)
+{
+	TArray<uint8> Output;
+	const FString Arguments = FString::Printf(
+		// Manual port of upstream 9d5f309 intent: keep machine-parsed history records free of ANSI sequences.
+		TEXT("--no-optional-locks --literal-pathspecs log --no-color %s --date=raw --name-status -z --max-count=%d --format=%%x1e%%H%%x1f%%an%%x1f%%at%%x1f%%s%%x00 -- %s"),
+		*InStartCommit,
+		InMaxCount,
+		*QuoteGitFileArgument(InRelativePath));
+	if (!RunLocalCommand(InPathToGitBinary, InRepositoryRoot, Arguments, Output, OutErrorMessages))
+	{
+		return false;
+	}
+
+	TGitSourceControlHistory Segment;
+	if (Output.IsEmpty())
+	{
+		return true;
+	}
+	if (!ParseMachineHistory(Output, InPathToGitBinary, InRepositoryRoot, Segment))
+	{
+		OutErrorMessages.Add(TEXT("Git returned malformed history for the selected file."));
+		return false;
+	}
+	for (int32 Index = 0; Index < Segment.Num(); ++Index)
+	{
+		if (Segment[Index]->Action == TEXT("add"))
+		{
+			// Git path history 否则会跨过 delete/re-add, 把同路径的旧无关文件附加进来.
+			// 从新到旧遇到的第一个 add 是当前 path segment 的 birth boundary.
+			Segment.SetNum(Index + 1);
+			break;
+		}
+	}
+	for (const TSharedRef<FGitSourceControlRevision, ESPMode::ThreadSafe>& Revision : Segment)
+	{
+		// UE History widget 使用稳定的当前 workspace path; Filename 保留该 commit 的真实 blob path.
+		Revision->Filename = InRelativePath;
+		Revision->LocalFilename = InLocalFilename;
+		Revision->BranchSource.Reset();
+	}
+	OutHistory.Append(MoveTemp(Segment));
+	return true;
+}
+
+bool FindExactRenamePredecessor(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InCommit,
+	const FString& InExpectedNewPath, FString& OutParentCommit, FString& OutOldPath, TArray<FString>& OutErrorMessages)
+{
+	OutParentCommit.Reset();
+	OutOldPath.Reset();
+
+	TArray<uint8> ParentOutput;
+	if (!RunLocalCommand(InPathToGitBinary, InRepositoryRoot,
+		FString::Printf(TEXT("--no-optional-locks rev-list --parents -n 1 %s"), *InCommit), ParentOutput, OutErrorMessages))
+	{
+		return false;
+	}
+	TArray<FString> ParentFields;
+	BytesToString(ParentOutput).ParseIntoArrayWS(ParentFields);
+	if (ParentFields.Num() != 2 || !ParentFields[0].Equals(InCommit, ESearchCase::IgnoreCase))
+	{
+		// root 和 merge 是有意的边界, 两者都无法证明线性的 asset path.
+		return true;
+	}
+
+	TArray<uint8> DiffOutput;
+	if (!RunLocalCommand(InPathToGitBinary, InRepositoryRoot,
+		// Manual port of upstream 9d5f309 intent: keep machine-parsed rename records free of ANSI sequences.
+		FString::Printf(TEXT("--no-optional-locks diff-tree --no-color --no-commit-id -r --name-status -z --find-renames=100%% %s %s"), *ParentFields[1], *InCommit),
+		DiffOutput, OutErrorMessages))
+	{
+		return false;
+	}
+
+	int32 Offset = 0;
+	FString Status;
+	while (ReadNulToken(DiffOutput, Offset, Status))
+	{
+		const bool bRenameOrCopy = Status.StartsWith(TEXT("R"), ESearchCase::CaseSensitive) || Status.StartsWith(TEXT("C"), ESearchCase::CaseSensitive);
+		if (!Status.Equals(TEXT("R100"), ESearchCase::CaseSensitive))
+		{
+			FString IgnoredPath;
+			if (!ReadNulToken(DiffOutput, Offset, IgnoredPath))
+			{
+				OutErrorMessages.Add(TEXT("Git returned an incomplete commit diff while checking an exact rename."));
+				return false;
+			}
+			if (bRenameOrCopy && !ReadNulToken(DiffOutput, Offset, IgnoredPath))
+			{
+				OutErrorMessages.Add(TEXT("Git returned an incomplete rename or copy record while checking an exact rename."));
+				return false;
+			}
+			continue;
+		}
+
+		FString OldPath;
+		FString NewPath;
+		if (!ReadNulToken(DiffOutput, Offset, OldPath) || !ReadNulToken(DiffOutput, Offset, NewPath))
+		{
+			OutErrorMessages.Add(TEXT("Git returned an incomplete exact rename record."));
+			return false;
+		}
+		if (NewPath.Equals(InExpectedNewPath, ESearchCase::CaseSensitive))
+		{
+			OutParentCommit = ParentFields[1];
+			OutOldPath = MoveTemp(OldPath);
+			return true;
+		}
+	}
+	return true;
+}
+}
+
+// 从固定 HEAD snapshot 查询单文件. ExactRenames 逐 commit 只追踪已提交 R100 move.
+bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InFile, const bool bMergeConflict,
+	const EGitLocalSourceControlHistoryMode InMode, FString& OutCapturedHead, bool& bOutHeadChanged, TArray<FString>& OutErrorMessages, TGitSourceControlHistory& OutHistory)
 {
 	OutHistory.Reset();
+	OutCapturedHead.Reset();
+	bOutHeadChanged = false;
 	if (bMergeConflict)
 	{
 		OutErrorMessages.Add(TEXT("History for conflicted files is unavailable. Resolve the conflict in an external Git GUI first."));
@@ -2402,22 +2665,69 @@ bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepository
 	}
 	FPaths::NormalizeFilename(RelativeFile);
 
-	const FString Arguments = FString::Printf(
-		TEXT("--no-optional-locks --literal-pathspecs log --follow --date=raw --name-status -z --max-count=250 --format=%%x1e%%H%%x1f%%an%%x1f%%at%%x1f%%s%%x00 -- %s"),
-		*QuoteGitFileArgument(RelativeFile));
-	TArray<uint8> Output;
-	if (!RunLocalCommand(InPathToGitBinary, RepositoryRoot, Arguments, Output, OutErrorMessages))
+	if (!GitSourceControlHistoryPrivate::ResolveHead(InPathToGitBinary, RepositoryRoot, OutCapturedHead, OutErrorMessages))
 	{
 		return false;
 	}
-	if (!ParseMachineHistory(Output, RepositoryRoot, OutHistory))
+
+	FString SegmentStart = OutCapturedHead;
+	FString SegmentPath = RelativeFile;
+	TSet<FString> VisitedSegments;
+	while (OutHistory.Num() < GitSourceControlHistoryPrivate::MaxHistoryEntries)
 	{
-		OutErrorMessages.Add(TEXT("Git returned no parseable history for the selected file."));
+		const FString SegmentKey = SegmentStart + TEXT("\n") + SegmentPath;
+		if (VisitedSegments.Contains(SegmentKey))
+		{
+			break;
+		}
+		VisitedSegments.Add(SegmentKey);
+
+		const int32 SegmentFirstIndex = OutHistory.Num();
+		if (!GitSourceControlHistoryPrivate::LoadSegment(InPathToGitBinary, RepositoryRoot, SegmentStart, SegmentPath, LocalFilename,
+			GitSourceControlHistoryPrivate::MaxHistoryEntries - SegmentFirstIndex, OutErrorMessages, OutHistory))
+		{
+			return false;
+		}
+		if (SegmentFirstIndex == OutHistory.Num())
+		{
+			break;
+		}
+		if (InMode == EGitLocalSourceControlHistoryMode::CurrentPath || OutHistory.Num() >= GitSourceControlHistoryPrivate::MaxHistoryEntries)
+		{
+			break;
+		}
+
+		const TSharedRef<FGitSourceControlRevision, ESPMode::ThreadSafe>& OldestRevision = OutHistory.Last();
+		FString ParentCommit;
+		FString OldPath;
+		if (!GitSourceControlHistoryPrivate::FindExactRenamePredecessor(InPathToGitBinary, RepositoryRoot, OldestRevision->CommitId, SegmentPath, ParentCommit, OldPath, OutErrorMessages))
+		{
+			return false;
+		}
+		if (ParentCommit.IsEmpty() || OldPath.IsEmpty())
+		{
+			break;
+		}
+		SegmentStart = MoveTemp(ParentCommit);
+		SegmentPath = MoveTemp(OldPath);
+	}
+
+	if (OutHistory.IsEmpty())
+	{
+		OutErrorMessages.Add(TEXT("Git returned no history for the selected file."));
 		return false;
 	}
-	for (const TSharedRef<FGitSourceControlRevision, ESPMode::ThreadSafe>& Revision : OutHistory)
+	for (int32 Index = 0; Index < OutHistory.Num(); ++Index)
 	{
-		Revision->LocalFilename = LocalFilename;
+		OutHistory[Index]->RevisionNumber = OutHistory.Num() - Index;
+		OutHistory[Index]->BranchSource.Reset();
+	}
+
+	TArray<FString> HeadCheckErrors;
+	FString HeadAtCompletion;
+	if (GitSourceControlHistoryPrivate::ResolveHead(InPathToGitBinary, RepositoryRoot, HeadAtCompletion, HeadCheckErrors))
+	{
+		bOutHeadChanged = !HeadAtCompletion.Equals(OutCapturedHead, ESearchCase::IgnoreCase);
 	}
 	return true;
 }
@@ -2446,151 +2756,6 @@ TArray<FString> AbsoluteFilenames(const TArray<FString>& InFileNames, const FStr
 	}
 
 	return AbsFiles;
-}
-
-bool UpdateCachedStates(const TMap<const FString, FGitState>& InResults)
-{
-	if (InResults.Num() == 0)
-	{
-		return false;
-	}
-	
-	FGitSourceControlModule* GitSourceControl = FGitSourceControlModule::GetThreadSafe();
-	if (!GitSourceControl)
-	{
-		return false;
-	}
-	FGitSourceControlProvider& Provider = GitSourceControl->GetProvider();
-	const FDateTime Now = FDateTime::Now();
-	bool bStatesChanged = false;
-
-	for (const auto& Pair : InResults)
-	{
-		TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> State = Provider.GetStateInternal(Pair.Key);
-		const FGitState& NewState = Pair.Value;
-		if (NewState.FileState != EFileState::Unset)
-		{
-			bStatesChanged |= State->State.FileState != NewState.FileState;
-			State->State.FileState = NewState.FileState;
-		}
-		if (NewState.TreeState != ETreeState::Unset)
-		{
-			bStatesChanged |= State->State.TreeState != NewState.TreeState;
-			State->State.TreeState = NewState.TreeState;
-		}
-		if (NewState.LockState != ELockState::Unset)
-		{
-			bStatesChanged |= State->State.LockState != NewState.LockState || State->State.LockUser != NewState.LockUser;
-			State->State.LockState = NewState.LockState;
-			State->State.LockUser = NewState.LockUser;
-		}
-		if (NewState.RemoteState != ERemoteState::Unset)
-		{
-			const FString NewHeadBranch = NewState.RemoteState == ERemoteState::UpToDate ? FString() : NewState.HeadBranch;
-			bStatesChanged |= State->State.RemoteState != NewState.RemoteState || State->State.HeadBranch != NewHeadBranch;
-			State->State.RemoteState = NewState.RemoteState;
-			State->State.HeadBranch = NewHeadBranch;
-		}
-		State->TimeStamp = Now;
-
-	}
-
-	return bStatesChanged;
-}
-
-bool CollectNewStates(const TMap<FString, FGitSourceControlState>& InStates, TMap<const FString, FGitState>& OutResults)
-{
-	if (InStates.Num() == 0)
-	{
-		return false;
-	}
-	
-	for (const auto& InState : InStates)
-	{
-		OutResults.Add(InState.Key, InState.Value.State);
-	}
-
-	return true;
-}
-
-bool CollectNewStates(const TArray<FString>& InFiles, TMap<const FString, FGitState>& OutResults, EFileState::Type FileState, ETreeState::Type TreeState, ELockState::Type LockState, ERemoteState::Type RemoteState)
-{
-	if (InFiles.Num() == 0)
-	{
-		return false;
-	}
-
-	FGitState NewState;
-	NewState.FileState = FileState;
-	NewState.TreeState = TreeState;
-	NewState.LockState = LockState;
-	NewState.RemoteState = RemoteState;
-
-	for (const auto& File : InFiles)
-	{
-		FGitState& State = OutResults.FindOrAdd(File, NewState);
-		if (NewState.FileState != EFileState::Unset)
-		{
-			State.FileState = NewState.FileState;
-		}
-		if (NewState.TreeState != ETreeState::Unset)
-		{
-			State.TreeState = NewState.TreeState;
-		}
-		if (NewState.LockState != ELockState::Unset)
-		{
-			State.LockState = NewState.LockState;
-		}
-		if (NewState.RemoteState != ERemoteState::Unset)
-		{
-			State.RemoteState = NewState.RemoteState;
-		}
-	}
-
-	return true;
-}
-
-/**
- * Helper struct for RemoveRedundantErrors()
- */
-struct FRemoveRedundantErrors
-{
-	FRemoveRedundantErrors(const FString& InFilter) : Filter(InFilter)
-	{}
-
-	bool operator()(const FString& String) const
-	{
-		if (String.Contains(Filter))
-		{
-			return true;
-		}
-
-		return false;
-	}
-
-	/** The filter string we try to identify in the reported error */
-	FString Filter;
-};
-
-void RemoveRedundantErrors(FGitSourceControlCommand& InCommand, const FString& InFilter)
-{
-	bool bFoundRedundantError = false;
-	for (auto Iter(InCommand.ResultInfo.ErrorMessages.CreateConstIterator()); Iter; Iter++)
-	{
-		if (Iter->Contains(InFilter))
-		{
-			InCommand.ResultInfo.InfoMessages.Add(*Iter);
-			bFoundRedundantError = true;
-		}
-	}
-
-	InCommand.ResultInfo.ErrorMessages.RemoveAll(FRemoveRedundantErrors(InFilter));
-
-	// if we have no error messages now, assume success!
-	if (bFoundRedundantError && InCommand.ResultInfo.ErrorMessages.Num() == 0 && !InCommand.bCommandSuccessful)
-	{
-		InCommand.bCommandSuccessful = true;
-	}
 }
 
 bool DumpRevisionBlobToFile(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InRevisionSpec, const FString& InOutputFile, FString& OutError)

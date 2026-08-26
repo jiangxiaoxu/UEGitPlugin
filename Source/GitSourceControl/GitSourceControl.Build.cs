@@ -20,11 +20,11 @@ public class GitSourceControl : ModuleRules
 				"SlateCore",
 				"InputCore",
 				"DesktopWidgets",
-				"DirectoryWatcher",
 				"EditorStyle",
 				"UnrealEd",
 				"SourceControl",
-				"SourceControlWindows",
+				"AssetTools",
+				"AssetDefinition",
 				"Projects"
 			}
 		);

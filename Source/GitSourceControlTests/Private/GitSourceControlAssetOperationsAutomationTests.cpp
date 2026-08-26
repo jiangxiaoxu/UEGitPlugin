@@ -2,51 +2,62 @@
 
 #include "GitSourceControlAssetOperations.h"
 
+#include "Curves/CurveFloat.h"
+#include "EditorValidatorSubsystem.h"
 #include "HAL/FileManager.h"
-#include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
+#include "Misc/PackageName.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
+#include "PackageTools.h"
+#include "UObject/MetaData.h"
+#include "UObject/Package.h"
+#include "UObject/SavePackage.h"
+#include "UObject/UObjectGlobals.h"
 
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
 namespace GitSourceControlAssetOperationsAutomationTestsPrivate
 {
-	FString QuoteGitArgument(const FString& InArgument)
+	FString QuoteGitArgument(const FString& Argument)
 	{
-		FString EscapedArgument = InArgument;
-		EscapedArgument.ReplaceInline(TEXT("\""), TEXT("\\\""));
-		return FString::Printf(TEXT("\"%s\""), *EscapedArgument);
+		FString Escaped = Argument;
+		Escaped.ReplaceInline(TEXT("\""), TEXT("\\\""));
+		return FString::Printf(TEXT("\"%s\""), *Escaped);
 	}
 
-	FString NormalizeDirectory(const FString& InDirectory)
+	FString NormalizeDirectory(const FString& Directory)
 	{
-		FString Result = FPaths::ConvertRelativePathToFull(InDirectory);
+		FString Result = FPaths::ConvertRelativePathToFull(Directory);
 		FPaths::NormalizeDirectoryName(Result);
 		return Result;
 	}
 
-	bool IsSameOrUnderDirectory(const FString& InPath, const FString& InDirectory)
+	bool IsSameOrUnderDirectory(const FString& Path, const FString& Directory)
 	{
-		const FString Path = NormalizeDirectory(InPath);
-		const FString Directory = NormalizeDirectory(InDirectory);
-		return FPaths::IsSamePath(Path, Directory) || FPaths::IsUnderDirectory(Path, Directory);
+		const FString NormalizedPath = NormalizeDirectory(Path);
+		const FString NormalizedDirectory = NormalizeDirectory(Directory);
+		return FPaths::IsSamePath(NormalizedPath, NormalizedDirectory) || FPaths::IsUnderDirectory(NormalizedPath, NormalizedDirectory);
 	}
 
-	class FGitAssetOperationFixture final
+	class FFixture final
 	{
 	public:
-		explicit FGitAssetOperationFixture(FAutomationTestBase& InTest)
+		explicit FFixture(FAutomationTestBase& InTest)
 			: Test(InTest)
 		{
 		}
 
-		~FGitAssetOperationFixture()
+		~FFixture()
 		{
-			Cleanup();
+			if (!Root.IsEmpty() && IsSafePath() && IFileManager::Get().DirectoryExists(*Root))
+			{
+				IFileManager::Get().DeleteDirectory(*Root, false, true);
+			}
 		}
 
 		bool Initialize()
@@ -54,827 +65,460 @@ namespace GitSourceControlAssetOperationsAutomationTestsPrivate
 			GitBinary = GitSourceControlUtils::FindGitBinaryPath();
 			if (GitBinary.IsEmpty())
 			{
-				Test.AddError(TEXT("Git executable is required for Git asset-operation automation tests."));
+				Test.AddError(TEXT("Git executable is required for asset-operation automation tests."));
 				return false;
 			}
-
-			const FString TempRoot = NormalizeDirectory(FPlatformProcess::UserTempDir());
-			RepositoryRoot = NormalizeDirectory(FPaths::Combine(TempRoot, TEXT("GitSourceControlAssetOperationTests"), FGuid::NewGuid().ToString(EGuidFormats::Digits)));
-			if (!IsSafeFixturePath(TempRoot))
+			Root = NormalizeDirectory(FPaths::Combine(FPlatformProcess::UserTempDir(), TEXT("GitSourceControlAssetOperationTests"), FGuid::NewGuid().ToString(EGuidFormats::Digits)));
+			if (!IsSafePath() || !IFileManager::Get().MakeDirectory(*Root, true))
 			{
-				Test.AddError(FString::Printf(TEXT("Refusing to create Git asset-operation fixture outside system temp: %s"), *RepositoryRoot));
+				Test.AddError(FString::Printf(TEXT("Could not create safe asset-operation fixture: %s"), *Root));
 				return false;
 			}
-			if (!IFileManager::Get().MakeDirectory(*RepositoryRoot, true))
-			{
-				Test.AddError(FString::Printf(TEXT("Failed to create Git asset-operation fixture directory: %s"), *RepositoryRoot));
-				return false;
-			}
-
-			return RunGit(TEXT("init"))
-				&& RunGit(TEXT("config user.name \"GitSourceControlTests\""))
-				&& RunGit(TEXT("config user.email \"git-source-control-tests@example.invalid\""));
+			return RunGit(TEXT("init")) && RunGit(TEXT("config user.name \"GitSourceControlTests\"")) && RunGit(TEXT("config user.email \"git-source-control-tests@example.invalid\""));
 		}
 
-		bool WriteFile(const FString& InRelativeFilename, const FString& InContents)
+		bool WriteFile(const FString& RelativeFilename, const FString& Contents) const
 		{
-			const FString Filename = AbsoluteFilename(InRelativeFilename);
-			if (!IFileManager::Get().MakeDirectory(*FPaths::GetPath(Filename), true))
-			{
-				Test.AddError(FString::Printf(TEXT("Failed to create fixture file directory for %s"), *Filename));
-				return false;
-			}
-			if (!FFileHelper::SaveStringToFile(InContents, *Filename, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
-			{
-				Test.AddError(FString::Printf(TEXT("Failed to write fixture file %s"), *Filename));
-				return false;
-			}
-			return true;
+			const FString Filename = AbsoluteFilename(RelativeFilename);
+			return IFileManager::Get().MakeDirectory(*FPaths::GetPath(Filename), true) && FFileHelper::SaveStringToFile(Contents, *Filename, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 		}
 
-		bool ReadFile(const FString& InRelativeFilename, FString& OutContents) const
-		{
-			return FFileHelper::LoadFileToString(OutContents, *AbsoluteFilename(InRelativeFilename));
-		}
-
-		bool DeleteFile(const FString& InRelativeFilename)
-		{
-			const FString Filename = AbsoluteFilename(InRelativeFilename);
-			if (!FPlatformFileManager::Get().GetPlatformFile().DeleteFile(*Filename))
-			{
-				Test.AddError(FString::Printf(TEXT("Failed to delete fixture file %s"), *Filename));
-				return false;
-			}
-			return true;
-		}
-
-		bool MoveFile(const FString& InSourceRelativeFilename, const FString& InDestinationRelativeFilename)
-		{
-			const FString SourceFilename = AbsoluteFilename(InSourceRelativeFilename);
-			const FString DestinationFilename = AbsoluteFilename(InDestinationRelativeFilename);
-			if (!IFileManager::Get().MakeDirectory(*FPaths::GetPath(DestinationFilename), true) ||
-				!IFileManager::Get().Move(*DestinationFilename, *SourceFilename, true, true, false, true))
-			{
-				Test.AddError(FString::Printf(TEXT("Failed to move fixture file from %s to %s"), *SourceFilename, *DestinationFilename));
-				return false;
-			}
-			return true;
-		}
-
-		bool CommitAll(const FString& InMessage)
-		{
-			return RunGit(TEXT("add --all"))
-				&& RunGit(FString::Printf(TEXT("commit --no-gpg-sign -m %s"), *QuoteGitArgument(InMessage)));
-		}
-
-		bool RunGit(const FString& InArguments)
-		{
-			FString Output;
-			return RunGitExpectExit(InArguments, 0, Output);
-		}
-
-		bool RunGit(const FString& InArguments, FString& OutStandardOutput)
-		{
-			return RunGitExpectExit(InArguments, 0, OutStandardOutput);
-		}
-
-		bool RunGitExpectExit(const FString& InArguments, const int32 InExpectedExitCode, FString& OutStandardOutput)
+		bool ReadFile(const FString& RelativeFilename, FString& OutContents) const { return FFileHelper::LoadFileToString(OutContents, *AbsoluteFilename(RelativeFilename)); }
+		bool RunGit(const FString& Arguments, FString& OutOutput) const
 		{
 			int32 ReturnCode = INDEX_NONE;
 			FString StandardError;
-			const FString CommandLine = FString::Printf(TEXT("-C %s --no-optional-locks %s"), *QuoteGitArgument(RepositoryRoot), *InArguments);
-			FPlatformProcess::ExecProcess(*GitBinary, *CommandLine, &ReturnCode, &OutStandardOutput, &StandardError);
-			if (ReturnCode != InExpectedExitCode)
-			{
-				Test.AddError(FString::Printf(TEXT("Fixture Git command returned %d rather than %d: git %s\n%s"), ReturnCode, InExpectedExitCode, *CommandLine, *StandardError));
-				return false;
-			}
-			return true;
+			const FString CommandLine = FString::Printf(TEXT("-C %s --no-optional-locks %s"), *QuoteGitArgument(Root), *Arguments);
+			FPlatformProcess::ExecProcess(*GitBinary, *CommandLine, &ReturnCode, &OutOutput, &StandardError);
+			if (ReturnCode == 0) return true;
+			Test.AddError(FString::Printf(TEXT("Fixture Git command failed (%d): git %s\n%s"), ReturnCode, *CommandLine, *StandardError));
+			return false;
 		}
-
-		FString AbsoluteFilename(const FString& InRelativeFilename) const
-		{
-			return FPaths::Combine(RepositoryRoot, InRelativeFilename);
-		}
-
-		FString RelativeFilename(const FString& InAbsoluteFilename) const
-		{
-			FString Result = FPaths::ConvertRelativePathToFull(InAbsoluteFilename);
-			FPaths::NormalizeFilename(Result);
-			FString RepositoryPrefix = RepositoryRoot;
-			FPaths::NormalizeDirectoryName(RepositoryPrefix);
-			RepositoryPrefix += TEXT("/");
-			if (!FPaths::MakePathRelativeTo(Result, *RepositoryPrefix))
-			{
-				Test.AddError(FString::Printf(TEXT("Fixture path is outside the Git repository: %s"), *InAbsoluteFilename));
-				return FString();
-			}
-			FPaths::NormalizeFilename(Result);
-			return Result;
-		}
-
-		const FString& GetGitBinary() const
-		{
-			return GitBinary;
-		}
-
-		const FString& GetRepositoryRoot() const
-		{
-			return RepositoryRoot;
-		}
+		bool RunGit(const FString& Arguments) const { FString Output; return RunGit(Arguments, Output); }
+		bool CommitAll(const FString& Message) const { return RunGit(TEXT("add --all")) && RunGit(FString::Printf(TEXT("commit --no-gpg-sign -m %s"), *QuoteGitArgument(Message))); }
+		FString AbsoluteFilename(const FString& RelativeFilename) const { return FPaths::Combine(Root, RelativeFilename); }
+		const FString& GetGitBinary() const { return GitBinary; }
+		const FString& GetRoot() const { return Root; }
 
 	private:
-		bool IsSafeFixturePath(const FString& InTempRoot) const
+		bool IsSafePath() const
 		{
-			const FString ExpectedParent = FPaths::Combine(InTempRoot, TEXT("GitSourceControlAssetOperationTests"));
-			if (!IsSameOrUnderDirectory(RepositoryRoot, ExpectedParent) || IsSameOrUnderDirectory(RepositoryRoot, FPaths::ProjectDir()))
-			{
-				return false;
-			}
+			const FString Parent = FPaths::Combine(NormalizeDirectory(FPlatformProcess::UserTempDir()), TEXT("GitSourceControlAssetOperationTests"));
+			if (!IsSameOrUnderDirectory(Root, Parent) || IsSameOrUnderDirectory(Root, FPaths::ProjectDir())) return false;
 			for (const TSharedRef<IPlugin>& Plugin : IPluginManager::Get().GetDiscoveredPlugins())
 			{
-				if (IsSameOrUnderDirectory(RepositoryRoot, Plugin->GetBaseDir()))
-				{
-					return false;
-				}
+				if (IsSameOrUnderDirectory(Root, Plugin->GetBaseDir())) return false;
 			}
 			return true;
-		}
-
-		void Cleanup()
-		{
-			if (RepositoryRoot.IsEmpty())
-			{
-				return;
-			}
-			if (!IsSafeFixturePath(NormalizeDirectory(FPlatformProcess::UserTempDir())))
-			{
-				Test.AddError(FString::Printf(TEXT("Refusing to delete unsafe Git asset-operation fixture: %s"), *RepositoryRoot));
-				return;
-			}
-			if (IFileManager::Get().DirectoryExists(*RepositoryRoot) && !IFileManager::Get().DeleteDirectory(*RepositoryRoot, false, true))
-			{
-				Test.AddError(FString::Printf(TEXT("Failed to delete Git asset-operation fixture: %s"), *RepositoryRoot));
-			}
-			RepositoryRoot.Reset();
 		}
 
 		FAutomationTestBase& Test;
 		FString GitBinary;
-		FString RepositoryRoot;
+		FString Root;
 	};
 
-	bool CreateCommittedTextFixture(FGitAssetOperationFixture& InFixture)
-	{
-		return InFixture.WriteFile(TEXT("Content/Tracked.txt"), TEXT("head revision\n"))
-			&& InFixture.WriteFile(TEXT("Content/Unrelated.txt"), TEXT("unrelated\n"))
-			&& InFixture.CommitAll(TEXT("Initial text fixture"));
-	}
-
-	GitSourceControlAssetOperations::FGitAssetOperationCallbacks MakeAcceptingCallbacks(int32& OutConfirmCalls, int32& OutPrepareCalls, int32& OutReloadCalls)
+	GitSourceControlAssetOperations::FGitAssetOperationCallbacks MakeAcceptingCallbacks(int32& ConfirmCalls, int32& PrepareCalls, int32& ReloadCalls)
 	{
 		using namespace GitSourceControlAssetOperations;
 		FGitAssetOperationCallbacks Callbacks;
-		Callbacks.Confirm = [&OutConfirmCalls](const FString&, const TArray<FString>&)
-		{
-			++OutConfirmCalls;
-			return true;
-		};
-		Callbacks.PrepareForMutation = [&OutPrepareCalls](const TArray<FString>&)
-		{
-			++OutPrepareCalls;
-			return true;
-		};
-		Callbacks.ReloadPackages = [&OutReloadCalls](const TArray<FString>&)
-		{
-			++OutReloadCalls;
-			return true;
-		};
+		Callbacks.Confirm = [&ConfirmCalls](const FString&, const TArray<FString>&) { ++ConfirmCalls; return true; };
+		Callbacks.PrepareForMutation = [&PrepareCalls](const TArray<FString>&) { ++PrepareCalls; return true; };
+		Callbacks.ReloadPackages = [&ReloadCalls](const TArray<FString>&) { ++ReloadCalls; return true; };
 		return Callbacks;
 	}
 
-	bool TestCallbacksWereUsed(FAutomationTestBase& InTest, const int32 InConfirmCalls, const int32 InPrepareCalls, const int32 InReloadCalls)
+	bool TestCallbacks(FAutomationTestBase& Test, int32 ConfirmCalls, int32 PrepareCalls, int32 ReloadCalls)
 	{
-		return InTest.TestEqual(TEXT("Confirm callback runs once"), InConfirmCalls, 1)
-			&& InTest.TestEqual(TEXT("Prepare callback runs once"), InPrepareCalls, 1)
-			&& InTest.TestEqual(TEXT("Reload callback runs once"), InReloadCalls, 1);
+		return Test.TestEqual(TEXT("Confirm callback runs once"), ConfirmCalls, 1)
+			&& Test.TestEqual(TEXT("Prepare callback runs once"), PrepareCalls, 1)
+			&& Test.TestEqual(TEXT("Reload callback runs once"), ReloadCalls, 1);
 	}
 
-	bool IsGitDiffClean(FGitAssetOperationFixture& InFixture, const FString& InArguments)
+	bool SaveCurvePackage(FAutomationTestBase& Test, UPackage* Package, UCurveFloat* Asset, const FString& Filename, const FString& Revision)
 	{
-		FString Output;
-		return InFixture.RunGitExpectExit(InArguments, 0, Output);
+		FMetaData& Metadata = Package->GetMetaData();
+		Metadata.SetValue(Asset, TEXT("GitSourceControlAssetOperationRevision"), *Revision);
+		Package->MarkPackageDirty();
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		SaveArgs.SaveFlags = SAVE_NoError;
+		return Test.TestTrue(*FString::Printf(TEXT("Saved curve package revision %s"), *Revision), UPackage::SavePackage(Package, Asset, *Filename, SaveArgs));
+	}
+
+	bool IsGitLfsAvailable(const FString& GitBinary)
+	{
+		int32 ReturnCode = INDEX_NONE;
+		FString StandardOutput;
+		FString StandardError;
+		FPlatformProcess::ExecProcess(*GitBinary, TEXT("lfs version"), &ReturnCode, &StandardOutput, &StandardError);
+		return ReturnCode == 0;
+	}
+
+	bool ParseLfsPointer(const FString& Pointer, FString& OutOid, int64& OutSize)
+	{
+		OutOid.Reset();
+		OutSize = 0;
+		TArray<FString> Lines;
+		Pointer.ParseIntoArrayLines(Lines, false);
+		for (const FString& Line : Lines)
+		{
+			if (Line.StartsWith(TEXT("oid sha256:"), ESearchCase::CaseSensitive))
+			{
+				OutOid = Line.Mid(11).TrimStartAndEnd();
+			}
+			else if (Line.StartsWith(TEXT("size "), ESearchCase::CaseSensitive))
+			{
+				OutSize = FCString::Atoi64(*Line.Mid(5).TrimStartAndEnd());
+			}
+		}
+		return OutOid.Len() == 64 && OutSize >= 0;
 	}
 }
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetDiscardAutomationTest,
-	"Cthulhu.GitSourceControl.AssetOperations.Discard",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetDiscardAutomationTest, "Cthulhu.GitSourceControl.AssetOperations.Discard", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
 
 bool FGitSourceControlAssetDiscardAutomationTest::RunTest(const FString& Parameters)
 {
 	static_cast<void>(Parameters);
 	using namespace GitSourceControlAssetOperations;
 	using namespace GitSourceControlAssetOperationsAutomationTestsPrivate;
-
-	FGitAssetOperationFixture Fixture(*this);
-	if (!Fixture.Initialize() || !CreateCommittedTextFixture(Fixture))
+	FFixture Fixture(*this);
+	if (!Fixture.Initialize() || !Fixture.WriteFile(TEXT("Content/Tracked.uasset"), TEXT("head bytes\n")) || !Fixture.CommitAll(TEXT("Initial tracked uasset"))
+		|| !Fixture.WriteFile(TEXT("Content/Tracked.uasset"), TEXT("staged bytes\n")) || !Fixture.RunGit(TEXT("add -- Content/Tracked.uasset")) || !Fixture.WriteFile(TEXT("Content/Tracked.uasset"), TEXT("unstaged bytes\n"))) return false;
+	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRoot());
+	const FString Filename = Fixture.AbsoluteFilename(TEXT("Content/Tracked.uasset"));
+	FString IndexBeforeCommitPoint;
+	if (!Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), IndexBeforeCommitPoint)) return false;
+	const FString ExternalWorktreeContents = TEXT("commit-point changed asset\n");
+	int32 RaceConfirmCalls = 0;
+	int32 RacePrepareCalls = 0;
+	int32 RaceReloadCalls = 0;
+	FGitAssetOperationCallbacks RaceCallbacks = MakeAcceptingCallbacks(RaceConfirmCalls, RacePrepareCalls, RaceReloadCalls);
+	RaceCallbacks.BeforeCommitPointForTesting = [&Fixture, &ExternalWorktreeContents]()
 	{
-		return false;
-	}
-
-	const FString RelativeFilename = TEXT("Content/Tracked.txt");
-	const FString Filename = Fixture.AbsoluteFilename(RelativeFilename);
-	if (!Fixture.WriteFile(RelativeFilename, TEXT("working only change\n")))
-	{
-		return false;
-	}
-
-	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRepositoryRoot());
+		Fixture.WriteFile(TEXT("Content/Tracked.uasset"), ExternalWorktreeContents);
+	};
+	FGitAssetOperationResult RaceResult;
+	TestFalse(TEXT("Discard rejects an asset changed after Confirm and Prepare"), Operations.DiscardTrackedFiles({ Filename }, RaceCallbacks, RaceResult));
+	TestFalse(TEXT("Discard commit-point rejection does not report success"), RaceResult.bSucceeded);
+	FString WorktreeAfterCommitPoint;
+	FString IndexAfterCommitPoint;
+	TestTrue(TEXT("Discard commit-point rejection keeps the external worktree bytes"), Fixture.ReadFile(TEXT("Content/Tracked.uasset"), WorktreeAfterCommitPoint));
+	TestEqual(TEXT("Discard commit-point rejection preserves the callback write"), WorktreeAfterCommitPoint, ExternalWorktreeContents);
+	TestTrue(TEXT("Discard commit-point rejection keeps index readable"), Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), IndexAfterCommitPoint));
+	TestEqual(TEXT("Discard commit-point rejection keeps index unchanged"), IndexAfterCommitPoint, IndexBeforeCommitPoint);
+	if (!TestCallbacks(*this, RaceConfirmCalls, RacePrepareCalls, RaceReloadCalls)) return false;
 	int32 ConfirmCalls = 0;
 	int32 PrepareCalls = 0;
 	int32 ReloadCalls = 0;
 	FGitAssetOperationResult Result;
-	if (!TestTrue(TEXT("Working-tree discard succeeds"), Operations.DiscardTrackedFiles({ Filename }, MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls), Result)))
+	if (!TestTrue(TEXT("Tracked uasset discard succeeds"), Operations.DiscardTrackedFiles({ Filename }, MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls), Result)))
 	{
 		AddError(FString::Join(Result.Errors, TEXT("\n")));
 		return false;
 	}
 	FString Contents;
-	TestTrue(TEXT("Discarded file is present"), Fixture.ReadFile(RelativeFilename, Contents));
-	TestEqual(TEXT("Working-tree discard restores HEAD"), Contents, FString(TEXT("head revision\n")));
-	TestTrue(TEXT("Working-tree is clean after discard"), IsGitDiffClean(Fixture, TEXT("diff --quiet -- Content/Tracked.txt")));
-	TestTrue(TEXT("Index is clean after working-tree discard"), IsGitDiffClean(Fixture, TEXT("diff --cached --quiet -- Content/Tracked.txt")));
-	if (!TestCallbacksWereUsed(*this, ConfirmCalls, PrepareCalls, ReloadCalls))
-	{
-		return false;
-	}
+	TestTrue(TEXT("Discarded asset is readable"), Fixture.ReadFile(TEXT("Content/Tracked.uasset"), Contents));
+	TestEqual(TEXT("Discard restores HEAD worktree bytes"), Contents, FString(TEXT("head bytes\n")));
+	FString Status;
+	TestTrue(TEXT("Discard leaves the asset status readable"), Fixture.RunGit(TEXT("status --porcelain=v2 -- Content/Tracked.uasset"), Status));
+	Status.TrimStartAndEndInline();
+	TestTrue(TEXT("Discard leaves no selected asset residue"), Status.IsEmpty());
+	return Result.bSucceeded && TestCallbacks(*this, ConfirmCalls, PrepareCalls, ReloadCalls);
+}
 
-	if (!Fixture.WriteFile(RelativeFilename, TEXT("staged change\n")) || !Fixture.RunGit(TEXT("add -- Content/Tracked.txt")) || !Fixture.WriteFile(RelativeFilename, TEXT("staged plus working change\n")))
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetDiscardLfsAutomationTest, "Cthulhu.GitSourceControl.AssetOperations.DiscardLfs", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlAssetDiscardLfsAutomationTest::RunTest(const FString& Parameters)
+{
+	static_cast<void>(Parameters);
+	using namespace GitSourceControlAssetOperations;
+	using namespace GitSourceControlAssetOperationsAutomationTestsPrivate;
+	FFixture Fixture(*this);
+	if (!Fixture.Initialize()) return false;
+	if (!IsGitLfsAvailable(Fixture.GetGitBinary()))
+	{
+		AddWarning(TEXT("Git LFS is unavailable; skipping DiscardLfs."));
+		return true;
+	}
+	if (!Fixture.RunGit(TEXT("lfs install --local"))
+		|| !Fixture.RunGit(TEXT("lfs track \"Content/*.uasset\""))
+		|| !Fixture.WriteFile(TEXT(".gitignore"), TEXT("Origin.git/\n"))
+		|| !Fixture.WriteFile(TEXT("Content/Tracked.uasset"), TEXT("head LFS bytes\n"))
+		|| !Fixture.CommitAll(TEXT("Initial LFS tracked asset")))
 	{
 		return false;
 	}
+	const FString OriginDirectory = Fixture.AbsoluteFilename(TEXT("Origin.git"));
+	if (!Fixture.RunGit(FString::Printf(TEXT("init --bare %s"), *QuoteGitArgument(OriginDirectory)))
+		|| !Fixture.RunGit(FString::Printf(TEXT("remote add origin %s"), *QuoteGitArgument(OriginDirectory)))
+		|| !Fixture.RunGit(TEXT("push -u origin HEAD")))
+	{
+		return false;
+	}
+	FString PointerText;
+	if (!Fixture.RunGit(TEXT("show HEAD:Content/Tracked.uasset"), PointerText)) return false;
+	FString Oid;
+	int64 Size = 0;
+	if (!TestTrue(TEXT("Discard LFS fixture pointer parses"), ParseLfsPointer(PointerText, Oid, Size))) return false;
+	const FString ObjectFilename = FPaths::Combine(Fixture.GetRoot(), TEXT(".git/lfs/objects"), Oid.Left(2), Oid.Mid(2, 2), Oid);
+	FString VerifyError;
+	if (!TestTrue(TEXT("Discard LFS fixture cache object verifies"), GitSourceControlUtils::VerifyLocalLfsObject(Fixture.GetGitBinary(), Fixture.GetRoot(), ObjectFilename, Oid, Size, VerifyError)))
+	{
+		AddError(VerifyError);
+		return false;
+	}
+	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRoot());
+	const FString Filename = Fixture.AbsoluteFilename(TEXT("Content/Tracked.uasset"));
+	if (!Fixture.WriteFile(TEXT("Content/Tracked.uasset"), TEXT("staged LFS bytes\n")) || !Fixture.RunGit(TEXT("add -- Content/Tracked.uasset")) || !Fixture.WriteFile(TEXT("Content/Tracked.uasset"), TEXT("unstaged LFS bytes\n"))) return false;
+	int32 ConfirmCalls = 0;
+	int32 PrepareCalls = 0;
+	int32 ReloadCalls = 0;
+	FGitAssetOperationResult Result;
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	if (!TestTrue(TEXT("Discard LFS cache hit succeeds"), Operations.DiscardTrackedFiles({ Filename }, MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls), Result)))
+	{
+		AddError(FString::Join(Result.Errors, TEXT("\n")));
+		return false;
+	}
+	TestEqual(TEXT("Discard LFS cache hit starts no fetch"), GitSourceControlUtils::Testing::GetGitLfsFetchLaunchCount(), static_cast<uint64>(0));
+	FString Contents;
+	TestTrue(TEXT("Discard LFS cache hit restores HEAD content"), Fixture.ReadFile(TEXT("Content/Tracked.uasset"), Contents));
+	TestEqual(TEXT("Discard LFS cache hit content matches HEAD"), Contents, FString(TEXT("head LFS bytes\n")));
+	if (!TestCallbacks(*this, ConfirmCalls, PrepareCalls, ReloadCalls) || !TestTrue(TEXT("Discard LFS removes cache object to force a miss"), IFileManager::Get().Delete(*ObjectFilename, false, true, true))) return false;
+	if (!Fixture.WriteFile(TEXT("Content/Tracked.uasset"), TEXT("staged LFS miss bytes\n")) || !Fixture.RunGit(TEXT("add -- Content/Tracked.uasset")) || !Fixture.WriteFile(TEXT("Content/Tracked.uasset"), TEXT("unstaged LFS miss bytes\n"))) return false;
 	ConfirmCalls = 0;
 	PrepareCalls = 0;
 	ReloadCalls = 0;
 	Result = FGitAssetOperationResult();
-	if (!TestTrue(TEXT("Staged discard succeeds"), Operations.DiscardTrackedFiles({ Filename }, MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls), Result)))
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	if (!TestTrue(TEXT("Discard LFS cache miss succeeds"), Operations.DiscardTrackedFiles({ Filename }, MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls), Result)))
 	{
 		AddError(FString::Join(Result.Errors, TEXT("\n")));
 		return false;
 	}
-	TestTrue(TEXT("Staged discard restores file"), Fixture.ReadFile(RelativeFilename, Contents));
-	TestEqual(TEXT("Staged discard restores HEAD content"), Contents, FString(TEXT("head revision\n")));
-	TestTrue(TEXT("Working tree is clean after staged discard"), IsGitDiffClean(Fixture, TEXT("diff --quiet -- Content/Tracked.txt")));
-	TestTrue(TEXT("Index is clean after staged discard"), IsGitDiffClean(Fixture, TEXT("diff --cached --quiet -- Content/Tracked.txt")));
-	TestTrue(TEXT("Discard result reports disk success"), Result.bSucceeded);
-	return TestCallbacksWereUsed(*this, ConfirmCalls, PrepareCalls, ReloadCalls);
+	TestEqual(TEXT("Discard LFS cache miss performs one targeted fetch"), GitSourceControlUtils::Testing::GetGitLfsFetchLaunchCount(), static_cast<uint64>(1));
+	TestTrue(TEXT("Discard LFS cache miss verifies downloaded object"), GitSourceControlUtils::VerifyLocalLfsObject(Fixture.GetGitBinary(), Fixture.GetRoot(), ObjectFilename, Oid, Size, VerifyError));
+	TestTrue(TEXT("Discard LFS cache miss restores HEAD content"), Fixture.ReadFile(TEXT("Content/Tracked.uasset"), Contents));
+	TestEqual(TEXT("Discard LFS cache miss content matches HEAD"), Contents, FString(TEXT("head LFS bytes\n")));
+	return TestCallbacks(*this, ConfirmCalls, PrepareCalls, ReloadCalls);
 }
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetDeletedTrackedAutomationTest,
-	"Cthulhu.GitSourceControl.AssetOperations.DiscardDeletedTracked",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitSourceControlAssetDeletedTrackedAutomationTest::RunTest(const FString& Parameters)
-{
-	static_cast<void>(Parameters);
-	using namespace GitSourceControlAssetOperations;
-	using namespace GitSourceControlAssetOperationsAutomationTestsPrivate;
-
-	FGitAssetOperationFixture Fixture(*this);
-	if (!Fixture.Initialize() || !CreateCommittedTextFixture(Fixture) || !Fixture.DeleteFile(TEXT("Content/Tracked.txt")))
-	{
-		return false;
-	}
-
-	const FString Filename = Fixture.AbsoluteFilename(TEXT("Content/Tracked.txt"));
-	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRepositoryRoot());
-	int32 ConfirmCalls = 0;
-	int32 PrepareCalls = 0;
-	int32 ReloadCalls = 0;
-	FGitAssetOperationResult Result;
-	if (!TestTrue(TEXT("Deleted tracked file is restored"), Operations.DiscardTrackedFiles({ Filename }, MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls), Result)))
-	{
-		AddError(FString::Join(Result.Errors, TEXT("\n")));
-		return false;
-	}
-	FString Contents;
-	TestTrue(TEXT("Deleted tracked file exists after discard"), Fixture.ReadFile(TEXT("Content/Tracked.txt"), Contents));
-	TestEqual(TEXT("Deleted tracked file is restored from HEAD"), Contents, FString(TEXT("head revision\n")));
-	TestTrue(TEXT("Restored deleted file has no index deletion"), IsGitDiffClean(Fixture, TEXT("diff --cached --quiet -- Content/Tracked.txt")));
-	return TestCallbacksWereUsed(*this, ConfirmCalls, PrepareCalls, ReloadCalls);
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetRenameDiscardAutomationTest,
-	"Cthulhu.GitSourceControl.AssetOperations.DiscardRename",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitSourceControlAssetRenameDiscardAutomationTest::RunTest(const FString& Parameters)
-{
-	static_cast<void>(Parameters);
-	using namespace GitSourceControlAssetOperations;
-	using namespace GitSourceControlAssetOperationsAutomationTestsPrivate;
-
-	FGitAssetOperationFixture Fixture(*this);
-	if (!Fixture.Initialize() || !CreateCommittedTextFixture(Fixture))
-	{
-		return false;
-	}
-
-	struct FRenameScenario
-	{
-		FString Name;
-		bool bStaged = false;
-		bool bSelectOldPath = false;
-	};
-	const TArray<FRenameScenario> Scenarios
-	{
-		{ TEXT("staged old endpoint"), true, true },
-		{ TEXT("staged new endpoint"), true, false },
-		{ TEXT("worktree old endpoint"), false, true },
-		{ TEXT("worktree new endpoint"), false, false },
-	};
-	const FString OldRelativeFilename = TEXT("Content/Tracked.txt");
-	const FString NewRelativeFilename = TEXT("Content/Renamed.txt");
-	const FString OldFilename = Fixture.AbsoluteFilename(OldRelativeFilename);
-	const FString NewFilename = Fixture.AbsoluteFilename(NewRelativeFilename);
-	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRepositoryRoot());
-
-	for (const FRenameScenario& Scenario : Scenarios)
-	{
-		const bool bRenamed = Scenario.bStaged
-			? Fixture.RunGit(TEXT("mv -- Content/Tracked.txt Content/Renamed.txt"))
-			: Fixture.MoveFile(OldRelativeFilename, NewRelativeFilename);
-		if (!bRenamed)
-		{
-			return false;
-		}
-
-		int32 ConfirmCalls = 0;
-		int32 PrepareCalls = 0;
-		int32 ReloadCalls = 0;
-		FGitAssetOperationResult Result;
-		const FString& SelectedFilename = Scenario.bSelectOldPath ? OldFilename : NewFilename;
-		if (!TestTrue(*FString::Printf(TEXT("Discard succeeds from %s"), *Scenario.Name), Operations.DiscardTrackedFiles({ SelectedFilename }, MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls), Result)))
-		{
-			AddError(FString::Join(Result.Errors, TEXT("\n")));
-			return false;
-		}
-
-		FString RestoredContents;
-		TestTrue(*FString::Printf(TEXT("Old path is restored from %s"), *Scenario.Name), Fixture.ReadFile(OldRelativeFilename, RestoredContents));
-		TestEqual(*FString::Printf(TEXT("Old path restores HEAD content from %s"), *Scenario.Name), RestoredContents, FString(TEXT("head revision\n")));
-		TestFalse(*FString::Printf(TEXT("New path is removed from %s"), *Scenario.Name), IFileManager::Get().FileExists(*NewFilename));
-		TestTrue(*FString::Printf(TEXT("Index has no staged rename from %s"), *Scenario.Name), IsGitDiffClean(Fixture, TEXT("diff --cached --quiet -- Content/Tracked.txt Content/Renamed.txt")));
-		FString Status;
-		if (!TestTrue(*FString::Printf(TEXT("Working tree is clean after %s"), *Scenario.Name), Fixture.RunGit(TEXT("status --porcelain=v2 --untracked-files=all"), Status)))
-		{
-			return false;
-		}
-		Status.TrimStartAndEndInline();
-		TestTrue(*FString::Printf(TEXT("No rename residue remains after %s"), *Scenario.Name), Status.IsEmpty());
-		if (!TestCallbacksWereUsed(*this, ConfirmCalls, PrepareCalls, ReloadCalls))
-		{
-			return false;
-		}
-	}
-	return true;
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetDiscardHeadChangeAutomationTest,
-	"Cthulhu.GitSourceControl.AssetOperations.DiscardHeadChange",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitSourceControlAssetDiscardHeadChangeAutomationTest::RunTest(const FString& Parameters)
-{
-	static_cast<void>(Parameters);
-	using namespace GitSourceControlAssetOperations;
-	using namespace GitSourceControlAssetOperationsAutomationTestsPrivate;
-
-	FGitAssetOperationFixture Fixture(*this);
-	if (!Fixture.Initialize() || !CreateCommittedTextFixture(Fixture) || !Fixture.WriteFile(TEXT("Content/Tracked.txt"), TEXT("local discard candidate\n")))
-	{
-		return false;
-	}
-
-	const FString RelativeFilename = TEXT("Content/Tracked.txt");
-	const FString Filename = Fixture.AbsoluteFilename(RelativeFilename);
-	FString IndexBefore;
-	if (!Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.txt"), IndexBefore))
-	{
-		return false;
-	}
-
-	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRepositoryRoot());
-	int32 ConfirmCalls = 0;
-	int32 PrepareCalls = 0;
-	int32 ReloadCalls = 0;
-	FGitAssetOperationCallbacks Callbacks;
-	Callbacks.Confirm = [&Fixture, &ConfirmCalls](const FString&, const TArray<FString>&)
-	{
-		++ConfirmCalls;
-		return Fixture.WriteFile(TEXT("Content/Unrelated.txt"), TEXT("external GUI changed HEAD\n"))
-			&& Fixture.RunGit(TEXT("add -- Content/Unrelated.txt"))
-			&& Fixture.RunGit(TEXT("commit --no-gpg-sign -m \"External HEAD update\""));
-	};
-	Callbacks.PrepareForMutation = [&PrepareCalls](const TArray<FString>&)
-	{
-		++PrepareCalls;
-		return true;
-	};
-	Callbacks.ReloadPackages = [&ReloadCalls](const TArray<FString>&)
-	{
-		++ReloadCalls;
-		return true;
-	};
-
-	FGitAssetOperationResult Result;
-	TestFalse(TEXT("Discard aborts when HEAD changes during confirmation"), Operations.DiscardTrackedFiles({ Filename }, Callbacks, Result));
-	FString ContentsAfter;
-	FString IndexAfter;
-	TestTrue(TEXT("HEAD-change rejection keeps target readable"), Fixture.ReadFile(RelativeFilename, ContentsAfter));
-	TestEqual(TEXT("HEAD-change rejection leaves worktree untouched"), ContentsAfter, FString(TEXT("local discard candidate\n")));
-	TestTrue(TEXT("HEAD-change rejection leaves target index readable"), Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.txt"), IndexAfter));
-	TestEqual(TEXT("HEAD-change rejection leaves target index untouched"), IndexAfter, IndexBefore);
-	TestEqual(TEXT("HEAD-change rejection prompts once"), ConfirmCalls, 1);
-	TestEqual(TEXT("HEAD-change rejection prepares before the final recheck"), PrepareCalls, 1);
-	TestEqual(TEXT("HEAD-change rejection does not reload packages"), ReloadCalls, 0);
-	return TestTrue(TEXT("HEAD-change rejection reports the changed boundary"), Result.Errors.ContainsByPredicate([](const FString& Error)
-	{
-		return Error.Contains(TEXT("HEAD"));
-	}));
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetDiscardFinalIndexRecheckAutomationTest,
-	"Cthulhu.GitSourceControl.AssetOperations.DiscardFinalIndexRecheck",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitSourceControlAssetDiscardFinalIndexRecheckAutomationTest::RunTest(const FString& Parameters)
-{
-	static_cast<void>(Parameters);
-	using namespace GitSourceControlAssetOperations;
-	using namespace GitSourceControlAssetOperationsAutomationTestsPrivate;
-
-	FGitAssetOperationFixture Fixture(*this);
-	if (!Fixture.Initialize() || !CreateCommittedTextFixture(Fixture) || !Fixture.WriteFile(TEXT("Content/Tracked.txt"), TEXT("local discard candidate\n")) ||
-		!Fixture.WriteFile(TEXT("Content/IndexOnly.txt"), TEXT("index only replacement\n")))
-	{
-		return false;
-	}
-
-	FString ReplacementBlob;
-	if (!Fixture.RunGit(TEXT("hash-object -w Content/IndexOnly.txt"), ReplacementBlob))
-	{
-		return false;
-	}
-	ReplacementBlob.TrimStartAndEndInline();
-	if (ReplacementBlob.IsEmpty() || !Fixture.DeleteFile(TEXT("Content/IndexOnly.txt")))
-	{
-		return false;
-	}
-
-	const FString RelativeFilename = TEXT("Content/Tracked.txt");
-	const FString Filename = Fixture.AbsoluteFilename(RelativeFilename);
-	FString IndexBefore;
-	if (!Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.txt"), IndexBefore))
-	{
-		return false;
-	}
-
-	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRepositoryRoot());
-	int32 PrepareCalls = 0;
-	FGitAssetOperationCallbacks Callbacks;
-	Callbacks.Confirm = [](const FString&, const TArray<FString>&)
-	{
-		return true;
-	};
-	Callbacks.PrepareForMutation = [&Fixture, &PrepareCalls, ReplacementBlob](const TArray<FString>&)
-	{
-		++PrepareCalls;
-		return Fixture.RunGit(FString::Printf(TEXT("update-index --add --cacheinfo 100644,%s,Content/Tracked.txt"), *ReplacementBlob));
-	};
-
-	FGitAssetOperationResult Result;
-	TestFalse(TEXT("Discard aborts when the index changes during Game Thread preparation"), Operations.DiscardTrackedFiles({ Filename }, Callbacks, Result));
-	FString ContentsAfter;
-	FString IndexAfter;
-	TestTrue(TEXT("Final-index rejection keeps target readable"), Fixture.ReadFile(RelativeFilename, ContentsAfter));
-	TestEqual(TEXT("Final-index rejection leaves worktree untouched"), ContentsAfter, FString(TEXT("local discard candidate\n")));
-	TestTrue(TEXT("Final-index rejection keeps the external index change"), Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.txt"), IndexAfter));
-	TestFalse(TEXT("Final-index rejection does not roll back external index changes"), IndexAfter.Equals(IndexBefore, ESearchCase::CaseSensitive));
-	TestEqual(TEXT("Final-index rejection prepares once"), PrepareCalls, 1);
-	return TestTrue(TEXT("Final-index rejection reports the index boundary"), Result.Errors.ContainsByPredicate([](const FString& Error)
-	{
-		return Error.Contains(TEXT("index"), ESearchCase::IgnoreCase);
-	}));
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetDiscardRenameTextFilterAutomationTest,
-	"Cthulhu.GitSourceControl.AssetOperations.DiscardRenameTextFilter",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitSourceControlAssetDiscardRenameTextFilterAutomationTest::RunTest(const FString& Parameters)
-{
-	static_cast<void>(Parameters);
-	using namespace GitSourceControlAssetOperations;
-	using namespace GitSourceControlAssetOperationsAutomationTestsPrivate;
-
-	FGitAssetOperationFixture Fixture(*this);
-	if (!Fixture.Initialize()
-		|| !Fixture.RunGit(TEXT("config core.autocrlf false"))
-		|| !Fixture.WriteFile(TEXT(".gitattributes"), TEXT("Content/*.txt text eol=lf\n"))
-		|| !Fixture.WriteFile(TEXT("Content/Tracked.txt"), TEXT("head text\n"))
-		|| !Fixture.CommitAll(TEXT("Initial text-filter fixture")))
-	{
-		return false;
-	}
-
-	const FString OldRelativeFilename = TEXT("Content/Tracked.txt");
-	const FString NewRelativeFilename = TEXT("Content/Renamed.txt");
-	const FString OldFilename = Fixture.AbsoluteFilename(OldRelativeFilename);
-	const FString NewFilename = Fixture.AbsoluteFilename(NewRelativeFilename);
-	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRepositoryRoot());
-	for (const bool bSelectOldPath : { true, false })
-	{
-		if (!Fixture.WriteFile(OldRelativeFilename, TEXT("head text\r\n")) || !Fixture.MoveFile(OldRelativeFilename, NewRelativeFilename))
-		{
-			return false;
-		}
-		int32 ConfirmCalls = 0;
-		int32 PrepareCalls = 0;
-		int32 ReloadCalls = 0;
-		FGitAssetOperationResult Result;
-		const FString& SelectedFilename = bSelectOldPath ? OldFilename : NewFilename;
-		if (!TestTrue(bSelectOldPath ? TEXT("CRLF rename discard succeeds from old path") : TEXT("CRLF rename discard succeeds from new path"),
-			Operations.DiscardTrackedFiles({ SelectedFilename }, MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls), Result)))
-		{
-			AddError(FString::Join(Result.Errors, TEXT("\n")));
-			return false;
-		}
-		TestTrue(bSelectOldPath ? TEXT("CRLF rename restores old path from old selection") : TEXT("CRLF rename restores old path from new selection"), IFileManager::Get().FileExists(*OldFilename));
-		TestFalse(bSelectOldPath ? TEXT("CRLF rename removes new path from old selection") : TEXT("CRLF rename removes new path from new selection"), IFileManager::Get().FileExists(*NewFilename));
-		TestTrue(bSelectOldPath ? TEXT("CRLF old selection leaves clean index") : TEXT("CRLF new selection leaves clean index"), IsGitDiffClean(Fixture, TEXT("diff --cached --quiet -- Content/Tracked.txt Content/Renamed.txt")));
-		FString Status;
-		if (!TestTrue(bSelectOldPath ? TEXT("CRLF old selection status is readable") : TEXT("CRLF new selection status is readable"), Fixture.RunGit(TEXT("status --porcelain=v2 --untracked-files=all"), Status)))
-		{
-			return false;
-		}
-		Status.TrimStartAndEndInline();
-		TestTrue(bSelectOldPath ? TEXT("CRLF old selection leaves no residue") : TEXT("CRLF new selection leaves no residue"), Status.IsEmpty());
-		if (!TestCallbacksWereUsed(*this, ConfirmCalls, PrepareCalls, ReloadCalls))
-		{
-			return false;
-		}
-	}
-	return true;
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetDiscardRenameLfsAutomationTest,
-	"Cthulhu.GitSourceControl.AssetOperations.DiscardRenameLfs",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitSourceControlAssetDiscardRenameLfsAutomationTest::RunTest(const FString& Parameters)
-{
-	static_cast<void>(Parameters);
-	using namespace GitSourceControlAssetOperations;
-	using namespace GitSourceControlAssetOperationsAutomationTestsPrivate;
-
-	FGitAssetOperationFixture Fixture(*this);
-	if (!Fixture.Initialize()
-		|| !Fixture.RunGit(TEXT("lfs install --local"))
-		|| !Fixture.RunGit(TEXT("lfs track \"Content/*.uasset\""))
-		|| !Fixture.WriteFile(TEXT("Content/Tracked.uasset"), TEXT("materialized local LFS content\n"))
-		|| !Fixture.CommitAll(TEXT("Initial local LFS fixture")))
-	{
-		return false;
-	}
-
-	const FString OldRelativeFilename = TEXT("Content/Tracked.uasset");
-	const FString NewRelativeFilename = TEXT("Content/Renamed.uasset");
-	const FString OldFilename = Fixture.AbsoluteFilename(OldRelativeFilename);
-	const FString NewFilename = Fixture.AbsoluteFilename(NewRelativeFilename);
-	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRepositoryRoot());
-	for (const bool bSelectOldPath : { true, false })
-	{
-		if (!Fixture.MoveFile(OldRelativeFilename, NewRelativeFilename))
-		{
-			return false;
-		}
-		int32 ConfirmCalls = 0;
-		int32 PrepareCalls = 0;
-		int32 ReloadCalls = 0;
-		FGitAssetOperationResult Result;
-		const FString& SelectedFilename = bSelectOldPath ? OldFilename : NewFilename;
-		if (!TestTrue(bSelectOldPath ? TEXT("Local LFS rename discard succeeds from old path") : TEXT("Local LFS rename discard succeeds from new path"),
-			Operations.DiscardTrackedFiles({ SelectedFilename }, MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls), Result)))
-		{
-			AddError(FString::Join(Result.Errors, TEXT("\n")));
-			return false;
-		}
-		FString RestoredContents;
-		TestTrue(bSelectOldPath ? TEXT("Local LFS old selection materializes restored asset") : TEXT("Local LFS new selection materializes restored asset"), Fixture.ReadFile(OldRelativeFilename, RestoredContents));
-		TestEqual(bSelectOldPath ? TEXT("Local LFS old selection restores content") : TEXT("Local LFS new selection restores content"), RestoredContents, FString(TEXT("materialized local LFS content\n")));
-		TestFalse(bSelectOldPath ? TEXT("Local LFS old selection removes new path") : TEXT("Local LFS new selection removes new path"), IFileManager::Get().FileExists(*NewFilename));
-		TestTrue(bSelectOldPath ? TEXT("Local LFS old selection leaves clean index") : TEXT("Local LFS new selection leaves clean index"), IsGitDiffClean(Fixture, TEXT("diff --cached --quiet -- Content/Tracked.uasset Content/Renamed.uasset")));
-		FString Status;
-		if (!TestTrue(bSelectOldPath ? TEXT("Local LFS old selection status is readable") : TEXT("Local LFS new selection status is readable"), Fixture.RunGit(TEXT("status --porcelain=v2 --untracked-files=all"), Status)))
-		{
-			return false;
-		}
-		Status.TrimStartAndEndInline();
-		TestTrue(bSelectOldPath ? TEXT("Local LFS old selection leaves no residue") : TEXT("Local LFS new selection leaves no residue"), Status.IsEmpty());
-		if (!TestCallbacksWereUsed(*this, ConfirmCalls, PrepareCalls, ReloadCalls))
-		{
-			return false;
-		}
-	}
-	return true;
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetDeleteNewAutomationTest,
-	"Cthulhu.GitSourceControl.AssetOperations.DeleteNew",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitSourceControlAssetDeleteNewAutomationTest::RunTest(const FString& Parameters)
-{
-	static_cast<void>(Parameters);
-	using namespace GitSourceControlAssetOperations;
-	using namespace GitSourceControlAssetOperationsAutomationTestsPrivate;
-
-	FGitAssetOperationFixture Fixture(*this);
-	if (!Fixture.Initialize() || !CreateCommittedTextFixture(Fixture)
-		|| !Fixture.WriteFile(TEXT("Content/Index Added.txt"), TEXT("index added\n"))
-		|| !Fixture.WriteFile(TEXT("Content/Leave Me.txt"), TEXT("untracked but unselected\n"))
-		|| !Fixture.RunGit(TEXT("add -- \"Content/Index Added.txt\"")))
-	{
-		return false;
-	}
-
-	const FString SelectedFilename = Fixture.AbsoluteFilename(TEXT("Content/Index Added.txt"));
-	const FString UnselectedFilename = Fixture.AbsoluteFilename(TEXT("Content/Leave Me.txt"));
-	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRepositoryRoot());
-	int32 ConfirmCalls = 0;
-	int32 PrepareCalls = 0;
-	int32 ReloadCalls = 0;
-	FGitAssetOperationResult Result;
-	if (!TestTrue(TEXT("Index-added selected file is deleted"), Operations.DeleteUntrackedFiles({ SelectedFilename }, MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls), Result)))
-	{
-		AddError(FString::Join(Result.Errors, TEXT("\n")));
-		return false;
-	}
-	TestFalse(TEXT("Selected index-added file is removed from disk"), IFileManager::Get().FileExists(*SelectedFilename));
-	TestTrue(TEXT("Selected index-added file is removed from index"), IsGitDiffClean(Fixture, TEXT("diff --cached --quiet -- \"Content/Index Added.txt\"")));
-	TestTrue(TEXT("Unselected untracked file remains on disk"), IFileManager::Get().FileExists(*UnselectedFilename));
-	FString UntrackedProbeOutput;
-	if (!Fixture.RunGitExpectExit(TEXT("ls-files --error-unmatch -- \"Content/Leave Me.txt\""), 1, UntrackedProbeOutput))
-	{
-		return false;
-	}
-	return TestCallbacksWereUsed(*this, ConfirmCalls, PrepareCalls, ReloadCalls);
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetHistoryRestoreAutomationTest,
-	"Cthulhu.GitSourceControl.AssetOperations.HistoryRestore",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetHistoryRestoreAutomationTest, "Cthulhu.GitSourceControl.AssetOperations.HistoryRestore", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
 
 bool FGitSourceControlAssetHistoryRestoreAutomationTest::RunTest(const FString& Parameters)
 {
 	static_cast<void>(Parameters);
 	using namespace GitSourceControlAssetOperations;
 	using namespace GitSourceControlAssetOperationsAutomationTestsPrivate;
-
-	FGitAssetOperationFixture Fixture(*this);
-	if (!Fixture.Initialize() || !CreateCommittedTextFixture(Fixture))
-	{
-		return false;
-	}
-
-	FString CommitId;
-	if (!Fixture.RunGit(TEXT("rev-parse HEAD"), CommitId))
-	{
-		return false;
-	}
-	CommitId.TrimStartAndEndInline();
-
-	const FString RelativeFilename = TEXT("Content/Tracked.txt");
+	FFixture Fixture(*this);
+	if (!Fixture.Initialize()) return false;
+	FScopedDisableValidateOnSave DisableValidateOnSave;
+	const FString ContentDirectory = FPaths::Combine(Fixture.GetRoot(), TEXT("Content"));
+	const FString MountRoot = FString::Printf(TEXT("/GitSourceControlAssetRestore_%s/"), *FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	FPackageName::RegisterMountPoint(MountRoot, ContentDirectory);
+	ON_SCOPE_EXIT { FPackageName::UnRegisterMountPoint(MountRoot, ContentDirectory); };
+	const FString RelativeFilename = TEXT("Content/Tracked.uasset");
+	const FString PackageName = MountRoot + TEXT("Tracked");
 	const FString Filename = Fixture.AbsoluteFilename(RelativeFilename);
-	if (!Fixture.WriteFile(RelativeFilename, TEXT("staged revision\n")) || !Fixture.RunGit(TEXT("add -- Content/Tracked.txt")) || !Fixture.WriteFile(RelativeFilename, TEXT("unstaged revision\n")))
-	{
-		return false;
-	}
+	UPackage* Package = CreatePackage(*PackageName);
+	UCurveFloat* Asset = Package ? NewObject<UCurveFloat>(Package, TEXT("Tracked"), RF_Public | RF_Standalone) : nullptr;
+	if (!TestNotNull(TEXT("Restore fixture package exists"), Package) || !TestNotNull(TEXT("Restore fixture asset exists"), Asset)) return false;
+	Asset->FloatCurve.AddKey(0.0f, 1.0f);
+	if (!SaveCurvePackage(*this, Package, Asset, Filename, TEXT("first")) || !Fixture.CommitAll(TEXT("Initial restorable uasset"))) return false;
+	FString FirstCommit;
+	if (!Fixture.RunGit(TEXT("rev-parse HEAD"), FirstCommit)) return false;
+	FirstCommit.TrimStartAndEndInline();
+	TArray<uint8> FirstBytes;
+	if (!TestTrue(TEXT("First package bytes are available"), FFileHelper::LoadFileToArray(FirstBytes, *Filename))) return false;
+	Asset->FloatCurve.AddKey(1.0f, 2.0f);
+	if (!SaveCurvePackage(*this, Package, Asset, Filename, TEXT("second")) || !Fixture.CommitAll(TEXT("Current uasset revision"))) return false;
+	Package->SetDirtyFlag(false);
+	TArray<UPackage*> PackagesToUnload;
+	PackagesToUnload.Add(Package);
+	FText UnloadError;
+	if (!TestTrue(TEXT("Current package unloads before direct Restore"), UPackageTools::UnloadPackages(PackagesToUnload, UnloadError))) { AddError(UnloadError.ToString()); return false; }
 	FString IndexBefore;
-	if (!Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.txt"), IndexBefore))
+	if (!Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), IndexBefore)) return false;
+	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRoot());
+	const FString ExternalWorktreeContents = TEXT("commit-point changed asset\n");
+	int32 RaceConfirmCalls = 0;
+	int32 RacePrepareCalls = 0;
+	int32 RaceReloadCalls = 0;
+	FGitAssetOperationCallbacks RaceCallbacks = MakeAcceptingCallbacks(RaceConfirmCalls, RacePrepareCalls, RaceReloadCalls);
+	RaceCallbacks.BeforeCommitPointForTesting = [&Fixture, &ExternalWorktreeContents]()
 	{
-		return false;
-	}
-
-	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRepositoryRoot());
+		Fixture.WriteFile(TEXT("Content/Tracked.uasset"), ExternalWorktreeContents);
+	};
+	FGitAssetOperationResult RaceResult;
+	TestFalse(TEXT("Restore rejects an asset changed after Confirm and Prepare"), Operations.RestoreRevisionToWorkspace(Filename, FirstCommit, RelativeFilename, RaceCallbacks, RaceResult));
+	TestFalse(TEXT("Restore commit-point rejection does not report success"), RaceResult.bSucceeded);
+	TArray<uint8> WorktreeAfterCommitPoint;
+	TestTrue(TEXT("Restore commit-point rejection leaves the external worktree bytes readable"), FFileHelper::LoadFileToArray(WorktreeAfterCommitPoint, *Filename));
+	FString ExternalWorktreeAfterCommitPoint;
+	TestTrue(TEXT("Restore commit-point rejection reads the callback write"), FFileHelper::LoadFileToString(ExternalWorktreeAfterCommitPoint, *Filename));
+	TestEqual(TEXT("Restore commit-point rejection preserves the callback write"), ExternalWorktreeAfterCommitPoint, ExternalWorktreeContents);
+	FString IndexAfterCommitPoint;
+	TestTrue(TEXT("Restore commit-point rejection leaves index readable"), Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), IndexAfterCommitPoint));
+	TestEqual(TEXT("Restore commit-point rejection leaves index unchanged"), IndexAfterCommitPoint, IndexBefore);
+	if (!TestCallbacks(*this, RaceConfirmCalls, RacePrepareCalls, RaceReloadCalls)) return false;
 	int32 ConfirmCalls = 0;
 	int32 PrepareCalls = 0;
 	int32 ReloadCalls = 0;
-	FGitAssetOperationResult Result;
-	if (!TestTrue(TEXT("Historical text revision restores to worktree"), Operations.RestoreRevisionToWorkspace(Filename, CommitId, RelativeFilename, MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls), Result)))
+	FGitAssetOperationCallbacks Callbacks = MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls);
+	Callbacks.ReloadPackages = [&ReloadCalls](const TArray<FString>&)
 	{
-		AddError(FString::Join(Result.Errors, TEXT("\n")));
+		++ReloadCalls;
 		return false;
-	}
-
-	FString Contents;
-	TestTrue(TEXT("Historical restore writes the target"), Fixture.ReadFile(RelativeFilename, Contents));
-	TestEqual(TEXT("Historical restore uses requested commit content"), Contents, FString(TEXT("head revision\n")));
+	};
+	FGitAssetOperationResult Result;
+	if (!TestTrue(TEXT("Same-path historical uasset Restore succeeds when reload reports failure"), Operations.RestoreRevisionToWorkspace(Filename, FirstCommit, RelativeFilename, Callbacks, Result))) { AddError(FString::Join(Result.Errors, TEXT("\n"))); return false; }
+	TArray<uint8> RestoredBytes;
+	TestTrue(TEXT("Restored uasset bytes are readable"), FFileHelper::LoadFileToArray(RestoredBytes, *Filename));
+	TestTrue(TEXT("Restore writes requested historical uasset bytes"), RestoredBytes == FirstBytes);
 	FString IndexAfter;
-	TestTrue(TEXT("Index can be queried after historical restore"), Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.txt"), IndexAfter));
-	TestEqual(TEXT("Historical restore leaves index byte-for-byte unchanged"), IndexAfter, IndexBefore);
-	TestTrue(TEXT("Historical restore reports disk success"), Result.bSucceeded);
-	return TestCallbacksWereUsed(*this, ConfirmCalls, PrepareCalls, ReloadCalls);
+	TestTrue(TEXT("Index is readable after same-path Restore"), Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), IndexAfter));
+	TestEqual(TEXT("Same-path Force Restore resets the index to HEAD"), IndexAfter, IndexBefore);
+	TestTrue(TEXT("Successful disk Restore propagates the reload failure"), Result.bSucceeded && !Result.bReloadSucceeded);
+	if (!TestCallbacks(*this, ConfirmCalls, PrepareCalls, ReloadCalls)) return false;
+
+	auto ForceRestoreTracked = [&]()
+	{
+		int32 ForceConfirmCalls = 0;
+		int32 ForcePrepareCalls = 0;
+		int32 ForceReloadCalls = 0;
+		FGitAssetOperationResult ForceResult;
+		const bool bRestored = Operations.RestoreRevisionToWorkspace(Filename, FirstCommit, RelativeFilename,
+			MakeAcceptingCallbacks(ForceConfirmCalls, ForcePrepareCalls, ForceReloadCalls), ForceResult);
+		FString ForceIndex;
+		TArray<uint8> ForceBytes;
+		return bRestored && ForceResult.bSucceeded && ForceResult.bReloadSucceeded &&
+			Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), ForceIndex) &&
+			FFileHelper::LoadFileToArray(ForceBytes, *Filename) && ForceIndex == IndexBefore && ForceBytes == FirstBytes &&
+			ForceConfirmCalls == 1 && ForcePrepareCalls == 1 && ForceReloadCalls == 1;
+	};
+
+	if (!FFileHelper::SaveStringToFile(TEXT("force working change\n"), *Filename, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ||
+		!TestTrue(TEXT("Force Restore accepts a dirty working tree"), ForceRestoreTracked())) return false;
+	if (!FFileHelper::SaveStringToFile(TEXT("force staged change\n"), *Filename, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ||
+		!Fixture.RunGit(TEXT("add -- Content/Tracked.uasset")) ||
+		!FFileHelper::SaveStringToFile(TEXT("force staged and working change\n"), *Filename, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ||
+		!TestTrue(TEXT("Force Restore accepts staged and working changes"), ForceRestoreTracked())) return false;
+	if (!Fixture.RunGit(TEXT("rm --cached -- Content/Tracked.uasset")) ||
+		!TestTrue(TEXT("Force Restore accepts an untracked worktree file"), ForceRestoreTracked())) return false;
+
+	const FString AddedRelativeFilename = TEXT("Content/ForceAdded.uasset");
+	const FString AddedFilename = Fixture.AbsoluteFilename(AddedRelativeFilename);
+	if (!FFileHelper::SaveArrayToFile(FirstBytes, *AddedFilename) || !Fixture.RunGit(TEXT("add -- Content/ForceAdded.uasset")) ||
+		!Fixture.RunGit(TEXT("commit --no-gpg-sign -m \"Force restore added-path history\" -- Content/ForceAdded.uasset"))) return false;
+	FString AddedCommit;
+	if (!Fixture.RunGit(TEXT("rev-parse HEAD"), AddedCommit)) return false;
+	AddedCommit.TrimStartAndEndInline();
+	if (!IFileManager::Get().Delete(*AddedFilename, false, true, true) || !Fixture.RunGit(TEXT("add --all -- Content/ForceAdded.uasset")) ||
+		!Fixture.RunGit(TEXT("commit --no-gpg-sign -m \"Force restore added-path deletion\" -- Content/ForceAdded.uasset")) ||
+		!FFileHelper::SaveArrayToFile(FirstBytes, *AddedFilename) || !Fixture.RunGit(TEXT("add -- Content/ForceAdded.uasset"))) return false;
+	int32 AddedConfirmCalls = 0;
+	int32 AddedPrepareCalls = 0;
+	int32 AddedReloadCalls = 0;
+	FGitAssetOperationResult AddedResult;
+	if (!TestTrue(TEXT("Force Restore accepts an index-added path"), Operations.RestoreRevisionToWorkspace(AddedFilename, AddedCommit, AddedRelativeFilename,
+		MakeAcceptingCallbacks(AddedConfirmCalls, AddedPrepareCalls, AddedReloadCalls), AddedResult))) return false;
+	FString AddedIndex;
+	if (!Fixture.RunGit(TEXT("ls-files --stage -- Content/ForceAdded.uasset"), AddedIndex) ||
+		!TestTrue(TEXT("Force Restore resets an index-added path to HEAD absence"), AddedIndex.TrimStartAndEnd().IsEmpty())) return false;
+	TArray<uint8> AddedBytes;
+	if (!TestTrue(TEXT("Force Restore writes the selected revision for an index-added path"), FFileHelper::LoadFileToArray(AddedBytes, *AddedFilename)) ||
+		!TestTrue(TEXT("Index-added Force Restore writes the requested package bytes"), AddedBytes == FirstBytes)) return false;
+	AddedResult = FGitAssetOperationResult();
+	if (!TestTrue(TEXT("Force Restore accepts an untracked historical path"), Operations.RestoreRevisionToWorkspace(AddedFilename, AddedCommit, AddedRelativeFilename,
+		MakeAcceptingCallbacks(AddedConfirmCalls, AddedPrepareCalls, AddedReloadCalls), AddedResult))) return false;
+	if (!IFileManager::Get().Delete(*AddedFilename, false, true, true)) return false;
+	if (!Fixture.RunGit(TEXT("restore --source=HEAD --staged --worktree -- Content/Tracked.uasset"))) return false;
+
+	FString MainBranch;
+	if (!Fixture.RunGit(TEXT("branch --show-current"), MainBranch)) return false;
+	MainBranch.TrimStartAndEndInline();
+	if (!Fixture.RunGit(FString::Printf(TEXT("branch force-restore-conflict %s"), *FirstCommit)) ||
+		!Fixture.RunGit(TEXT("checkout force-restore-conflict")) ||
+		!FFileHelper::SaveStringToFile(TEXT("other conflict bytes\n"), *Filename, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ||
+		!Fixture.CommitAll(TEXT("Force restore conflict branch")) ||
+		!Fixture.RunGit(FString::Printf(TEXT("checkout %s"), *MainBranch))) return false;
+	int32 MergeReturnCode = INDEX_NONE;
+	FString MergeOutput;
+	FString MergeError;
+	FPlatformProcess::ExecProcess(*Fixture.GetGitBinary(), *FString::Printf(TEXT("-C %s merge force-restore-conflict"), *QuoteGitArgument(Fixture.GetRoot())), &MergeReturnCode, &MergeOutput, &MergeError);
+	if (!TestTrue(TEXT("Force Restore fixture creates a merge conflict"), MergeReturnCode != 0)) return false;
+	FString ConflictIndexBeforeRollback;
+	TArray<uint8> ConflictBytesBeforeRollback;
+	if (!Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), ConflictIndexBeforeRollback) || !FFileHelper::LoadFileToArray(ConflictBytesBeforeRollback, *Filename)) return false;
+	int32 ConflictRollbackConfirmCalls = 0;
+	int32 ConflictRollbackPrepareCalls = 0;
+	int32 ConflictRollbackReloadCalls = 0;
+	FGitAssetOperationCallbacks ConflictRollbackCallbacks = MakeAcceptingCallbacks(ConflictRollbackConfirmCalls, ConflictRollbackPrepareCalls, ConflictRollbackReloadCalls);
+	ConflictRollbackCallbacks.AllowWorktreeReplaceForTesting = []() { return false; };
+	FGitAssetOperationResult ConflictRollbackResult;
+	TestFalse(TEXT("Force Restore conflict rollback seam rejects worktree replacement"), Operations.RestoreRevisionToWorkspace(Filename, FirstCommit, RelativeFilename, ConflictRollbackCallbacks, ConflictRollbackResult));
+	FString ConflictIndexAfterRollback;
+	TArray<uint8> ConflictBytesAfterRollback;
+	TestTrue(TEXT("Force Restore conflict rollback reads the index"), Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), ConflictIndexAfterRollback));
+	TestEqual(TEXT("Force Restore conflict rollback restores every conflict stage"), ConflictIndexAfterRollback, ConflictIndexBeforeRollback);
+	TestTrue(TEXT("Force Restore conflict rollback restores worktree bytes"), FFileHelper::LoadFileToArray(ConflictBytesAfterRollback, *Filename));
+	TestTrue(TEXT("Force Restore conflict rollback keeps worktree bytes"), ConflictBytesAfterRollback == ConflictBytesBeforeRollback);
+	if (!TestCallbacks(*this, ConflictRollbackConfirmCalls, ConflictRollbackPrepareCalls, ConflictRollbackReloadCalls)) return false;
+	if (!TestTrue(TEXT("Force Restore accepts a conflicted index"), ForceRestoreTracked())) return false;
+	if (!Fixture.RunGit(TEXT("reset --hard HEAD"))) return false;
+
+	FString RollbackIndexBefore;
+	TArray<uint8> RollbackBytesBefore;
+	if (!FFileHelper::SaveStringToFile(TEXT("rollback staged bytes\n"), *Filename, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ||
+		!Fixture.RunGit(TEXT("add -- Content/Tracked.uasset")) ||
+		!FFileHelper::SaveStringToFile(TEXT("rollback working bytes\n"), *Filename, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ||
+		!Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), RollbackIndexBefore) || !FFileHelper::LoadFileToArray(RollbackBytesBefore, *Filename)) return false;
+	int32 RollbackConfirmCalls = 0;
+	int32 RollbackPrepareCalls = 0;
+	int32 RollbackReloadCalls = 0;
+	FGitAssetOperationCallbacks RollbackCallbacks = MakeAcceptingCallbacks(RollbackConfirmCalls, RollbackPrepareCalls, RollbackReloadCalls);
+	RollbackCallbacks.AllowWorktreeReplaceForTesting = []() { return false; };
+	FGitAssetOperationResult RollbackResult;
+	TestFalse(TEXT("Force Restore rollback seam rejects worktree replacement after index reset"), Operations.RestoreRevisionToWorkspace(Filename, FirstCommit, RelativeFilename, RollbackCallbacks, RollbackResult));
+	FString RollbackIndexAfter;
+	TArray<uint8> RollbackBytesAfter;
+	TestTrue(TEXT("Force Restore rollback restores the index snapshot"), Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), RollbackIndexAfter));
+	TestEqual(TEXT("Force Restore rollback keeps the exact index snapshot"), RollbackIndexAfter, RollbackIndexBefore);
+	TestTrue(TEXT("Force Restore rollback restores worktree bytes"), FFileHelper::LoadFileToArray(RollbackBytesAfter, *Filename));
+	TestTrue(TEXT("Force Restore rollback keeps worktree bytes"), RollbackBytesAfter == RollbackBytesBefore);
+	if (!Fixture.RunGit(TEXT("reset --hard HEAD")) || !Fixture.RunGit(FString::Printf(TEXT("checkout %s"), *MainBranch))) return false;
+	return TestCallbacks(*this, RollbackConfirmCalls, RollbackPrepareCalls, RollbackReloadCalls);
 }
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetRejectionAutomationTest,
-	"Cthulhu.GitSourceControl.AssetOperations.Rejection",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetRejectionAutomationTest, "Cthulhu.GitSourceControl.AssetOperations.Rejection", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
 
 bool FGitSourceControlAssetRejectionAutomationTest::RunTest(const FString& Parameters)
 {
 	static_cast<void>(Parameters);
 	using namespace GitSourceControlAssetOperations;
 	using namespace GitSourceControlAssetOperationsAutomationTestsPrivate;
-
-	FGitAssetOperationFixture Fixture(*this);
-	if (!Fixture.Initialize() || !CreateCommittedTextFixture(Fixture))
-	{
-		return false;
-	}
-
-	const FString UntrackedFilename = Fixture.AbsoluteFilename(TEXT("Content/Untracked.txt"));
-	if (!Fixture.WriteFile(TEXT("Content/Untracked.txt"), TEXT("untracked\n")))
-	{
-		return false;
-	}
+	FFixture Fixture(*this);
+	if (!Fixture.Initialize() || !Fixture.WriteFile(TEXT("Content/Tracked.uasset"), TEXT("opaque tracked bytes\n")) || !Fixture.WriteFile(TEXT("Content/Plain.txt"), TEXT("plain tracked bytes\n")) || !Fixture.CommitAll(TEXT("Asset-operation rejection fixture"))) return false;
 	FString CommitId;
-	if (!Fixture.RunGit(TEXT("rev-parse HEAD"), CommitId))
-	{
-		return false;
-	}
+	if (!Fixture.RunGit(TEXT("rev-parse HEAD"), CommitId)) return false;
 	CommitId.TrimStartAndEndInline();
-
-	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRepositoryRoot());
+	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRoot());
 	int32 ConfirmCalls = 0;
 	int32 PrepareCalls = 0;
 	int32 ReloadCalls = 0;
-	FGitAssetOperationResult Result;
 	const FGitAssetOperationCallbacks Callbacks = MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls);
-	TestFalse(TEXT("Untracked file cannot use tracked discard"), Operations.DiscardTrackedFiles({ UntrackedFilename }, Callbacks, Result));
-	TestFalse(TEXT("Untracked file cannot use historical restore"), Operations.RestoreRevisionToWorkspace(UntrackedFilename, CommitId, TEXT("Content/Tracked.txt"), Callbacks, Result));
-	TestEqual(TEXT("Rejected untracked operations do not prompt"), ConfirmCalls, 0);
-	TestEqual(TEXT("Rejected untracked operations do not prepare mutation"), PrepareCalls, 0);
-	TestEqual(TEXT("Rejected untracked operations do not reload"), ReloadCalls, 0);
-	TestTrue(TEXT("Untracked file remains after rejection"), IFileManager::Get().FileExists(*UntrackedFilename));
-
-	FString Branch;
-	if (!Fixture.RunGit(TEXT("branch --show-current"), Branch))
-	{
-		return false;
-	}
-	Branch.TrimStartAndEndInline();
-	if (Branch.IsEmpty()
-		|| !Fixture.RunGit(TEXT("checkout -b conflict-side"))
-		|| !Fixture.WriteFile(TEXT("Content/Tracked.txt"), TEXT("conflict side\n"))
-		|| !Fixture.CommitAll(TEXT("Conflict side"))
-		|| !Fixture.RunGit(FString::Printf(TEXT("checkout %s"), *QuoteGitArgument(Branch)))
-		|| !Fixture.WriteFile(TEXT("Content/Tracked.txt"), TEXT("current side\n"))
-		|| !Fixture.CommitAll(TEXT("Current side")))
-	{
-		return false;
-	}
-
-	FString MergeOutput;
-	if (!Fixture.RunGitExpectExit(TEXT("merge conflict-side"), 1, MergeOutput))
-	{
-		return false;
-	}
-	const FString TrackedFilename = Fixture.AbsoluteFilename(TEXT("Content/Tracked.txt"));
-	FString IndexBefore;
-	if (!Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.txt"), IndexBefore))
-	{
-		return false;
-	}
-	FString ContentsBefore;
-	if (!Fixture.ReadFile(TEXT("Content/Tracked.txt"), ContentsBefore))
-	{
-		return false;
-	}
+	const FString AssetFilename = Fixture.AbsoluteFilename(TEXT("Content/Tracked.uasset"));
+	FGitAssetOperationResult Result;
+	TestFalse(TEXT("Cross-rename historical Restore is rejected"), Operations.RestoreRevisionToWorkspace(AssetFilename, CommitId, TEXT("Content/OldName.uasset"), Callbacks, Result));
 	Result = FGitAssetOperationResult();
-	TestFalse(TEXT("Conflicted file cannot be discarded"), Operations.DiscardTrackedFiles({ TrackedFilename }, Callbacks, Result));
-	FString IndexAfter;
-	FString ContentsAfter;
-	TestTrue(TEXT("Conflict index remains readable"), Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.txt"), IndexAfter));
-	TestTrue(TEXT("Conflict worktree remains readable"), Fixture.ReadFile(TEXT("Content/Tracked.txt"), ContentsAfter));
-	TestEqual(TEXT("Conflict rejection leaves index unchanged"), IndexAfter, IndexBefore);
-	TestEqual(TEXT("Conflict rejection leaves worktree unchanged"), ContentsAfter, ContentsBefore);
-	TestEqual(TEXT("Conflict rejection does not prompt"), ConfirmCalls, 0);
-	TestEqual(TEXT("Conflict rejection does not prepare mutation"), PrepareCalls, 0);
-	TestEqual(TEXT("Conflict rejection does not reload"), ReloadCalls, 0);
-	return true;
+	const FString CaseOnlyAssetFilename = Fixture.AbsoluteFilename(TEXT("Content/tracked.uasset"));
+	TestFalse(TEXT("Case-only path mismatch is treated as a cross-rename"), Operations.RestoreRevisionToWorkspace(CaseOnlyAssetFilename, CommitId, TEXT("Content/Tracked.uasset"), Callbacks, Result));
+	Result = FGitAssetOperationResult();
+	TestFalse(TEXT("Discard rejects non-uasset selections"), Operations.DiscardTrackedFiles({ Fixture.AbsoluteFilename(TEXT("Content/Plain.txt")) }, Callbacks, Result));
+	TestEqual(TEXT("Rejected operations never prompt"), ConfirmCalls, 0);
+	TestEqual(TEXT("Rejected operations never prepare mutation"), PrepareCalls, 0);
+	return TestEqual(TEXT("Rejected operations never reload packages"), ReloadCalls, 0);
 }
 
 #endif

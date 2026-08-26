@@ -5,8 +5,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "GitSourceControlState.h"
+#include "GitSourceControlFileStatus.h"
 #include "GitSourceControlUtils.h"
+
+class UPackage;
 
 /** UI 无关的本地 Git 资产变更服务. */
 namespace GitSourceControlAssetOperations
@@ -36,6 +38,14 @@ namespace GitSourceControlAssetOperations
 
 		/** 仅在 Git/文件系统变更成功后调用. 返回 false 表示 package reload 失败. */
 		TFunction<bool(const TArray<FString>& AffectedFiles)> ReloadPackages;
+
+#if WITH_DEV_AUTOMATION_TESTS
+		/** Test seam executed after PrepareForMutation and immediately before the commit-point topology recheck. */
+		TFunction<void()> BeforeCommitPointForTesting;
+
+		/** Test seam executed after the exact-path index reset and before worktree replacement. */
+		TFunction<bool()> AllowWorktreeReplaceForTesting;
+#endif
 	};
 
 	struct FGitAssetOperationResult
@@ -66,7 +76,7 @@ namespace GitSourceControlAssetOperations
 		FGitSourceControlAssetOperations(FString InGitBinary, FString InRepositoryRoot);
 
 		bool DiscardTrackedFiles(const TArray<FString>& InFiles, const FGitAssetOperationCallbacks& Callbacks, FGitAssetOperationResult& OutResult) const;
-		bool DeleteUntrackedFiles(const TArray<FString>& InFiles, const FGitAssetOperationCallbacks& Callbacks, FGitAssetOperationResult& OutResult) const;
+		/** Force-restores one same-path revision: reset the exact index path to HEAD, replace the worktree blob, and roll both back on failure. */
 		bool RestoreRevisionToWorkspace(const FString& InCurrentFilename, const FString& InCommitId, const FString& InHistoricalPath,
 			const FGitAssetOperationCallbacks& Callbacks, FGitAssetOperationResult& OutResult) const;
 
@@ -75,12 +85,15 @@ namespace GitSourceControlAssetOperations
 		/** Resolve one nearest Git root; reject mixed-root requests instead of mutating a parent repository. */
 		static bool ResolveSingleRepositoryRoot(const TArray<FString>& InFiles, const FString& InFallbackRepositoryRoot, FString& OutRepositoryRoot, FString& OutError);
 
+		/** Reject world and external packages; standalone mutation currently supports tracked .uasset files only. */
+		static bool ValidateStandaloneMutationPreflight(const TArray<FString>& InFiles, const TArray<UPackage*>& InLoadedPackages, FString& OutError);
+
 	private:
 		bool NormalizeFiles(const TArray<FString>& InFiles, TArray<FString>& OutFiles, FGitAssetOperationResult& OutResult) const;
-		bool QueryStates(const TArray<FString>& InFiles, TMap<FString, FGitSourceControlState>& OutStates, FGitAssetOperationResult& OutResult) const;
+		bool QueryStates(const TArray<FString>& InFiles, TMap<FString, FGitSourceControlFileStatus>& OutStates, FGitAssetOperationResult& OutResult) const;
 		bool Confirm(const FString& Description, const TArray<FString>& Files, const FGitAssetOperationCallbacks& Callbacks, FGitAssetOperationResult& OutResult) const;
 		bool RecheckTargets(const TArray<FString>& Files, const TMap<FString, FGitAssetFileFingerprint>& Fingerprints,
-			const FGitIndexSnapshot& IndexSnapshot, uint64 Generation, const FString& ExpectedHeadCommitId, FGitAssetOperationResult& OutResult) const;
+			const FGitIndexSnapshot& IndexSnapshot, const FString& ExpectedHeadCommitId, FGitAssetOperationResult& OutResult) const;
 
 		FString GitBinary;
 		FString RepositoryRoot;

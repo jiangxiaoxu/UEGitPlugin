@@ -5,43 +5,28 @@
 
 #include "GitSourceControlModule.h"
 
-#include "Features/IModularFeatures.h"
 #include "GitLocalSourceControl.h"
-#include "GitSourceControlOperations.h"
+#include "GitSourceControlRevision.h"
+#include "GitStandaloneLog.h"
+#include "GitSourceControlUtils.h"
 #include "Misc/App.h"
+#include "Misc/CoreDelegates.h"
 
-TArray<FString> FGitSourceControlModule::EmptyStringArray;
-
-namespace GitSourceControlModulePrivate
-{
-	const FName SourceControlFeatureName(TEXT("SourceControl"));
-
-	template<typename WorkerType>
-	TSharedRef<IGitSourceControlWorker, ESPMode::ThreadSafe> CreateWorker()
-	{
-		return MakeShared<WorkerType, ESPMode::ThreadSafe>();
-	}
-}
+DEFINE_LOG_CATEGORY(LogGitStandalone);
 
 void FGitSourceControlModule::StartupModule()
 {
-	UE_LOG(LogSourceControl, Display, TEXT("GitSourceControl Phase 1 module starting."));
-	// Phase 1 intentionally exposes only local connection and local status/history.
-	// Asset mutations are explicit menu actions, not generic Source Control workers.
-	GitSourceControlProvider.RegisterWorker(TEXT("Connect"), FGetGitSourceControlWorker::CreateStatic(&GitSourceControlModulePrivate::CreateWorker<FGitConnectWorker>));
-	GitSourceControlProvider.RegisterWorker(TEXT("UpdateStatus"), FGetGitSourceControlWorker::CreateStatic(&GitSourceControlModulePrivate::CreateWorker<FGitUpdateStatusWorker>));
-
-	IModularFeatures::Get().RegisterModularFeature(GitSourceControlModulePrivate::SourceControlFeatureName, &GitSourceControlProvider);
+	UE_LOG(LogGitStandalone, Display, TEXT("GitSourceControl standalone module starting."));
 #if WITH_DEV_AUTOMATION_TESTS
 	if (FApp::IsUnattended() || IsRunningCommandlet())
 	{
 		if (FModuleManager::Get().LoadModulePtr<IModuleInterface>(TEXT("GitSourceControlTests")) == nullptr)
 		{
-			UE_LOG(LogSourceControl, Error, TEXT("GitSourceControlTests could not be loaded for unattended automation."));
+			UE_LOG(LogGitStandalone, Error, TEXT("GitSourceControlTests could not be loaded for unattended automation."));
 		}
 		else
 		{
-			UE_LOG(LogSourceControl, Display, TEXT("GitSourceControlTests loaded for unattended automation."));
+			UE_LOG(LogGitStandalone, Display, TEXT("GitSourceControlTests loaded for unattended automation."));
 		}
 	}
 #endif
@@ -49,22 +34,26 @@ void FGitSourceControlModule::StartupModule()
 	{
 		GitSourceControlMenu.Register();
 	}
+	PreExitHandle = FCoreDelegates::OnPreExit.AddRaw(this, &FGitSourceControlModule::HandlePreExit);
+#if WITH_DEV_AUTOMATION_TESTS
+	GitSourceControlUtils::Testing::CaptureGitProcessLaunchCountAtModuleStartup();
+#endif
 }
 
 void FGitSourceControlModule::ShutdownModule()
 {
+	if (PreExitHandle.IsValid())
+	{
+		FCoreDelegates::OnPreExit.Remove(PreExitHandle);
+		PreExitHandle.Reset();
+	}
 	GitLocalSourceControl::ShutdownOperations();
 	GitSourceControlMenu.Unregister();
-	GitSourceControlProvider.Close();
-	IModularFeatures::Get().UnregisterModularFeature(GitSourceControlModulePrivate::SourceControlFeatureName, &GitSourceControlProvider);
 }
 
-void FGitSourceControlModule::SetLastErrors(const TArray<FText>& InErrors)
+void FGitSourceControlModule::HandlePreExit()
 {
-	if (FGitSourceControlModule* Module = FModuleManager::GetModulePtr<FGitSourceControlModule>(TEXT("GitSourceControl")))
-	{
-		Module->GetProvider().SetLastErrors(InErrors);
-	}
+	GitSourceControlRevision::CleanupTemporaryExports();
 }
 
 IMPLEMENT_MODULE(FGitSourceControlModule, GitSourceControl);
