@@ -131,6 +131,14 @@ bool CheckGitAvailability(const FString& InPathToGitBinary, FGitVersion* OutVers
 /** Verify local-only porcelain-v2 status and literal-path query capabilities for explicit standalone mutations. */
 GITSOURCECONTROL_API bool CheckLocalGitCapabilities(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutError);
 
+/** Changed Assets 使用的固定全仓 porcelain-v2 status. Git 使用 NUL record separator, 故保持 bytes; 不接受调用方 Git 参数. */
+GITSOURCECONTROL_API bool RunRepositoryStatusPorcelainV2(const FString& InPathToGitBinary, const FString& InRepositoryRoot,
+	TArray<uint8>& OutStandardOutput, FString& OutError);
+
+/** Changed Assets transaction recheck 使用的固定 literal-pathspec porcelain-v2 status; 保留 NUL 输出. */
+GITSOURCECONTROL_API bool RunPathsStatusPorcelainV2(const FString& InPathToGitBinary, const FString& InRepositoryRoot,
+	const TArray<FString>& InFiles, TArray<uint8>& OutStandardOutput, FString& OutError);
+
 /**
  * Parse the output from the "version" command into GitMajorVersion and GitMinorVersion.
  * @param InVersionString       The version string returned by `git --version`

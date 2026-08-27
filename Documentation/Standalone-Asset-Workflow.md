@@ -4,11 +4,22 @@
 
 ## 支持范围
 
-- 当前只处理项目 Git repository 中的 `.uasset` 文件。
-- `.umap` 只作为未来扩展方向, 当前 History、Diff、Restore 和 Discard 均不修改 map。
+- 当前所有 Git actions 只处理单个 `.uasset` 文件. 支持普通资产, Blueprint, Animation, DataAsset, Plugin Content 以及 OFPA external actor/object 的 `.uasset`.
+- `.umap`, `.uexp`, `.ubulk`, `.uptnl`, `.upayload` 等 sidecar 或其他 package 不在本期范围, 不参与 Changed Assets 或 Revert.
 - Content Browser 只有选中 `.uasset` 时才显示 `Git (Local)` 菜单区; 选中 `.umap` 或其他文件不会显示 Git actions。
 - 插件不会把 Unreal asset identity 当成 Git rename identity。跨 rename 只表示 Git 能证明的路径移动。
 - remote、branch、commit、merge、push、pull、conflict resolution 和 asset delete 由外部 Git client 负责。
+
+## Changed Assets
+
+1. 点击 Level Editor 状态栏的 `Git Changes`, 或从 `Window` 菜单打开同名 Tab. 状态栏仍保留 Unsaved Assets 指示, 原生 Revision Control/check-in 控件由该直达按钮替代. 面板先显示当前 snapshot 或 loading 状态; repository-wide `git status --porcelain=v2 -z` 只在打开, 用户点击 `Refresh` 或操作完成后显式启动, 并在 worker 上运行.
+2. 列表按固定 `HEAD` 汇总每个变更 `.uasset` 的总体状态: `Modified`, `Deleted`, `Added`, `Untracked`, `Renamed` 或 `Conflicted`. 同一路径 staged 与 unstaged 改动合并显示, 不提供 staging/unstaging 操作.
+3. 每行显示友好名称, 所属关卡, asset/object path, 类型和状态; 原始 Git path 仅在详情或 Tooltip 中显示. 普通资产使用 Asset Registry, OFPA 使用 actor descriptor metadata. owner 无法唯一解析的行仍可查看, 但 Revert 会禁用.
+4. 普通单击或 Ctrl+单击会切换单行选择并保留其他选择; Shift 选择当前过滤结果中的连续范围, Ctrl+Shift 追加范围. checkbox 与行高亮使用同一选择状态. 不可回退行可以被选中, 但混合选择会按 all-or-nothing 规则禁用整批 Revert.
+5. 选择一行或多行后执行 `Revert Selected to HEAD...`. 该操作会同时丢弃所选项 staged 与 unstaged 内容; `Modified`/`Deleted` 恢复 HEAD, `Added`/`Untracked` 精确删除, `Renamed` 原子恢复旧/新路径, `Conflicted` 不可回退. OFPA 的 dirty owner map 或 unresolved owner 同样阻止操作. 确认后没有 Undo.
+
+Changed Assets 不使用 DirectoryWatcher, 后台轮询或跨刷新 status cache. 刷新结果按 generation 合并; 新一代 snapshot 会使旧异步 metadata 结果失效. 刷新失败保留上一次成功列表并显示错误.
+一次刷新只执行一个 repository-wide status process; 列表不为每一行启动 Git, 不联网, 也不扫描未变更目录.
 
 ## 入口与 History
 
@@ -46,7 +57,7 @@ History window 提供三种 Diff:
 
 ## Discard
 
-`Discard Tracked...` 将明确选中的 tracked `.uasset` 的 index 和 worktree 恢复到当前 `HEAD`。它同样要求显式确认、单 repository 和 mutation 前复核。插件不执行目录级 `git clean`, 不删除 untracked asset, 也不改变 branch。
+`Discard Tracked...` 将明确选中的 tracked `.uasset` 的 index 和 worktree 恢复到当前 `HEAD`. Changed Assets 的 `Revert to HEAD` 覆盖相同安全检查, 并额外支持 Added/Untracked 精确删除与 Rename 原子恢复; 插件不执行目录级 `git clean`, 也不改变 branch.
 
 ## Git LFS
 

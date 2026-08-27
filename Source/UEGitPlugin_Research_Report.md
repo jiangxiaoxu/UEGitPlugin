@@ -2,15 +2,16 @@
 
 ## 结论
 
-当前插件是 Unreal Editor 的 standalone local Git asset tool, 不注册 Unreal `ISourceControlProvider`。它只在用户明确选择的 Git worktree 和 index path 上工作, 不承担 remote、branch 或团队协作流程。当前可变更范围只有 tracked `.uasset`; `.umap` 留待未来单独设计。
+当前插件是 Unreal Editor 的 standalone local Git asset tool, 不注册 Unreal `ISourceControlProvider`. 它只在用户明确触发的 Git repository snapshot 和 exact path 上工作, 不承担 remote, branch 或团队协作流程. Changed Assets 与 mutation 只处理单个 `.uasset`; `.umap`, `.uexp`, `.ubulk`, `.uptnl`, `.upayload` 和其他 package 留待未来单独设计.
 
 ## 当前实现
 
-- `FGitSourceControlModule` 只注册 standalone Content Browser UI。Startup 不发现 Git, 不创建 provider、worker queue、`DirectoryWatcher`、state cache 或 global ticker。
+- `FGitSourceControlModule` 注册 standalone Content Browser UI 和 `GitChangedAssets` Nomad tab. Startup 不发现 Git, 不创建 provider, worker queue, `DirectoryWatcher`, state cache 或 global ticker; tab 打开后才显式触发 Changed Assets snapshot.
 - `GitLocalSourceControl` 和菜单操作在显式交互后才解析 Git executable 与 nearest repository root。每个 job 使用 worker 和 Game Thread completion, 临时 repository context 在 job 结束后释放。
-- `GitSourceControlUtils` 负责 exact path status preflight、fixed-HEAD history、exact blob 和 LFS materialization。空路径不会升级为 repository-wide scan。
-- `FGitSourceControlMenu` 提供 History、三种 Diff、same-path Force Restore 和 tracked Discard, 不提供 status refresh、untracked delete、checkout、changelist 或 Content Browser badge。
-- `FGitSourceControlAssetOperations` 是 UI 无关的 mutation service。它拒绝 directory、mixed-root、map 和 external package, 在 commit point 前复核 fingerprint、HEAD、index 和 package topology, 并在失败时 rollback。
+- `GitSourceControlUtils` 负责 exact path status preflight, repository-wide porcelain-v2 snapshot, fixed-HEAD history, exact blob 和 LFS materialization. Changed Assets status 仅通过窄接口触发一次全仓查询, 空路径的 legacy 操作不会升级为 repository-wide scan.
+- `FGitChangedAssetsMetadataResolver` 使用 Asset Registry 批量 metadata 和 OFPA owner fallback, `FGitChangedAssetsController` 负责 generation, 异步 enrich, 过滤结果刷新和 revert 完成后的状态重查.
+- `FGitSourceControlMenu` 提供 History, 三种 Diff, same-path Force Restore 和 tracked Discard. Changed Assets 使用独立的 project-wide snapshot/list UI, 不注册 native changelist 或 Content Browser badge.
+- `FGitSourceControlAssetOperations` 是 Content Browser legacy path 使用的 UI 无关 mutation service. 它拒绝 directory, mixed-root, map 和 external package, 在 commit point 前复核 fingerprint, HEAD, index 和 package topology, 并在失败时 rollback. Changed Assets 使用独立的 `FGitChangedAssetOperations` 处理单 `.uasset`, 包括 OFPA owner gate.
 - `FGitSourceControlRevision` 是 standalone Diff 使用的 private `ISourceControlRevision` adapter。每个实例自带 Git binary、repository root、commit、historical path 和 current path, 不回查 module provider。
 
 ## History 和 Diff
@@ -27,6 +28,16 @@ Git LFS pointer 优先从本地 storage verify/materialize。Diff、Restore、Fe
 
 ## 安全与一致性语义
 
+### Changed Assets
+
+Changed Assets 在显式打开或 Refresh 时执行一次 `git status --porcelain=v2 -z` 并固定 `HEAD`; 结果按单个 `.uasset` 聚合为 Modified, Deleted, Added, Untracked, Renamed 或 Conflicted. staged 与 worktree 状态合并为相对 HEAD 的总体状态, 不提供 staging/unstaging. 刷新无 DirectoryWatcher, 后台轮询或长期 status cache, generation 只用于丢弃过期异步 metadata 结果.
+
+性能约束: 每次刷新只启动一个 repository status process, 不逐行启动 Git, 不递归扫描未变更 package, 不联网. 行列表使用虚拟化 Slate, metadata 解析按批次合并回 Game Thread.
+
+现存资产通过 Asset Registry 批量 metadata 渲染友好名称, 类型, object path 与 owner level; OFPA 优先使用 `OptionalOuterPath` 和 actor descriptor, owner 无法唯一解析时显示 unresolved 并禁用 Revert. Changed Assets 仅接受单个 `.uasset`, 不将 `.umap` 或 sidecar 合并为 artifact group.
+
+`Revert to HEAD` 是显式, 不可 Undo 的 all-or-nothing 事务, 同时丢弃 staged 与 unstaged: tracked Modified/Deleted 恢复 HEAD, Added/Untracked 精确删除, Rename 成对原子恢复, Conflict 禁用. OFPA dirty owner map 或 unresolved owner 阻止操作. 事务前复核 HEAD, index, fingerprint 和 package 校验, 禁止 `git clean`, 目录删除和模糊 pathspec.
+
 1. 输入路径先转为绝对路径并解析 nearest Git root, 跨 repository selection 直接拒绝。
 2. 命令使用 exact pathspec 和 NUL-safe 参数。空列表、directory target、map、`.umap` 和无法解析 repository 的输入不执行 mutation。
 3. Discard 和 Force Restore 在确认前保存文件 fingerprint、HEAD 和 index snapshot。外部 Git 操作或文件变化会使请求失效, 需要重新执行。
@@ -35,7 +46,7 @@ Git LFS pointer 优先从本地 storage verify/materialize。Diff、Restore、Fe
 
 ## Editor automation API
 
-AngelScript 和 Blueprint automation 通过 typed `GitLocalSourceControl` API 控制当前能力。`StartLoadHistory(AssetObjectPath, EGitLocalSourceControlHistoryMode)` 显式选择 `CurrentPath` 或 `ExactRenames`; LFS fetch 和 revision Restore 始终以 `ExactRenames` 解析 historical path。API 提供显式 repository info、history、LFS fetch、Discard 和 revision Restore, 不提供 status refresh 或 untracked delete。Operation handle 仅在 Game Thread 被 Tick、Cancel 和 readback, Git/LFS I/O 在 worker。输入为 asset object path, 不暴露 raw Git argv。
+AngelScript 和 Blueprint automation 通过 typed `GitLocalSourceControl` API 控制 legacy History/Diff/Restore/Discard 能力. `StartLoadHistory(AssetObjectPath, EGitLocalSourceControlHistoryMode)` 显式选择 `CurrentPath` 或 `ExactRenames`; LFS fetch 和 revision Restore 始终以 `ExactRenames` 解析 historical path. 该 public API 不提供 Changed Assets status refresh 或 untracked delete; Changed Assets tab 保持 private/providerless. Operation handle 仅在 Game Thread 被 Tick, Cancel 和 readback, Git/LFS I/O 在 worker. 输入为 asset object path, 不暴露 raw Git argv.
 
 ## 构建与测试入口
 
@@ -45,6 +56,8 @@ AngelScript 和 Blueprint automation 通过 typed `GitLocalSourceControl` API �
 npm run build:regular
 npm run test:unreal:automation -- Cthulhu.GitSourceControl
 npm run test:unreal:automation -- Cthulhu.GitSourceControl.Integration.HistoryDiffRestore
+npm run test:unreal:automation -- Cthulhu.GitSourceControl.ChangedAssets.StatusParser
+npm run test:unreal:automation -- Cthulhu.GitSourceControl.ChangedAssets.RevertToHead
 npm run as:diagnostics
 ```
 
@@ -53,7 +66,7 @@ npm run as:diagnostics
 ## 已知限制
 
 - standalone plugin 不提供 remote/branch 协作状态、commit/push/pull 流程、conflict resolution、LFS lock 管理或 Content Browser status badge。
-- 当前只支持 tracked `.uasset` mutation。`.umap`、World Partition、external package 和其他非 `.uasset` package 需要未来独立设计。
+- 当前 Changed Assets 与 mutation 只支持单个 `.uasset`; `.umap`, sidecar, World Partition map package 和其他非 `.uasset` package 需要未来独立设计. OFPA actor/object `.uasset` 可显示, 但 owner unresolved 或 dirty owner map 时不可 Revert.
 - 跨 rename revision 可以 Diff, 但不能 Force Restore 到当前 path, 因为 Git path identity 不证明 Unreal package identity。
 - LFS miss 在多 remote 且无 current branch upstream 时失败。
 - 插件不提供 precompiled binary, 构建需要项目 Unreal Editor target 和可用 C++ toolchain。

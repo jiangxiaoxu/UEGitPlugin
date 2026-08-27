@@ -1951,6 +1951,94 @@ bool CheckLocalGitCapabilities(const FString& InPathToGitBinary, const FString& 
 	return CheckLocalGitCapabilitiesInternal(InPathToGitBinary, InRepositoryRoot, OutError);
 }
 
+bool RunRepositoryStatusPorcelainV2(const FString& InPathToGitBinary, const FString& InRepositoryRoot,
+	TArray<uint8>& OutStandardOutput, FString& OutError)
+{
+	OutStandardOutput.Reset();
+	OutError.Reset();
+	if (InPathToGitBinary.IsEmpty() || InRepositoryRoot.IsEmpty())
+	{
+		OutError = TEXT("Git binary path and repository root are required.");
+		return false;
+	}
+
+	FString RepositoryRoot = FPaths::ConvertRelativePathToFull(InRepositoryRoot);
+	FPaths::NormalizeDirectoryName(RepositoryRoot);
+	TArray<FString> Errors;
+	if (!RunLocalCommand(InPathToGitBinary, RepositoryRoot,
+		TEXT("--no-optional-locks --literal-pathspecs status --porcelain=v2 -z --renames --untracked-files=all --ignored=no"),
+		OutStandardOutput, Errors))
+	{
+		OutError = Errors.IsEmpty() ? TEXT("Repository-wide Git status query failed.") : Errors[0];
+		return false;
+	}
+	return true;
+}
+
+bool RunPathsStatusPorcelainV2(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InFiles,
+	TArray<uint8>& OutStandardOutput, FString& OutError)
+{
+	OutStandardOutput.Reset();
+	OutError.Reset();
+	if (InPathToGitBinary.IsEmpty() || InRepositoryRoot.IsEmpty() || InFiles.IsEmpty())
+	{
+		OutError = TEXT("Git binary path, repository root, and one or more exact .uasset paths are required.");
+		return false;
+	}
+
+	FString RepositoryRoot = FPaths::ConvertRelativePathToFull(InRepositoryRoot);
+	FPaths::NormalizeDirectoryName(RepositoryRoot);
+	constexpr int32 MaxCommandLineLength = 24000;
+	FString Arguments = TEXT("--no-optional-locks --literal-pathspecs status --porcelain=v2 -z --renames --untracked-files=all --ignored=no --");
+	TSet<FString> SeenRelativePaths;
+	for (const FString& InFile : InFiles)
+	{
+		FString AbsoluteFilename = FPaths::ConvertRelativePathToFull(InFile);
+		FPaths::NormalizeFilename(AbsoluteFilename);
+		if (FPaths::DirectoryExists(AbsoluteFilename) || !FPaths::GetExtension(AbsoluteFilename, false).Equals(TEXT("uasset"), ESearchCase::IgnoreCase))
+		{
+			OutError = FString::Printf(TEXT("Changed Assets status only accepts explicit .uasset files: %s"), *InFile);
+			return false;
+		}
+
+		FString RelativeFilename = AbsoluteFilename;
+		if (!MakeRepositoryRelativePath(RepositoryRoot, RelativeFilename))
+		{
+			OutError = FString::Printf(TEXT("Changed Assets status path is outside the Git repository: %s"), *InFile);
+			return false;
+		}
+		FPaths::NormalizeFilename(RelativeFilename);
+		const FString PathKey = NormalizeFileKey(AbsoluteFilename);
+		if (SeenRelativePaths.Contains(PathKey))
+		{
+			continue;
+		}
+
+		const FString QuotedPath = QuoteGitFileArgument(RelativeFilename);
+		if (Arguments.Len() + QuotedPath.Len() + 1 > MaxCommandLineLength)
+		{
+			OutError = TEXT("The exact Changed Assets recheck path set exceeds the one-process command-line limit.");
+			return false;
+		}
+		SeenRelativePaths.Add(PathKey);
+		Arguments += TEXT(" ");
+		Arguments += QuotedPath;
+	}
+	if (SeenRelativePaths.IsEmpty())
+	{
+		OutError = TEXT("Changed Assets status requires at least one unique .uasset path.");
+		return false;
+	}
+
+	TArray<FString> Errors;
+	if (!RunLocalCommand(InPathToGitBinary, RepositoryRoot, Arguments, OutStandardOutput, Errors))
+	{
+		OutError = Errors.IsEmpty() ? TEXT("Exact Changed Assets status query failed.") : Errors[0];
+		return false;
+	}
+	return true;
+}
+
 bool ExpandSelectedPathsWithRenamePairs(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InSelectedFiles,
 	TArray<FString>& OutExpandedFiles, TArray<FGitRenamePair>& OutRenamePairs, TArray<FString>& OutErrorMessages)
 {

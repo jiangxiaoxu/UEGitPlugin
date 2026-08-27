@@ -6,6 +6,7 @@
 
 #include "Algo/AllOf.h"
 #include "GitSourceControlFileStatus.h"
+#include "GitRepositoryMutationGuard.h"
 #include "GitSourceControlUtils.h"
 #include "HAL/FileManager.h"
 #include "Engine/World.h"
@@ -607,6 +608,16 @@ namespace GitSourceControlAssetOperations
 	bool FGitSourceControlAssetOperations::DiscardTrackedFiles(const TArray<FString>& InFiles, const FGitAssetOperationCallbacks& Callbacks, FGitAssetOperationResult& OutResult) const
 	{
 		OutResult = FGitAssetOperationResult();
+		GitSourceControlRepositoryMutation::FGitRepositoryMutationGuard TransactionGuard(RepositoryRoot);
+		if (!TransactionGuard.Acquire([&Callbacks]() { return Callbacks.IsCancellationRequested && Callbacks.IsCancellationRequested(); }))
+		{
+			OutResult.bCancelled = Callbacks.IsCancellationRequested && Callbacks.IsCancellationRequested();
+			if (!OutResult.bCancelled)
+			{
+				OutResult.AddError(TEXT("Could not acquire the repository mutation transaction guard."));
+			}
+			return false;
+		}
 		TArray<FString> Files;
 		if (!NormalizeFiles(InFiles, Files, OutResult)) return false;
 
@@ -737,6 +748,16 @@ namespace GitSourceControlAssetOperations
 		const FGitAssetOperationCallbacks& Callbacks, FGitAssetOperationResult& OutResult) const
 	{
 		OutResult = FGitAssetOperationResult();
+		GitSourceControlRepositoryMutation::FGitRepositoryMutationGuard TransactionGuard(RepositoryRoot);
+		if (!TransactionGuard.Acquire([&Callbacks]() { return Callbacks.IsCancellationRequested && Callbacks.IsCancellationRequested(); }))
+		{
+			OutResult.bCancelled = Callbacks.IsCancellationRequested && Callbacks.IsCancellationRequested();
+			if (!OutResult.bCancelled)
+			{
+				OutResult.AddError(TEXT("Could not acquire the repository mutation transaction guard."));
+			}
+			return false;
+		}
 		TArray<FString> Files;
 		if (!NormalizeFiles({ InCurrentFilename }, Files, OutResult)) return false;
 		const FString Target = Files[0];

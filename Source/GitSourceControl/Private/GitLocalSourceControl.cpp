@@ -149,62 +149,6 @@ namespace GitLocalSourceControlPrivate
 		TArray<TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>> PendingReloadStates;
 	};
 
-	class FRepositoryMutationGuard final
-	{
-	public:
-		FRepositoryMutationGuard(const FString& InRepositoryRoot, const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState)
-			: Mutex(GetMutex(InRepositoryRoot))
-			, State(InState)
-		{
-		}
-
-		~FRepositoryMutationGuard()
-		{
-			if (bLocked)
-			{
-				Mutex->Unlock();
-			}
-		}
-
-		bool Acquire()
-		{
-			while (!Mutex->TryLock())
-			{
-				if (State->CancellationContext->IsCancellationRequested())
-				{
-					return false;
-				}
-				FPlatformProcess::SleepNoStats(0.005f);
-			}
-			bLocked = true;
-			return !State->CancellationContext->IsCancellationRequested();
-		}
-
-	private:
-		static TSharedRef<FCriticalSection, ESPMode::ThreadSafe> GetMutex(const FString& InRepositoryRoot)
-		{
-			const FString Key = InRepositoryRoot.ToLower();
-			FScopeLock Lock(&RepositoryLocksMutex);
-			if (const TSharedRef<FCriticalSection, ESPMode::ThreadSafe>* Existing = RepositoryLocks.Find(Key))
-			{
-				return *Existing;
-			}
-			const TSharedRef<FCriticalSection, ESPMode::ThreadSafe> NewMutex = MakeShared<FCriticalSection, ESPMode::ThreadSafe>();
-			RepositoryLocks.Add(Key, NewMutex);
-			return NewMutex;
-		}
-
-		static FCriticalSection RepositoryLocksMutex;
-		static TMap<FString, TSharedRef<FCriticalSection, ESPMode::ThreadSafe>> RepositoryLocks;
-
-		TSharedRef<FCriticalSection, ESPMode::ThreadSafe> Mutex;
-		TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe> State;
-		bool bLocked = false;
-	};
-
-	FCriticalSection FRepositoryMutationGuard::RepositoryLocksMutex;
-	TMap<FString, TSharedRef<FCriticalSection, ESPMode::ThreadSafe>> FRepositoryMutationGuard::RepositoryLocks;
-
 	FOperationRegistry& GetOperationRegistry()
 	{
 		static FOperationRegistry Registry;
@@ -566,6 +510,10 @@ namespace GitLocalSourceControlPrivate
 		const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState)
 	{
 		GitSourceControlAssetOperations::FGitAssetOperationCallbacks Callbacks;
+		Callbacks.IsCancellationRequested = [InState]()
+		{
+			return InState->CancellationContext->IsCancellationRequested();
+		};
 		Callbacks.Confirm = [](const FString&, const TArray<FString>&)
 		{
 			return true;
@@ -827,12 +775,6 @@ UGitLocalSourceControlOperation* UGitLocalSourceControlLibrary::StartRestoreRevi
 		}
 
 		GitLocalSourceControlPrivate::SetWorkerPhase(State, EGitLocalSourceControlOperationPhase::Preparing, true);
-		GitLocalSourceControlPrivate::FRepositoryMutationGuard MutationGuard(Target.RepositoryRoot, State);
-		if (!MutationGuard.Acquire())
-		{
-			GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
-			return;
-		}
 		GitSourceControlAssetOperations::FGitSourceControlAssetOperations Operations(Target.GitBinary, Target.RepositoryRoot);
 		GitSourceControlAssetOperations::FGitAssetOperationResult AssetResult;
 		const bool bRestored = Operations.RestoreRevisionToWorkspace(Target.Filename, SelectedRevision.CommitId, SelectedRevision.Filename,
@@ -880,12 +822,6 @@ UGitLocalSourceControlOperation* UGitLocalSourceControlLibrary::StartDiscardTrac
 		for (const GitLocalSourceControlPrivate::FResolvedTarget& Target : Targets)
 		{
 			Files.Add(Target.Filename);
-		}
-		GitLocalSourceControlPrivate::FRepositoryMutationGuard MutationGuard(Targets[0].RepositoryRoot, State);
-		if (!MutationGuard.Acquire())
-		{
-			GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
-			return;
 		}
 		GitSourceControlAssetOperations::FGitSourceControlAssetOperations Operations(Targets[0].GitBinary, Targets[0].RepositoryRoot);
 		GitSourceControlAssetOperations::FGitAssetOperationResult AssetResult;

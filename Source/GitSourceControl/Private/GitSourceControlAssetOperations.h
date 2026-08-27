@@ -30,6 +30,9 @@ namespace GitSourceControlAssetOperations
 
 	struct FGitAssetOperationCallbacks
 	{
+		/** 在等待 repository mutation guard 时查询取消状态. */
+		TFunction<bool()> IsCancellationRequested;
+
 		/** 在只读预检完成后调用, 只能收集用户确认. */
 		TFunction<bool(const FString& OperationDescription, const TArray<FString>& AffectedFiles)> Confirm;
 

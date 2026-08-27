@@ -23,9 +23,13 @@ public class GitSourceControl : ModuleRules
 				"EditorStyle",
 				"UnrealEd",
 				"SourceControl",
+				"AssetRegistry",
 				"AssetTools",
 				"AssetDefinition",
-				"Projects"
+				"ContentBrowser",
+				"WorkspaceMenuStructure",
+				"Projects",
+				"UnsavedAssetsTracker"
 			}
 		);
 

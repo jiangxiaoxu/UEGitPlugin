@@ -12,6 +12,9 @@
 #include "GitSourceControlMenu.h"
 
 class FExtender;
+class FGitChangedAssetsController;
+class FGitSourceControlStatusBarIntegration;
+class SDockTab;
 
 /**
  * Standalone local Git asset tools for Unreal Editor.
@@ -25,6 +28,8 @@ public:
 	/** IModuleInterface implementation */
 	virtual void StartupModule() override;
 	virtual void ShutdownModule() override;
+	/** ToolMenus/Slate delegate 与异步事务需要进程级生命周期。 */
+	virtual bool SupportsDynamicReloading() override { return false; }
 
 	/**
 	 * Singleton-like access to this module's interface.  This is just for convenience!
@@ -40,6 +45,12 @@ public:
 private:
 	/** Editor-only local Git actions. */
 	FGitSourceControlMenu GitSourceControlMenu;
+	TSharedPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> ChangedAssetsController;
+	TSharedPtr<FGitSourceControlStatusBarIntegration, ESPMode::ThreadSafe> StatusBarIntegration;
+
+	void RegisterMenus();
+	TSharedRef<SDockTab> SpawnChangedAssetsTab(const class FSpawnTabArgs& SpawnTabArgs);
+	void OpenChangedAssetsTab();
 	void HandlePreExit();
 	FDelegateHandle PreExitHandle;
 };
