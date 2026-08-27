@@ -185,7 +185,15 @@ TMap<FString, TSharedRef<FCriticalSection, ESPMode::ThreadSafe>> GitRepositoryGa
 FCriticalSection GitBinaryCapabilityCacheLock;
 FGitBinaryCapabilityCache GitBinaryCapabilityCache;
 FGitLfsCapabilityCache GitLfsCapabilityCache;
+FCriticalSection StartupGitCapabilityLock;
+FGitStartupCapability StartupGitCapability;
+bool bStartupGitCapabilityProbeStarted = false;
+thread_local FString StartupGitDiscoveryDiagnostic;
 thread_local TSharedPtr<FGitOperationCancellationContext, ESPMode::ThreadSafe> ActiveGitCancellationContext;
+
+#if WITH_DEV_AUTOMATION_TESTS
+TAtomic<uint32> StartupGitCapabilityProbeCount = 0;
+#endif
 
 FString NormalizeRepositoryKey(const FString& InRepositoryRoot)
 {
@@ -914,6 +922,21 @@ bool CheckGitAvailability(const FString& InPathToGitBinary)
 		!ParseGitReleaseVersion(BytesToString(Result.StandardOutput), Version) || !IsSupportedGitRelease(Version))
 	{
 		InvalidateVerifiedGitBinaryInternal(InPathToGitBinary);
+		FString VersionText = BytesToString(Result.StandardOutput);
+		VersionText.TrimStartAndEndInline();
+		if (VersionText.IsEmpty())
+		{
+			VersionText = Result.bLaunchFailed
+				? TEXT("could not launch executable")
+				: Result.bCancelled
+					? TEXT("probe was cancelled")
+					: Result.bTimedOut
+						? TEXT("probe timed out")
+						: TEXT("no valid Git version was returned");
+		}
+		StartupGitDiscoveryDiagnostic = FString::Printf(
+			TEXT("Detected Git executable: %s\nDetected version: %s\nGit 2.53.0 or a newer release is required. Install or upgrade Git, then restart the Editor."),
+			*InPathToGitBinary, *VersionText);
 		UE_LOG(LogGitStandalone, Verbose, TEXT("Ignoring Git executable '%s': this plugin requires Git 2.53.0 or a newer release."), *InPathToGitBinary);
 		return false;
 	}
@@ -1024,8 +1047,10 @@ static bool RunCommandInternal(const FString& InCommand, const FString& InPathTo
 	return bResult;
 }
 
-FString FindGitBinaryPath()
+static FString DiscoverSupportedGitBinaryPath(FString& OutDiagnostic)
 {
+	OutDiagnostic.Reset();
+	StartupGitDiscoveryDiagnostic.Reset();
 	FString CachedGitBinary;
 	if (TryGetVerifiedGitBinary(CachedGitBinary))
 	{
@@ -1267,9 +1292,85 @@ FString FindGitBinaryPath()
 	{
 		// If we did not find a path to Git, set it empty
 		GitBinaryPath.Empty();
+		OutDiagnostic = StartupGitDiscoveryDiagnostic.IsEmpty()
+			? TEXT("No supported Git executable was found. Git 2.53.0 or a newer release is required. Install or upgrade Git, then restart the Editor.")
+			: StartupGitDiscoveryDiagnostic;
 	}
 
 	return GitBinaryPath;
+}
+
+bool BeginStartupGitCapabilityProbe()
+{
+	FScopeLock Lock(&StartupGitCapabilityLock);
+	if (bStartupGitCapabilityProbeStarted)
+	{
+		return false;
+	}
+	bStartupGitCapabilityProbeStarted = true;
+	StartupGitCapability = FGitStartupCapability();
+	StartupGitCapability.State = EGitStartupCapabilityState::Pending;
+	StartupGitCapability.Diagnostic = TEXT("Checking for Git 2.53.0 or newer...");
+#if WITH_DEV_AUTOMATION_TESTS
+	++StartupGitCapabilityProbeCount;
+#endif
+	return true;
+}
+
+FGitStartupCapability ProbeStartupGitCapability()
+{
+	FGitStartupCapability Result;
+	Result.GitBinary = DiscoverSupportedGitBinaryPath(Result.Diagnostic);
+	Result.State = Result.GitBinary.IsEmpty() ? EGitStartupCapabilityState::Unavailable : EGitStartupCapabilityState::Available;
+	if (Result.State == EGitStartupCapabilityState::Available)
+	{
+		Result.Diagnostic = FString::Printf(TEXT("Using Git executable: %s"), *Result.GitBinary);
+	}
+	return Result;
+}
+
+void CompleteStartupGitCapabilityProbe(FGitStartupCapability InCapability)
+{
+	FScopeLock Lock(&StartupGitCapabilityLock);
+	if (StartupGitCapability.State != EGitStartupCapabilityState::Pending)
+	{
+		return;
+	}
+	if (InCapability.State == EGitStartupCapabilityState::Pending)
+	{
+		InCapability.State = EGitStartupCapabilityState::Unavailable;
+		InCapability.Diagnostic = TEXT("Git startup capability probe did not reach a terminal result. Restart the Editor and try again.");
+	}
+	StartupGitCapability = MoveTemp(InCapability);
+}
+
+FGitStartupCapability GetStartupGitCapability()
+{
+	FScopeLock Lock(&StartupGitCapabilityLock);
+	return StartupGitCapability;
+}
+
+bool IsStartupGitCapabilityAvailable()
+{
+	return GetStartupGitCapability().State == EGitStartupCapabilityState::Available;
+}
+
+FText GetStartupGitCapabilityMessage()
+{
+	const FGitStartupCapability Capability = GetStartupGitCapability();
+	if (Capability.State == EGitStartupCapabilityState::Available)
+	{
+		return FText::FromString(Capability.Diagnostic);
+	}
+	return FText::FromString(Capability.Diagnostic.IsEmpty()
+		? TEXT("Git is unavailable. Git 2.53.0 or a newer release is required. Install or upgrade Git, then restart the Editor.")
+		: Capability.Diagnostic);
+}
+
+FString FindGitBinaryPath()
+{
+	const FGitStartupCapability Capability = GetStartupGitCapability();
+	return Capability.State == EGitStartupCapabilityState::Available ? Capability.GitBinary : FString();
 }
 
 bool ResolveStandaloneRepositoryForFile(const FString& InFilename, FString& OutGitBinary, FString& OutRepositoryRoot, FString& OutError)
@@ -1285,10 +1386,16 @@ bool ResolveStandaloneRepositoryForFile(const FString& InFilename, FString& OutG
 		return false;
 	}
 
-	OutGitBinary = FindGitBinaryPath();
-	if (OutGitBinary.IsEmpty())
+	const FGitStartupCapability Capability = GetStartupGitCapability();
+	if (Capability.State != EGitStartupCapabilityState::Available)
 	{
-		OutError = TEXT("Could not locate a supported local Git executable. Git 2.53.0 or a newer release is required.");
+		OutError = GetStartupGitCapabilityMessage().ToString();
+		return false;
+	}
+	OutGitBinary = Capability.GitBinary;
+	if (OutGitBinary.IsEmpty() || !FPaths::FileExists(OutGitBinary))
+	{
+		OutError = FString::Printf(TEXT("The Git executable selected when the Editor started is no longer available: %s\nRestart the Editor after restoring Git."), *OutGitBinary);
 		return false;
 	}
 	if (!FindRootDirectory(Filename, OutRepositoryRoot))
@@ -1336,6 +1443,17 @@ void ResetVerifiedGitBinaryCache()
 	void CaptureGitProcessLaunchCountAtModuleStartup()
 	{
 		GitSourceControlUtilsPrivate::GitProcessLaunchCountAtModuleStartup.Store(GitSourceControlUtilsPrivate::GitProcessLaunchCount.Load());
+	}
+
+	uint32 GetStartupGitCapabilityProbeCount()
+	{
+		return GitSourceControlUtilsPrivate::StartupGitCapabilityProbeCount.Load();
+	}
+
+	void SetStartupGitCapabilityForTesting(const FGitStartupCapability& InCapability)
+	{
+		FScopeLock Lock(&GitSourceControlUtilsPrivate::StartupGitCapabilityLock);
+		GitSourceControlUtilsPrivate::StartupGitCapability = InCapability;
 	}
 
 	bool LoadStandaloneHistory(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InFilename,

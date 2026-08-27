@@ -35,6 +35,21 @@
 
 namespace GitSourceControlLocalAutomationTestsPrivate
 {
+	bool WaitForStartupGitCapability(FAutomationTestBase& Test, GitSourceControlUtils::FGitStartupCapability& OutCapability)
+	{
+		for (int32 Attempt = 0; Attempt < 500; ++Attempt)
+		{
+			OutCapability = GitSourceControlUtils::GetStartupGitCapability();
+			if (OutCapability.State != GitSourceControlUtils::EGitStartupCapabilityState::Pending)
+			{
+				return true;
+			}
+			FPlatformProcess::SleepNoStats(0.01f);
+		}
+		Test.AddError(TEXT("Timed out waiting for the one-shot Git startup capability probe."));
+		return false;
+	}
+
 	FString QuoteGitArgument(const FString& Argument)
 	{
 		FString Escaped = Argument;
@@ -551,12 +566,23 @@ bool FGitSourceControlStandaloneZeroImplicitGitAutomationTest::RunTest(const FSt
 {
 	static_cast<void>(Parameters);
 	using namespace GitSourceControlLocalAutomationTestsPrivate;
-	TestEqual(TEXT("Standalone module startup snapshot starts no Git process"), GitSourceControlUtils::Testing::GetGitProcessLaunchCountAtModuleStartup(), static_cast<uint64>(0));
+	GitSourceControlUtils::FGitStartupCapability StartupCapability;
+	if (!WaitForStartupGitCapability(*this, StartupCapability))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Standalone module launches exactly one startup Git capability probe"),
+		GitSourceControlUtils::Testing::GetStartupGitCapabilityProbeCount(), static_cast<uint32>(1));
+	if (!TestTrue(TEXT("Startup Git capability probe finds a supported Git release"),
+		StartupCapability.State == GitSourceControlUtils::EGitStartupCapabilityState::Available))
+	{
+		AddError(StartupCapability.Diagnostic);
+		return false;
+	}
 	FGitTestFixture Fixture(*this);
 	if (!Fixture.Initialize() || !CreateCommittedFixture(Fixture)) return false;
-	// Fixture setup has its own explicit Git discovery. Reset the test-only
-	// binary capability cache before checking the product lifecycle so the final
-	// explicit discovery still proves that it launches Git after idle startup.
+	// The executable path is frozen by startup. Reset only process accounting so
+	// normal asset lifecycle checks prove there is no additional Git activity.
 	GitSourceControlUtils::Testing::ResetVerifiedGitBinaryCache();
 	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
 	FGitSourceControlModule& Module = FModuleManager::LoadModuleChecked<FGitSourceControlModule>(TEXT("GitSourceControl"));
@@ -654,8 +680,47 @@ bool FGitSourceControlStandaloneZeroImplicitGitAutomationTest::RunTest(const FSt
 	FString GitBinary;
 	FString RepositoryRoot;
 	FString ResolveError;
-	TestTrue(TEXT("Explicit standalone repository discovery succeeds"), GitSourceControlUtils::ResolveStandaloneRepositoryForFile(Fixture.AbsoluteFilename(TEXT("Content/Tracked.txt")), GitBinary, RepositoryRoot, ResolveError));
-	return TestTrue(TEXT("Only explicit standalone discovery starts Git"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() > 0);
+	TestTrue(TEXT("Explicit standalone repository resolution succeeds"), GitSourceControlUtils::ResolveStandaloneRepositoryForFile(Fixture.AbsoluteFilename(TEXT("Content/Tracked.txt")), GitBinary, RepositoryRoot, ResolveError));
+	TestTrue(TEXT("Explicit repository resolution reuses the frozen startup Git binary"), FPaths::IsSamePath(GitBinary, StartupCapability.GitBinary));
+	return TestEqual(TEXT("Explicit repository resolution starts no additional Git process after startup"),
+		GitSourceControlUtils::Testing::GetGitProcessLaunchCount(), static_cast<uint64>(0));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlStartupCapabilityGateAutomationTest, "Cthulhu.GitSourceControl.Standalone.StartupCapabilityGate", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlStartupCapabilityGateAutomationTest::RunTest(const FString& Parameters)
+{
+	static_cast<void>(Parameters);
+	const GitSourceControlUtils::FGitStartupCapability SavedCapability = GitSourceControlUtils::GetStartupGitCapability();
+	ON_SCOPE_EXIT
+	{
+		GitSourceControlUtils::Testing::SetStartupGitCapabilityForTesting(SavedCapability);
+	};
+
+	GitSourceControlUtils::FGitStartupCapability PendingCapability;
+	PendingCapability.State = GitSourceControlUtils::EGitStartupCapabilityState::Pending;
+	PendingCapability.Diagnostic = TEXT("Checking for Git 2.53.0 or newer...");
+	GitSourceControlUtils::Testing::SetStartupGitCapabilityForTesting(PendingCapability);
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	FString GitBinary;
+	FString RepositoryRoot;
+	FString Error;
+	TestFalse(TEXT("Pending startup capability blocks Git action repository resolution"),
+		GitSourceControlUtils::ResolveStandaloneRepositoryForFile(FPaths::GetProjectFilePath(), GitBinary, RepositoryRoot, Error));
+	TestEqual(TEXT("Pending Git action capability gate starts no Git process"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount(), static_cast<uint64>(0));
+	TestTrue(TEXT("Pending startup capability reports an actionable explanation"), Error.Contains(TEXT("Git 2.53.0")));
+
+	GitSourceControlUtils::FGitStartupCapability UnavailableCapability;
+	UnavailableCapability.State = GitSourceControlUtils::EGitStartupCapabilityState::Unavailable;
+	UnavailableCapability.Diagnostic = TEXT("Detected Git executable: C:/Tools/Git/bin/git.exe\nDetected version: git version 2.42.0\nGit 2.53.0 or a newer release is required. Install or upgrade Git, then restart the Editor.");
+	GitSourceControlUtils::Testing::SetStartupGitCapabilityForTesting(UnavailableCapability);
+	Error.Reset();
+	TestFalse(TEXT("Unavailable startup capability blocks Git action repository resolution"),
+		GitSourceControlUtils::ResolveStandaloneRepositoryForFile(FPaths::GetProjectFilePath(), GitBinary, RepositoryRoot, Error));
+	TestEqual(TEXT("Unavailable Git action capability gate starts no Git process"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount(), static_cast<uint64>(0));
+	TestTrue(TEXT("Unavailable startup capability preserves detected path and restart guidance"),
+		Error.Contains(TEXT("C:/Tools/Git/bin/git.exe")) && Error.Contains(TEXT("restart the Editor")));
+	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlLfsObjectVerificationAutomationTest, "Cthulhu.GitSourceControl.Local.LfsObjectVerification", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
@@ -689,23 +754,29 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlGitBinaryCapabilityCacheAutoma
 bool FGitSourceControlGitBinaryCapabilityCacheAutomationTest::RunTest(const FString& Parameters)
 {
 	static_cast<void>(Parameters);
+	using namespace GitSourceControlLocalAutomationTestsPrivate;
+	GitSourceControlUtils::FGitStartupCapability StartupCapability;
+	if (!WaitForStartupGitCapability(*this, StartupCapability))
+	{
+		return false;
+	}
+	if (!TestTrue(TEXT("Startup capability is available before checking its frozen binary"),
+		StartupCapability.State == GitSourceControlUtils::EGitStartupCapabilityState::Available))
+	{
+		AddError(StartupCapability.Diagnostic);
+		return false;
+	}
 	GitSourceControlUtils::Testing::ResetVerifiedGitBinaryCache();
 	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
 	const FString FirstGitBinary = GitSourceControlUtils::FindGitBinaryPath();
-	if (!TestTrue(TEXT("First explicit Git discovery finds a supported Git release"), !FirstGitBinary.IsEmpty()))
+	if (!TestTrue(TEXT("Frozen startup capability provides a supported Git binary"), !FirstGitBinary.IsEmpty()))
 	{
 		return false;
 	}
-	const uint64 FirstDiscoveryLaunchCount = GitSourceControlUtils::Testing::GetGitProcessLaunchCount();
-	if (!TestTrue(TEXT("First explicit Git discovery validates at least one candidate"), FirstDiscoveryLaunchCount > 0))
-	{
-		return false;
-	}
-
 	const FString CachedGitBinary = GitSourceControlUtils::FindGitBinaryPath();
-	TestTrue(TEXT("Cached Git discovery returns the verified binary"), FPaths::IsSamePath(CachedGitBinary, FirstGitBinary));
-	return TestEqual(TEXT("Cached Git discovery does not launch another Git process"),
-		GitSourceControlUtils::Testing::GetGitProcessLaunchCount(), FirstDiscoveryLaunchCount);
+	TestTrue(TEXT("Frozen startup capability returns the same Git binary"), FPaths::IsSamePath(CachedGitBinary, FirstGitBinary));
+	return TestEqual(TEXT("Reading the frozen startup binary does not launch Git"),
+		GitSourceControlUtils::Testing::GetGitProcessLaunchCount(), static_cast<uint64>(0));
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlLfsRevisionFetchAutomationTest, "Cthulhu.GitSourceControl.Local.LfsRevisionFetch", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)

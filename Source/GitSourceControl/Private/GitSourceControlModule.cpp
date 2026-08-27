@@ -12,12 +12,14 @@
 #include "GitStandaloneLog.h"
 #include "GitSourceControlUtils.h"
 #include "SGitChangedAssetsPanel.h"
+#include "Async/Async.h"
 #include "Framework/Docking/TabManager.h"
+#include "HAL/Event.h"
+#include "HAL/PlatformProcess.h"
 #include "Misc/App.h"
 #include "Misc/CoreDelegates.h"
+#include "Misc/MessageDialog.h"
 #include "Styling/AppStyle.h"
-#include "ToolMenu.h"
-#include "ToolMenuSection.h"
 #include "ToolMenus.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "WorkspaceMenuStructure.h"
@@ -26,6 +28,12 @@
 DEFINE_LOG_CATEGORY(LogGitStandalone);
 
 #define LOCTEXT_NAMESPACE "GitSourceControl"
+
+class FGitSourceControlStartupProbeState final
+{
+public:
+	TAtomic<bool> bShuttingDown = false;
+};
 
 namespace GitSourceControlModulePrivate
 {
@@ -58,14 +66,13 @@ void FGitSourceControlModule::StartupModule()
 			FOnSpawnTab::CreateRaw(this, &FGitSourceControlModule::SpawnChangedAssetsTab))
 			.SetDisplayName(LOCTEXT("ChangedAssetsTabName", "Git Changes"))
 			.SetTooltipText(LOCTEXT("ChangedAssetsTabTooltip", "Shows repository-wide changed .uasset files and reverts selected assets to HEAD."))
+			.SetAutoGenerateMenuEntry(false)
 			.SetGroup(WorkspaceMenu::GetMenuStructure().GetToolsCategory())
 			.SetIcon(FSlateIcon(FAppStyle::GetAppStyleSetName(), "SourceControl.Edit"));
-		UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FGitSourceControlModule::RegisterMenus));
+		UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FGitSourceControlModule::RegisterStatusBarIntegration));
 	}
+	BeginStartupGitCapabilityProbe();
 	PreExitHandle = FCoreDelegates::OnPreExit.AddRaw(this, &FGitSourceControlModule::HandlePreExit);
-#if WITH_DEV_AUTOMATION_TESTS
-	GitSourceControlUtils::Testing::CaptureGitProcessLaunchCountAtModuleStartup();
-#endif
 }
 
 void FGitSourceControlModule::ShutdownModule()
@@ -74,6 +81,22 @@ void FGitSourceControlModule::ShutdownModule()
 	{
 		FCoreDelegates::OnPreExit.Remove(PreExitHandle);
 		PreExitHandle.Reset();
+	}
+	if (StartupProbeState.IsValid())
+	{
+		StartupProbeState->bShuttingDown.Store(true);
+		if (StartupProbeCancellation.IsValid())
+		{
+			StartupProbeCancellation->Cancel();
+		}
+		if (StartupProbeCompletedEvent != nullptr)
+		{
+			StartupProbeCompletedEvent->Wait();
+			FPlatformProcess::ReturnSynchEventToPool(StartupProbeCompletedEvent);
+			StartupProbeCompletedEvent = nullptr;
+		}
+		StartupProbeCancellation.Reset();
+		StartupProbeState.Reset();
 	}
 	if (ChangedAssetsController.IsValid())
 	{
@@ -90,7 +113,6 @@ void FGitSourceControlModule::ShutdownModule()
 	if (UToolMenus::TryGet())
 	{
 		UToolMenus::UnRegisterStartupCallback(this);
-		UToolMenus::UnregisterOwner(this);
 	}
 	if (FGlobalTabmanager::Get()->HasTabSpawner(GitSourceControlModulePrivate::ChangedAssetsTabId))
 	{
@@ -107,21 +129,12 @@ void FGitSourceControlModule::HandlePreExit()
 	GitSourceControlRevision::CleanupTemporaryExports();
 }
 
-void FGitSourceControlModule::RegisterMenus()
+void FGitSourceControlModule::RegisterStatusBarIntegration()
 {
-	FToolMenuOwnerScoped OwnerScoped(this);
 	if (StatusBarIntegration.IsValid())
 	{
 		StatusBarIntegration->Install();
 	}
-	UToolMenu* const WindowMenu = UToolMenus::Get()->ExtendMenu(TEXT("LevelEditor.MainMenu.Window"));
-	FToolMenuSection& WindowSection = WindowMenu->FindOrAddSection(TEXT("WindowLayout"));
-	WindowSection.AddMenuEntry(
-		TEXT("GitSourceControl_OpenChangedAssets"),
-		LOCTEXT("OpenChangedAssets", "Git Changes"),
-		LOCTEXT("OpenChangedAssetsTooltip", "Open the repository-wide Git Changes view."),
-		FSlateIcon(FAppStyle::GetAppStyleSetName(), "SourceControl.Edit"),
-		FUIAction(FExecuteAction::CreateRaw(this, &FGitSourceControlModule::OpenChangedAssetsTab)));
 }
 
 TSharedRef<SDockTab> FGitSourceControlModule::SpawnChangedAssetsTab(const FSpawnTabArgs& SpawnTabArgs)
@@ -137,7 +150,69 @@ TSharedRef<SDockTab> FGitSourceControlModule::SpawnChangedAssetsTab(const FSpawn
 
 void FGitSourceControlModule::OpenChangedAssetsTab()
 {
+	if (!GitSourceControlUtils::IsStartupGitCapabilityAvailable())
+	{
+		ShowStartupGitCapabilityDialog();
+		return;
+	}
 	FGlobalTabmanager::Get()->TryInvokeTab(GitSourceControlModulePrivate::ChangedAssetsTabId);
+}
+
+void FGitSourceControlModule::BeginStartupGitCapabilityProbe()
+{
+	check(IsInGameThread());
+	if (!GitSourceControlUtils::BeginStartupGitCapabilityProbe())
+	{
+		return;
+	}
+	StartupProbeState = MakeShared<FGitSourceControlStartupProbeState, ESPMode::ThreadSafe>();
+	StartupProbeCancellation = MakeShared<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>();
+	StartupProbeCompletedEvent = FPlatformProcess::GetSynchEventFromPool(true);
+	StartupProbeCompletedEvent->Reset();
+	const TWeakPtr<FGitSourceControlStartupProbeState, ESPMode::ThreadSafe> WeakProbeState = StartupProbeState;
+	const TSharedRef<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe> Cancellation = StartupProbeCancellation.ToSharedRef();
+	FEvent* const CompletionEvent = StartupProbeCompletedEvent;
+	Async(EAsyncExecution::ThreadPool, [WeakProbeState, Cancellation, CompletionEvent, this]()
+	{
+		GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(Cancellation);
+		GitSourceControlUtils::FGitStartupCapability Capability = GitSourceControlUtils::ProbeStartupGitCapability();
+		if (Cancellation->IsCancellationRequested())
+		{
+			Capability.State = GitSourceControlUtils::EGitStartupCapabilityState::Unavailable;
+			Capability.GitBinary.Reset();
+			Capability.Diagnostic = TEXT("Git startup capability detection was cancelled during Editor shutdown.");
+		}
+		GitSourceControlUtils::CompleteStartupGitCapabilityProbe(MoveTemp(Capability));
+#if WITH_DEV_AUTOMATION_TESTS
+		GitSourceControlUtils::Testing::CaptureGitProcessLaunchCountAtModuleStartup();
+#endif
+		AsyncTask(ENamedThreads::GameThread, [WeakProbeState, this]()
+		{
+			if (const TSharedPtr<FGitSourceControlStartupProbeState, ESPMode::ThreadSafe> ProbeState = WeakProbeState.Pin())
+			{
+				if (!ProbeState->bShuttingDown.Load())
+				{
+					HandleStartupGitCapabilityCompleted();
+				}
+			}
+		});
+		CompletionEvent->Trigger();
+	});
+}
+
+void FGitSourceControlModule::HandleStartupGitCapabilityCompleted()
+{
+	check(IsInGameThread());
+	if (ChangedAssetsController.IsValid())
+	{
+		ChangedAssetsController->HandleStartupGitCapabilityChanged();
+	}
+}
+
+void FGitSourceControlModule::ShowStartupGitCapabilityDialog() const
+{
+	FMessageDialog::Open(EAppMsgType::Ok, GitSourceControlUtils::GetStartupGitCapabilityMessage(),
+		LOCTEXT("GitCapabilityUnavailableTitle", "Git Changes Unavailable"));
 }
 
 IMPLEMENT_MODULE(FGitSourceControlModule, GitSourceControl);

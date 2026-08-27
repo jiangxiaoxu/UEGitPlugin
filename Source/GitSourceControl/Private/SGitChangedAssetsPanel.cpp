@@ -4,6 +4,7 @@
 
 #include "GitChangedAssetsController.h"
 #include "GitChangedAssetsModel.h"
+#include "GitSourceControlUtils.h"
 #include "Framework/Application/SlateApplication.h"
 #include "HAL/PlatformApplicationMisc.h"
 #include "Misc/PackageName.h"
@@ -530,6 +531,11 @@ namespace SGitChangedAssetsPanelPrivate
 		}
 		return Options.Add_GetRef(MakeShared<FString>(Value));
 	}
+
+	bool ShouldRequestInitialRefresh(const bool bAlreadyRequested, const bool bGitCapabilityAvailable)
+	{
+		return !bAlreadyRequested && bGitCapabilityAvailable;
+	}
 }
 
 void SGitChangedAssetsPanel::Construct(const FArguments& InArgs)
@@ -562,6 +568,7 @@ void SGitChangedAssetsPanel::Construct(const FArguments& InArgs)
 		SNew(SBorder)
 		.Padding(8.0f)
 		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+		.IsEnabled(this, &SGitChangedAssetsPanel::IsStartupGitCapabilityAvailable)
 		[
 			SNew(SVerticalBox)
 			+ SVerticalBox::Slot()
@@ -695,7 +702,6 @@ void SGitChangedAssetsPanel::Construct(const FArguments& InArgs)
 	];
 
 	HandleControllerChanged();
-	Controller->Refresh();
 }
 
 SGitChangedAssetsPanel::~SGitChangedAssetsPanel()
@@ -709,6 +715,11 @@ SGitChangedAssetsPanel::~SGitChangedAssetsPanel()
 void SGitChangedAssetsPanel::HandleControllerChanged()
 {
 	RebuildItems();
+	if (Controller.IsValid() && SGitChangedAssetsPanelPrivate::ShouldRequestInitialRefresh(bInitialRefreshRequested, IsStartupGitCapabilityAvailable()))
+	{
+		bInitialRefreshRequested = true;
+		Controller->Refresh();
+	}
 }
 
 void SGitChangedAssetsPanel::RebuildItems()
@@ -1000,7 +1011,7 @@ TSharedRef<SWidget> SGitChangedAssetsPanel::GenerateFilterOption(TSharedPtr<FStr
 
 FReply SGitChangedAssetsPanel::HandleRefreshClicked()
 {
-	if (Controller.IsValid())
+	if (IsStartupGitCapabilityAvailable() && Controller.IsValid())
 	{
 		Controller->Refresh();
 	}
@@ -1009,7 +1020,7 @@ FReply SGitChangedAssetsPanel::HandleRefreshClicked()
 
 bool SGitChangedAssetsPanel::HasSelection() const
 {
-	return ListView.IsValid() && ListView->GetNumItemsSelected() > 0;
+	return IsStartupGitCapabilityAvailable() && ListView.IsValid() && ListView->GetNumItemsSelected() > 0;
 }
 
 FReply SGitChangedAssetsPanel::HandleCopyPathsClicked()
@@ -1054,7 +1065,7 @@ FReply SGitChangedAssetsPanel::HandleRevertClicked()
 
 bool SGitChangedAssetsPanel::CanRevertSelection() const
 {
-	if (!Controller.IsValid() || Controller->IsRefreshing() || Controller->IsReverting())
+	if (!IsStartupGitCapabilityAvailable() || !Controller.IsValid() || Controller->IsRefreshing() || Controller->IsReverting())
 	{
 		return false;
 	}
@@ -1073,9 +1084,14 @@ bool SGitChangedAssetsPanel::CanRevertSelection() const
 	return true;
 }
 
+bool SGitChangedAssetsPanel::IsStartupGitCapabilityAvailable() const
+{
+	return GitSourceControlUtils::IsStartupGitCapabilityAvailable();
+}
+
 FReply SGitChangedAssetsPanel::HandleEntryMouseButtonDown(FEntryPtr Entry, const FPointerEvent& MouseEvent)
 {
-	if (!Entry.IsValid() || !ListView.IsValid() || MouseEvent.GetEffectingButton() != EKeys::LeftMouseButton)
+	if (!IsStartupGitCapabilityAvailable() || !Entry.IsValid() || !ListView.IsValid() || MouseEvent.GetEffectingButton() != EKeys::LeftMouseButton)
 	{
 		return FReply::Unhandled();
 	}
@@ -1109,6 +1125,10 @@ ECheckBoxState SGitChangedAssetsPanel::GetEntryCheckState(FEntryPtr Entry) const
 
 FText SGitChangedAssetsPanel::GetStatusText() const
 {
+	if (!IsStartupGitCapabilityAvailable())
+	{
+		return GitSourceControlUtils::GetStartupGitCapabilityMessage();
+	}
 	if (!Controller.IsValid())
 	{
 		return LOCTEXT("ChangedAssetsControllerUnavailable", "Git Changes is unavailable.");
@@ -1133,12 +1153,14 @@ FText SGitChangedAssetsPanel::GetStatusText() const
 
 FText SGitChangedAssetsPanel::GetErrorText() const
 {
-	return Controller.IsValid() ? FText::FromString(Controller->GetLastError()) : FText::GetEmpty();
+	return !IsStartupGitCapabilityAvailable()
+		? GitSourceControlUtils::GetStartupGitCapabilityMessage()
+		: Controller.IsValid() ? FText::FromString(Controller->GetLastError()) : FText::GetEmpty();
 }
 
 EVisibility SGitChangedAssetsPanel::GetErrorVisibility() const
 {
-	return Controller.IsValid() && !Controller->GetLastError().IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed;
+	return !IsStartupGitCapabilityAvailable() || (Controller.IsValid() && !Controller->GetLastError().IsEmpty()) ? EVisibility::Visible : EVisibility::Collapsed;
 }
 
 FText SGitChangedAssetsPanel::GetRevertButtonText() const
@@ -1165,6 +1187,17 @@ bool FGitChangedAssetsFileExplorerSelectionTest::RunTest(const FString& Paramete
 {
 	using namespace SGitChangedAssetsPanelPrivate;
 	(void)Parameters;
+	bool bInitialRefreshRequested = false;
+	TestFalse(TEXT("A panel opened while the startup probe is pending does not request repository status"),
+		ShouldRequestInitialRefresh(bInitialRefreshRequested, false));
+	if (ShouldRequestInitialRefresh(bInitialRefreshRequested, true))
+	{
+		bInitialRefreshRequested = true;
+	}
+	TestTrue(TEXT("A visible panel requests repository status when Git becomes available"), bInitialRefreshRequested);
+	TestFalse(TEXT("The same visible panel does not request a duplicate initial repository status"),
+		ShouldRequestInitialRefresh(bInitialRefreshRequested, true));
+
 	const auto MakeEntry = [](const TCHAR* Filename)
 	{
 		FEntryPtr Entry = MakeShared<FGitChangedAssetEntry>();

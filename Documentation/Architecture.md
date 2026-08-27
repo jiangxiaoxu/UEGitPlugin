@@ -6,13 +6,13 @@
 
 - 不注册 Unreal `ISourceControlProvider`, 不调用 `RegisterModularFeature("SourceControl", ...)`, 不使用 Unreal native History window、status badge、filter、changelist 或 Source Control settings。
 - 不注册 `DirectoryWatcher`, 不维护跨会话 repository/status cache, history cache, provider handoff 或后台轮询. Changed Assets tab 只在显式打开/Refresh 时创建一次性的 snapshot generation, 操作完成后丢弃.
-- Module startup 不执行 Git discovery、`git version`、`rev-parse` 或 repository probe, 不创建 module-global ticker。仅显式操作时按需发现 Git binary 和 nearest repository。
+- Module startup 异步且恰好执行一次 Git capability gate, 发现可执行文件并读取 `git version`, 要求 Git 2.53.0 或更高; 不执行 `rev-parse` 或 repository probe. gate 状态为 `Pending`, `Available` 或 `Unavailable`. Content Browser 资产菜单始终注册以保持 discoverability; `Pending`/`Unavailable` 时点击只显示 actionable diagnostic 且不执行 Git, `Available` 时才执行 action. status bar 和 Changed Assets panel 在 `Pending`/`Unavailable` 时显示 actionable diagnostic 并禁止交互. Git Changes 用户入口仅为 Level Editor status bar; layout restore 或 programmatic tab invocation 仍受 gate 约束. 当前 Editor session 不重探, 安装或升级 Git 后需重启 Editor.
 - Content Browser asset lifecycle 的 create、move、copy、save、rename、delete 不得触发 Git command。
-- Level Editor status bar 以 owner-scoped ToolMenus entry 替换原生 Revision Control 组合控件, 保留 Unsaved Assets 指示并提供 `Git Changes` 直达按钮. 原 entry 在 shutdown 时恢复; module 禁止 dynamic reload, 避免 ToolMenus/Slate 缓存持有已卸载 DLL delegate.
+- Level Editor 右下角 status bar 以 owner-scoped ToolMenus entry 替换默认 Source Control 组合控件, 保留 Unsaved Assets 指示并提供 `Git Changes` 直达按钮. 这是 Git Changes 的唯一用户入口; layout restore 或 programmatic tab invocation 仍受 startup gate 约束. 原 entry 在 shutdown 时恢复; module 禁止 dynamic reload, 避免 ToolMenus/Slate 缓存持有已卸载 DLL delegate.
 
 ## Explicit asynchronous jobs
 
-每个 Changed Assets refresh/revert, History, Diff, LFS Fetch, Restore 或 Discard 都是显式 async job. Git/LFS process 和 file I/O 在 worker, 所有 Slate, asset load/unload/reload 和 completion callback 在 Game Thread. 窗口或 operation handle 持有临时 job context, job 结束即释放; 不建立插件持久缓存.
+每个 Changed Assets refresh/revert, History, Diff, LFS Fetch, Restore 或 Discard 都是显式 async job, 且必须先通过 startup Git gate. Git/LFS process 和 file I/O 在 worker, 所有 Slate, asset load/unload/reload 和 completion callback 在 Game Thread. 窗口或 operation handle 持有临时 job context, job 结束即释放; 不建立插件持久缓存. Git LFS 3.7.1+ 只在首次需要 LFS object 的显式操作时 lazy gate, 只缓存成功结果; 缺失、版本过低或瞬时失败不缓存, 当前动作失败且下次显式 LFS 动作重试, 无需重启 Editor. 未触发 LFS 时不执行 LFS version probe.
 
 Read-only job 可由用户取消, window close 和 module shutdown 必须终止并等待其 process。Mutation 在 commit point 前可取消, 进入 commit point 后必须完成或 rollback。任何 callback 都必须先验证 window/module lifetime, 禁止在 worker thread 访问 UObject、Slate 或 Editor subsystem。
 
@@ -51,10 +51,11 @@ Repository discovery 只接受用户显式选中的 asset path, 解析 nearest r
 
 变更至少应覆盖以下边界:
 
-- module idle 和 asset lifecycle 的 Git process count 为零, 且没有 Unreal Source Control modular feature。
+- startup Git capability gate 恰好执行一次, `Pending`/`Unavailable` 时所有 Git action 均 fail closed 并给出 actionable diagnostic, 同时保留 Content Browser 菜单 discoverability; 安装或升级 Git 后必须重启 Editor 才重新探测。
+- Git gate 完成后的 module idle 和普通 asset lifecycle 不再启动额外 Git process, 且没有 Unreal Source Control modular feature。
 - CurrentPath、multi-hop `R100`、fixed HEAD、250 条上限和无 `--follow`。
 - Diff 三种选择模式、跨 rename path、类型不兼容和 temp cleanup。
-- LFS cache hit 零 network fetch; miss 只进行目标 commit/path fetch; ambiguous remote 在网络前失败。
+- LFS capability 在首次需要 LFS 的显式操作中 lazy 探测, 只缓存成功的 3.7.1+ 结果; 缺失、版本过低或瞬时失败不缓存, 当前动作失败且下次显式 LFS 动作重试. cache hit 零 network fetch; miss 只进行目标 commit/path fetch; ambiguous remote 在网络前失败.
 - Restore/Discard 的 dirty、staged、conflict、untracked、index-added、package load/reload、rollback 和 index invariants。
 - Changed Assets 的 repository-wide status parser, `.uasset` state aggregation, Added/Untracked 删除, Rename 原子回退, OFPA owner unresolved/dirty-map gate, generation cancellation 和 mutation guard.
 - window close、cancel、module shutdown 时无遗留 Git process、notification 或 temp package。

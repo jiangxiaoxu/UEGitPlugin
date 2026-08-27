@@ -6,8 +6,8 @@
 
 ## 当前实现
 
-- `FGitSourceControlModule` 注册 standalone Content Browser UI 和 `GitChangedAssets` Nomad tab. Startup 不发现 Git, 不创建 provider, worker queue, `DirectoryWatcher`, state cache 或 global ticker; tab 打开后才显式触发 Changed Assets snapshot.
-- `GitLocalSourceControl` 和菜单操作在显式交互后才解析 Git executable 与 nearest repository root。每个 job 使用 worker 和 Game Thread completion, 临时 repository context 在 job 结束后释放。
+- `FGitSourceControlModule` 注册 standalone Content Browser UI 和 `GitChangedAssets` Nomad tab. Startup 异步且恰好执行一次 Git capability gate, 发现 Git executable 并验证版本 2.53.0+, 但不探测 repository; Content Browser 资产菜单始终注册以保持 discoverability, `Pending`/`Unavailable` 时点击只显示 actionable diagnostic 且不执行 Git, `Available` 时才执行 action. status bar 和 panel 在门禁未通过时只显示 actionable diagnostic 并禁止交互. Git Changes 用户入口仅为 Level Editor 右下角替换默认 Source Control 控件的 status bar 按钮, layout restore 或 programmatic tab invocation 仍受 gate 约束. 模块仍不创建 provider、`DirectoryWatcher`、state cache 或后台 status polling.
+- `GitLocalSourceControl` 和菜单操作在 startup gate `Available` 后解析 nearest repository root. 每个 job 使用 worker 和 Game Thread completion, 临时 repository context 在 job 结束后释放. 当前 Editor session 不重探 Git; 安装或升级后需重启.
 - `GitSourceControlUtils` 负责 exact path status preflight, repository-wide porcelain-v2 snapshot, fixed-HEAD history, exact blob 和 LFS materialization. Changed Assets status 仅通过窄接口触发一次全仓查询, 空路径的 legacy 操作不会升级为 repository-wide scan.
 - `FGitChangedAssetsMetadataResolver` 使用 Asset Registry 批量 metadata 和 OFPA owner fallback, `FGitChangedAssetsController` 负责 generation, 异步 enrich, 过滤结果刷新和 revert 完成后的状态重查.
 - `FGitSourceControlMenu` 提供 History, 三种 Diff, same-path Force Restore 和 tracked Discard. Changed Assets 使用独立的 project-wide snapshot/list UI, 不注册 native changelist 或 Content Browser badge.
@@ -22,7 +22,7 @@ History 是按文件显式请求的 local `git log`, 先捕获 `HEAD` 再查询�
 
 ## LFS 和外部 Git client
 
-Git LFS pointer 优先从本地 storage verify/materialize。Diff、Restore、Fetch 或 Discard 的 object 缺失时, 插件只 fetch 对应 full commit + historical path。remote 只接受当前 branch upstream 或 repository 唯一 remote; 多 remote 且无 upstream 时在 network command 前失败, 不根据 `origin` 猜测。下载可取消, 完成后必须通过 SHA-256 和 size 校验。
+Git LFS 3.7.1+ capability 只在首次需要 LFS object 的显式操作时 lazy 检查, 只缓存成功结果. 缺失、版本过低或瞬时检查失败不缓存, 当前动作失败且下次显式 LFS 动作重试, 无需重启 Editor. pointer 优先从本地 storage verify/materialize. Diff、Restore、Fetch 或 Discard 的 object 缺失时, 插件只 fetch 对应 full commit + historical path. remote 只接受当前 branch upstream 或 repository 唯一 remote; 多 remote 且无 upstream 时在 network command 前失败, 不根据 `origin` 猜测. 下载可取消, 完成后必须通过 SHA-256 和 size 校验.
 
 插件不执行 branch checkout、remote status polling 或 server coordination。项目仍在外部 Git client 中完成 fetch、pull、push、commit、merge、conflict resolution、asset delete 和 LFS lock。Content Browser 浏览及 Engine asset lifecycle 不触发 Git work。
 
@@ -61,7 +61,7 @@ npm run test:unreal:automation -- Cthulhu.GitSourceControl.ChangedAssets.RevertT
 npm run as:diagnostics
 ```
 
-测试使用 isolated temporary Git repository 和 local bare LFS remote, 覆盖 fixed-HEAD history、exact rename、LFS hit/miss、standalone Diff selection、Restore/Discard safety、index invariant、provider absence、startup process snapshot 以及 asset lifecycle 中的 zero Git process。测试需要 Git 和 Git LFS, 不连接 external server。
+测试使用 isolated temporary Git repository 和 local bare LFS remote, 覆盖 fixed-HEAD history、exact rename、LFS hit/miss、standalone Diff selection、Restore/Discard safety、index invariant、provider absence、startup Git capability gate 恰好一次、Pending/Unavailable UI fail-closed、Content Browser action execution gate 以及 asset lifecycle 中除 startup gate 外的 zero Git process. 测试需要 Git 和 Git LFS, 不连接 external server.
 
 ## 已知限制
 
@@ -69,6 +69,8 @@ npm run as:diagnostics
 - 当前 Changed Assets 与 mutation 只支持单个 `.uasset`; `.umap`, sidecar, World Partition map package 和其他非 `.uasset` package 需要未来独立设计. OFPA actor/object `.uasset` 可显示, 但 owner unresolved 或 dirty owner map 时不可 Revert.
 - 跨 rename revision 可以 Diff, 但不能 Force Restore 到当前 path, 因为 Git path identity 不证明 Unreal package identity。
 - LFS miss 在多 remote 且无 current branch upstream 时失败。
+- Git 缺失或低于 2.53.0 时 startup gate 为 `Unavailable`, 资产右键菜单仍保持可见但点击只显示诊断, 面板入口只显示诊断; 安装/升级后不重启不会重新探测.
+- Git LFS 缺失、低于 3.7.1 或瞬时检查失败时当前 LFS 操作失败且不缓存失败结果, 下一次显式 LFS 操作重试, 无需重启 Editor; 普通 Changed Assets 不受影响.
 - 插件不提供 precompiled binary, 构建需要项目 Unreal Editor target 和可用 C++ toolchain。
 
 ## Attribution and license

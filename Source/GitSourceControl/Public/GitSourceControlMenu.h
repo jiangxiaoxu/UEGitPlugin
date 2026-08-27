@@ -29,4 +29,5 @@ private:
 
 	FDelegateHandle AssetMenuExtenderHandle;
 	TSharedPtr<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe> LifetimeState;
+	bool bRegistered = false;
 };

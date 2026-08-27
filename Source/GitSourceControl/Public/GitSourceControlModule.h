@@ -15,6 +15,12 @@ class FExtender;
 class FGitChangedAssetsController;
 class FGitSourceControlStatusBarIntegration;
 class SDockTab;
+class FEvent;
+class FGitSourceControlStartupProbeState;
+namespace GitSourceControlUtils
+{
+	class FGitOperationCancellationContext;
+}
 
 /**
  * Standalone local Git asset tools for Unreal Editor.
@@ -48,9 +54,15 @@ private:
 	TSharedPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> ChangedAssetsController;
 	TSharedPtr<FGitSourceControlStatusBarIntegration, ESPMode::ThreadSafe> StatusBarIntegration;
 
-	void RegisterMenus();
+	void RegisterStatusBarIntegration();
 	TSharedRef<SDockTab> SpawnChangedAssetsTab(const class FSpawnTabArgs& SpawnTabArgs);
 	void OpenChangedAssetsTab();
+	void BeginStartupGitCapabilityProbe();
+	void HandleStartupGitCapabilityCompleted();
+	void ShowStartupGitCapabilityDialog() const;
 	void HandlePreExit();
 	FDelegateHandle PreExitHandle;
+	TSharedPtr<FGitSourceControlStartupProbeState, ESPMode::ThreadSafe> StartupProbeState;
+	TSharedPtr<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe> StartupProbeCancellation;
+	FEvent* StartupProbeCompletedEvent = nullptr;
 };

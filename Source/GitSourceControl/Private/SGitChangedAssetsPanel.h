@@ -57,6 +57,7 @@ private:
 	FReply HandleRefreshClicked();
 	FReply HandleCopyPathsClicked();
 	FReply HandleRevertClicked();
+	bool IsStartupGitCapabilityAvailable() const;
 	bool HasSelection() const;
 	bool CanRevertSelection() const;
 
@@ -84,6 +85,7 @@ private:
 	FEntryPtr SelectionAnchor;
 	bool bApplyingListSelection = false;
 	bool bUpdatingOwnerOptions = false;
+	bool bInitialRefreshRequested = false;
 	TArray<TSharedPtr<FString>> StatusOptions;
 	TArray<TSharedPtr<FString>> KindOptions;
 	TArray<TSharedPtr<FString>> OwnerOptions;

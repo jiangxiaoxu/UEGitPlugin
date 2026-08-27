@@ -347,6 +347,12 @@ void FGitChangedAssetsController::Refresh(const bool bClearPreviousError)
 	{
 		return;
 	}
+	if (!GitSourceControlUtils::IsStartupGitCapabilityAvailable())
+	{
+		LastError = GitSourceControlUtils::GetStartupGitCapabilityMessage().ToString();
+		ChangedDelegate.Broadcast();
+		return;
+	}
 
 	ClearPendingHeadMetadata();
 	bRefreshing = true;
@@ -424,6 +430,17 @@ void FGitChangedAssetsController::Shutdown()
 	Snapshot.Reset();
 }
 
+void FGitChangedAssetsController::HandleStartupGitCapabilityChanged()
+{
+	check(IsInGameThread());
+	if (bShuttingDown.Load())
+	{
+		return;
+	}
+	LastError.Empty();
+	ChangedDelegate.Broadcast();
+}
+
 bool FGitChangedAssetsController::IsRefreshing() const
 {
 	return bRefreshing;
@@ -452,7 +469,17 @@ const FDateTime& FGitChangedAssetsController::GetLastSuccessfulRefreshTime() con
 void FGitChangedAssetsController::RevertToHead(TArray<FGitChangedAssetEntry> Entries)
 {
 	check(IsInGameThread());
-	if (bShuttingDown.Load() || bRefreshing || bReverting || !Snapshot.IsSet() || Entries.IsEmpty())
+	if (bShuttingDown.Load() || bRefreshing || bReverting)
+	{
+		return;
+	}
+	if (!GitSourceControlUtils::IsStartupGitCapabilityAvailable())
+	{
+		LastError = GitSourceControlUtils::GetStartupGitCapabilityMessage().ToString();
+		ChangedDelegate.Broadcast();
+		return;
+	}
+	if (!Snapshot.IsSet() || Entries.IsEmpty())
 	{
 		return;
 	}

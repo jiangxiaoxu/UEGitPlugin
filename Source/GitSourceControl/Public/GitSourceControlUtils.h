@@ -63,6 +63,25 @@ struct GITSOURCECONTROL_API FGitIndexSnapshot
 
 namespace GitSourceControlUtils
 {
+	/** Frozen outcome of the single Git executable probe performed when the plugin starts. */
+	enum class EGitStartupCapabilityState : uint8
+	{
+		Pending,
+		Available,
+		Unavailable,
+	};
+
+	/**
+	 * Session-scoped Git executable capability. The result never re-runs discovery:
+	 * install, removal, or upgrade requires an Editor restart.
+	 */
+	struct GITSOURCECONTROL_API FGitStartupCapability
+	{
+		EGitStartupCapabilityState State = EGitStartupCapabilityState::Unavailable;
+		FString GitBinary;
+		FString Diagnostic;
+	};
+
 	/** 跨 UI 和 worker 传递的取消边界. 只读和网络 Git 工作可在任意时刻取消. */
 	class GITSOURCECONTROL_API FGitOperationCancellationContext final
 	{
@@ -92,6 +111,24 @@ namespace GitSourceControlUtils
 		TSharedPtr<FGitOperationCancellationContext, ESPMode::ThreadSafe> PreviousContext;
 	};
 
+	/** Mark the session capability as pending before the module launches its one startup probe. Returns false after the one-shot probe has begun. */
+	GITSOURCECONTROL_API bool BeginStartupGitCapabilityProbe();
+
+	/** Run Git executable discovery/version validation off the GameThread. */
+	GITSOURCECONTROL_API FGitStartupCapability ProbeStartupGitCapability();
+
+	/** Freeze the pending capability with the completed startup probe result. */
+	GITSOURCECONTROL_API void CompleteStartupGitCapabilityProbe(FGitStartupCapability InCapability);
+
+	/** Return the immutable session capability snapshot. */
+	GITSOURCECONTROL_API FGitStartupCapability GetStartupGitCapability();
+
+	/** True only when the startup probe found Git 2.53.0 or newer. */
+	GITSOURCECONTROL_API bool IsStartupGitCapabilityAvailable();
+
+	/** User-facing explanation for Pending/Unavailable capability states. */
+	GITSOURCECONTROL_API FText GetStartupGitCapabilityMessage();
+
 	/**
 		*  Returns an updated repo root if all selected files are in a plugin subfolder, and the plugin subfolder is a git repo
 		*  This supports the case where each plugin is a sub module
@@ -110,10 +147,7 @@ namespace GitSourceControlUtils
 		*/
 	FString ChangeRepositoryRootIfSubmodule(FString & AbsoluteFilePath, const FString& PathToRepositoryRoot);
 
-/**
- * Find and cache a supported Git release (2.53.0+) from standalone installs and common bundled locations.
- * @returns the verified path to the Git binary if found, or an empty string.
- */
+/** Return the Git binary from the frozen startup capability snapshot, if available. Never performs discovery. */
 GITSOURCECONTROL_API FString FindGitBinaryPath();
 
 /** Resolve a local Git executable and repository root for one explicit workspace file. */
@@ -234,6 +268,8 @@ GITSOURCECONTROL_API bool DumpRevisionBlobToFile(const FString& InPathToGitBinar
 		GITSOURCECONTROL_API uint64 GetGitLfsFetchLaunchCount();
 		GITSOURCECONTROL_API uint64 GetGitProcessLaunchCountAtModuleStartup();
 		GITSOURCECONTROL_API void CaptureGitProcessLaunchCountAtModuleStartup();
+		GITSOURCECONTROL_API uint32 GetStartupGitCapabilityProbeCount();
+		GITSOURCECONTROL_API void SetStartupGitCapabilityForTesting(const FGitStartupCapability& InCapability);
 		GITSOURCECONTROL_API bool LoadStandaloneHistory(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InFilename,
 			EGitLocalSourceControlHistoryMode InMode, FString& OutCapturedHead, bool& bOutHeadChanged, TArray<FGitStandaloneHistoryTestEntry>& OutHistory, FString& OutError);
 		GITSOURCECONTROL_API bool ExportStandaloneRevisionForDiff(const FString& InGitBinary, const FString& InRepositoryRoot,

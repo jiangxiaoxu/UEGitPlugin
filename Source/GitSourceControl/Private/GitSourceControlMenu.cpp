@@ -820,7 +820,6 @@ private:
 
 namespace GitSourceControlMenuPrivate
 {
-
 	void AddUniquePath(TArray<FString>& InOutFiles, FString Filename)
 	{
 		Filename = FPaths::ConvertRelativePathToFull(Filename);
@@ -883,6 +882,29 @@ namespace GitSourceControlMenuPrivate
 	{
 		UE_LOG(LogGitStandalone, Warning, TEXT("%s"), *Text.ToString());
 		ShowNotification(Text, false);
+	}
+
+	bool CheckGitActionExecutionCapability(FText& OutUnavailableMessage)
+	{
+		OutUnavailableMessage = FText::GetEmpty();
+		if (GitSourceControlUtils::IsStartupGitCapabilityAvailable())
+		{
+			return true;
+		}
+		OutUnavailableMessage = GitSourceControlUtils::GetStartupGitCapabilityMessage();
+		return false;
+	}
+
+	bool GuardGitActionExecution()
+	{
+		FText UnavailableMessage;
+		if (CheckGitActionExecutionCapability(UnavailableMessage))
+		{
+			return true;
+		}
+		FMessageDialog::Open(EAppMsgType::Ok, UnavailableMessage,
+			LOCTEXT("GitActionCapabilityUnavailableTitle", "Git (Local) Unavailable"));
+		return false;
 	}
 
 	TArray<UPackage*> GatherLoadedPackages(const TArray<FString>& Files, const bool bIncludeConservativeDirtyWorlds = false)
@@ -1750,7 +1772,7 @@ namespace GitSourceControlMenuPrivate
 
 void FGitSourceControlMenu::Register()
 {
-	if (FApp::IsUnattended() || IsRunningCommandlet())
+	if (bRegistered || FApp::IsUnattended() || IsRunningCommandlet())
 	{
 		return;
 	}
@@ -1760,10 +1782,15 @@ void FGitSourceControlMenu::Register()
 	TArray<FContentBrowserMenuExtender_SelectedAssets>& Extenders = ContentBrowserModule.GetAllAssetViewContextMenuExtenders();
 	Extenders.Add(FContentBrowserMenuExtender_SelectedAssets::CreateRaw(this, &FGitSourceControlMenu::OnExtendContentBrowserAssetSelectionMenu));
 	AssetMenuExtenderHandle = Extenders.Last().GetHandle();
+	bRegistered = true;
 }
 
 void FGitSourceControlMenu::Unregister()
 {
+	if (!bRegistered)
+	{
+		return;
+	}
 	if (LifetimeState.IsValid())
 	{
 		LifetimeState->StopAcceptingAndWait();
@@ -1777,6 +1804,8 @@ void FGitSourceControlMenu::Unregister()
 			return Delegate.GetHandle() == Handle;
 		});
 	}
+	AssetMenuExtenderHandle.Reset();
+	bRegistered = false;
 }
 
 TSharedRef<FExtender> FGitSourceControlMenu::OnExtendContentBrowserAssetSelectionMenu(const TArray<FAssetData>& SelectedAssets)
@@ -1818,6 +1847,10 @@ void FGitSourceControlMenu::AddAssetMenuEntries(FMenuBuilder& MenuBuilder, const
 
 void FGitSourceControlMenu::ViewSelectedAssetHistory(TArray<FAssetData> SelectedAssets, const EGitLocalSourceControlHistoryMode Mode)
 {
+	if (!GitSourceControlMenuPrivate::GuardGitActionExecution())
+	{
+		return;
+	}
 	if (!LifetimeState.IsValid() || !LifetimeState->IsAcceptingCallbacks())
 	{
 		return;
@@ -1834,6 +1867,10 @@ void FGitSourceControlMenu::ViewSelectedAssetHistory(TArray<FAssetData> Selected
 
 void FGitSourceControlMenu::DiscardSelectedAssets(TArray<FAssetData> SelectedAssets)
 {
+	if (!GitSourceControlMenuPrivate::GuardGitActionExecution())
+	{
+		return;
+	}
 	if (!LifetimeState.IsValid() || !LifetimeState->IsAcceptingCallbacks())
 	{
 		return;
@@ -1855,12 +1892,44 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStandaloneUAssetMenuScopeTest, "Cthulhu.Git
 
 bool FGitStandaloneUAssetMenuScopeTest::RunTest(const FString& Parameters)
 {
+	(void)Parameters;
 	const TArray<FString> Files = { TEXT("Content/Example.uasset"), TEXT("Content/Example.umap"), TEXT("Content/Example.txt") };
 	const TArray<FString> PackageFiles = GitSourceControlMenuPrivate::GetPrimaryPackageFiles(Files);
 	TestEqual(TEXT("Only .uasset files are eligible for standalone Git menu actions"), PackageFiles.Num(), 1);
 	TestTrue(TEXT("The .uasset path remains eligible"), PackageFiles.Contains(TEXT("Content/Example.uasset")));
 	TestFalse(TEXT("The future .umap scope is not exposed"), PackageFiles.Contains(TEXT("Content/Example.umap")));
-	return true;
+
+	const GitSourceControlUtils::FGitStartupCapability SavedCapability = GitSourceControlUtils::GetStartupGitCapability();
+	ON_SCOPE_EXIT
+	{
+		GitSourceControlUtils::Testing::SetStartupGitCapabilityForTesting(SavedCapability);
+	};
+	GitSourceControlUtils::FGitStartupCapability PendingCapability;
+	PendingCapability.State = GitSourceControlUtils::EGitStartupCapabilityState::Pending;
+	PendingCapability.Diagnostic = TEXT("Checking for Git 2.53.0 or newer...");
+	GitSourceControlUtils::Testing::SetStartupGitCapabilityForTesting(PendingCapability);
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	FText CapabilityMessage;
+	TestFalse(TEXT("Pending startup capability blocks a clickable Content Browser Git action"),
+		GitSourceControlMenuPrivate::CheckGitActionExecutionCapability(CapabilityMessage));
+	TestTrue(TEXT("Pending Git action explains that the startup check is still running"), CapabilityMessage.ToString().Contains(TEXT("Checking for Git")));
+	TestEqual(TEXT("Pending Content Browser Git action starts no Git process"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount(), static_cast<uint64>(0));
+	TestEqual(TEXT("Pending startup capability keeps the .uasset action scope present"),
+		GitSourceControlMenuPrivate::GetPrimaryPackageFiles(Files).Num(), 1);
+	GitSourceControlUtils::FGitStartupCapability UnavailableCapability;
+	UnavailableCapability.State = GitSourceControlUtils::EGitStartupCapabilityState::Unavailable;
+	UnavailableCapability.Diagnostic = TEXT("Detected Git executable: C:/Tools/Git/bin/git.exe\nDetected version: git version 2.42.0\nGit 2.53.0 or a newer release is required. Install or upgrade Git, then restart the Editor.");
+	GitSourceControlUtils::Testing::SetStartupGitCapabilityForTesting(UnavailableCapability);
+	CapabilityMessage = FText::GetEmpty();
+	TestFalse(TEXT("Unavailable startup capability blocks a clickable Content Browser Git action"),
+		GitSourceControlMenuPrivate::CheckGitActionExecutionCapability(CapabilityMessage));
+	TestTrue(TEXT("Unavailable Git action preserves the detected path, required version, and restart guidance"),
+		CapabilityMessage.ToString().Contains(TEXT("C:/Tools/Git/bin/git.exe"))
+		&& CapabilityMessage.ToString().Contains(TEXT("Git 2.53.0"))
+		&& CapabilityMessage.ToString().Contains(TEXT("restart the Editor")));
+	TestEqual(TEXT("Unavailable Content Browser Git action starts no Git process"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount(), static_cast<uint64>(0));
+	return TestEqual(TEXT("Unavailable startup capability keeps the .uasset action scope present"),
+		GitSourceControlMenuPrivate::GetPrimaryPackageFiles(Files).Num(), 1);
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStandaloneMutationShutdownPhaseTest, "Cthulhu.GitSourceControl.Standalone.MutationShutdownPhase",

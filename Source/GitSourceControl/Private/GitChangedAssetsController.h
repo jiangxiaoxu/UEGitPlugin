@@ -32,6 +32,9 @@ public:
 	/** Cancels delivery of outstanding work and releases the current snapshot. Must run on the GameThread. */
 	void Shutdown();
 
+	/** Notify bound panels that the frozen startup Git capability reached its terminal state. */
+	void HandleStartupGitCapabilityChanged();
+
 	bool IsRefreshing() const;
 	bool IsReverting() const;
 	const FGitChangedAssetSnapshot* GetSnapshot() const;

@@ -1,18 +1,19 @@
 # Standalone Asset Workflow
 
-本文档描述 `GitSourceControl` 在 Unreal Editor 中的用户行为。插件不接入 Unreal Source Control provider, 所有 Git 操作都必须由用户显式触发。
+本文档描述 `GitSourceControl` 在 Unreal Editor 中的用户行为。插件不接入 Unreal Source Control provider. 模块启动后会异步执行一次 Git 2.53.0+ capability gate; 除此之外, 所有 repository Git 操作都必须由用户显式触发.
 
 ## 支持范围
 
 - 当前所有 Git actions 只处理单个 `.uasset` 文件. 支持普通资产, Blueprint, Animation, DataAsset, Plugin Content 以及 OFPA external actor/object 的 `.uasset`.
 - `.umap`, `.uexp`, `.ubulk`, `.uptnl`, `.upayload` 等 sidecar 或其他 package 不在本期范围, 不参与 Changed Assets 或 Revert.
-- Content Browser 只有选中 `.uasset` 时才显示 `Git (Local)` 菜单区; 选中 `.umap` 或其他文件不会显示 Git actions。
+- Content Browser 选中 `.uasset` 时始终显示 `Git (Local)` 菜单区以保持 discoverability; `Pending` 或 `Unavailable` 时点击 action 只显示 startup capability diagnostic 且不执行 Git, `Available` 时才执行 action. 选中 `.umap` 或其他文件不会显示 Git actions.
+- Level Editor 右下角状态栏和已打开的 Git Changes 面板在 gate `Pending`/`Unavailable` 时保留入口用于说明状态, 但按钮和列表交互均禁用. Git Changes 用户入口仅为 Level Editor 右下角状态栏的替换 Source Control 按钮; layout restore 或 programmatic tab invocation 仍受 gate 约束. 点击会显示包含安装、升级和重启 Editor 指引的诊断, 不会启动 Git job.
 - 插件不会把 Unreal asset identity 当成 Git rename identity。跨 rename 只表示 Git 能证明的路径移动。
 - remote、branch、commit、merge、push、pull、conflict resolution 和 asset delete 由外部 Git client 负责。
 
 ## Changed Assets
 
-1. 点击 Level Editor 状态栏的 `Git Changes`, 或从 `Window` 菜单打开同名 Tab. 状态栏仍保留 Unsaved Assets 指示, 原生 Revision Control/check-in 控件由该直达按钮替代. 面板先显示当前 snapshot 或 loading 状态; repository-wide `git status --porcelain=v2 -z` 只在打开, 用户点击 `Refresh` 或操作完成后显式启动, 并在 worker 上运行.
+1. 当 startup gate 为 `Available` 时, 点击 Level Editor 右下角状态栏替换默认 Source Control 控件的 `Git Changes` 按钮. 状态栏仍保留 Unsaved Assets 指示. 面板先显示当前 snapshot 或 loading 状态; repository-wide `git status --porcelain=v2 -z` 只在打开, 用户点击 `Refresh` 或操作完成后显式启动, 并在 worker 上运行. gate 为 `Pending`/`Unavailable` 时点击只显示 actionable diagnostic, 面板不执行 Git 操作.
 2. 列表按固定 `HEAD` 汇总每个变更 `.uasset` 的总体状态: `Modified`, `Deleted`, `Added`, `Untracked`, `Renamed` 或 `Conflicted`. 同一路径 staged 与 unstaged 改动合并显示, 不提供 staging/unstaging 操作.
 3. 每行显示友好名称, 所属关卡, asset/object path, 类型和状态; 原始 Git path 仅在详情或 Tooltip 中显示. 普通资产使用 Asset Registry, OFPA 使用 actor descriptor metadata. owner 无法唯一解析的行仍可查看, 但 Revert 会禁用.
 4. 普通单击或 Ctrl+单击会切换单行选择并保留其他选择; Shift 选择当前过滤结果中的连续范围, Ctrl+Shift 追加范围. checkbox 与行高亮使用同一选择状态. 不可回退行可以被选中, 但混合选择会按 all-or-nothing 规则禁用整批 Revert.
@@ -61,7 +62,9 @@ History window 提供三种 Diff:
 
 ## Git LFS
 
-History 查询只读取 commit metadata。Diff、Restore、Fetch 或 Discard 需要 blob 时按以下顺序处理:
+History 查询只读取 commit metadata. Git LFS 3.7.1+ capability 只在首次确实需要 LFS object 的 Diff、Restore、Fetch 或 Discard 中 lazy 检查, 只缓存成功结果; 普通 Changed Assets 不触发 LFS probe. 缺失、版本过低或瞬时检查失败时当前动作在 mutation 前失败, 下次显式 LFS 动作会重试, 无需重启 Editor.
+
+通过 LFS gate 后, Diff、Restore、Fetch 或 Discard 需要 blob 时按以下顺序处理:
 
 1. 先验证本地 LFS object 的 OID 和 size; cache hit 不访问网络。
 2. cache miss 时, 只 fetch 目标 commit + historical path 对应的 LFS object, 完成后再次验证。
@@ -72,13 +75,16 @@ LFS 下载显示可取消进度。取消或失败不会进入 asset mutation。
 
 ## 异步、取消与关闭
 
-启动插件、浏览 Content Browser、create/move/copy/save/rename/delete asset 都不会执行 Git。显式操作才会创建异步 job; Git/LFS I/O 在 worker, Slate 和 asset/package 操作在 Game Thread。
+启动插件会执行一次异步 Git executable/version gate, 但不会执行 repository status. 浏览 Content Browser、create/move/copy/save/rename/delete asset 都不会执行额外 Git. 仅在 gate `Available` 后的显式操作才会创建异步 job; Git/LFS I/O 在 worker, Slate 和 asset/package 操作在 Game Thread. Git 安装或升级后需重启 Editor, 当前 session 不会自动重探.
 
 关闭 History window 会取消未完成的 read-only job。模块 shutdown 会取消并等待 read-only/network job; 已跨过 mutation commit point 的 Restore/Discard 必须完成或 rollback, 不能被中途取消。
 
 ## 常见错误
 
 - `Git executable or repository not found`: 当前选中的 asset 不在可识别的 Git repository, 或 Editor process `PATH` 找不到 Git。
+- `Git capability is pending`: 插件仍在执行启动时的 Git 检查. 稍候重试; 不会重复启动检查.
+- `Git 2.53.0 or newer is required`: Git 缺失或版本过低. 安装/升级 Git 后重启 Editor.
+- `Git LFS 3.7.1 or newer is required`: 当前操作需要 LFS object, 但 Git LFS 缺失或版本过低. 安装/升级 Git LFS 后重试当前或下一次显式 LFS 操作, 无需重启 Editor.
 - `History is empty`: 当前 path 在捕获的 `HEAD` 中没有 commit, 或 exact rename 链在 Git 规则边界停止。
 - `LFS remote is ambiguous`: 多个 remote 且当前 branch 没有 upstream, 需在外部 Git client 配置 upstream。
 - `Unable to load asset for Diff`: revision 不是可加载的 `.uasset`, 或当前 Editor asset type 不支持该 Diff。

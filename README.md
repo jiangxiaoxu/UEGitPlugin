@@ -1,6 +1,6 @@
 # Unreal Engine Git Plugin
 
-`GitSourceControl` 是 Unreal Editor 的 standalone local Git asset tool. 它不注册 Unreal `ISourceControlProvider`, 不维护 Content Browser 状态徽标, 也不参与 Engine asset lifecycle. 启动, 静置和普通 create/move/copy/save/rename/delete 不执行 Git; 用户显式触发 Changed Assets, History, Diff, LFS Fetch, Force Restore 或 Discard 后才创建异步 job.
+`GitSourceControl` 是 Unreal Editor 的 standalone local Git asset tool. 它不注册 Unreal `ISourceControlProvider`, 不维护 Content Browser 状态徽标, 也不参与 Engine asset lifecycle. 模块启动后会异步执行一次 Git executable 与版本门禁检查, 只验证 Git 是否可用且版本为 2.53.0 或更高, 不探测 repository 状态. Content Browser 资产右键菜单始终注册以保持 discoverability; 门禁为 `Pending` 或 `Unavailable` 时点击只显示可操作的诊断并禁止 Git 交互, `Available` 时才执行 Git action. Level Editor 状态栏和 Git Changes 面板在门禁未通过时同样禁止交互. 普通 create/move/copy/save/rename/delete 仍不执行 Git.
 
 ## 文档
 
@@ -11,7 +11,8 @@
 ## 当前能力
 
 - `Git Changes` 提供项目级 `.uasset` 变更列表, 汇总相对固定 `HEAD` 的 Modified, Deleted, Added, Untracked, Renamed 和 Conflicted 状态, 并显示资产名, 所属关卡, object path 与类型. staged 与 unstaged 合并显示, 不提供 staging/unstaging.
-- Level Editor 状态栏保留 Unsaved Assets 指示, 并以 `Git Changes` 直达按钮替换原生 Revision Control/check-in 控件; `Window` 菜单仍保留同名入口.
+- Level Editor 右下角状态栏保留 Unsaved Assets 指示, 并以 `Git Changes` 直达按钮替换默认 Source Control 控件. 这是 Git Changes 的唯一用户入口; layout restore 或 programmatic tab invocation 仍受 Git executable 门禁约束.
+- Git executable 门禁状态为 `Pending`, `Available` 或 `Unavailable`. Content Browser 的 Git 资产菜单始终可见以便发现; `Pending`/`Unavailable` 时点击只显示诊断, `Available` 时才执行 action. 状态栏和面板入口保持可见以便给出诊断, 但门禁未通过时不会启动 refresh 或 mutation.
 - Changed Assets 的 `Revert to HEAD` 同时清除所选 `.uasset` 的 staged 与 worktree 改动: tracked 修改/删除恢复 HEAD, Added/Untracked 精确删除, Rename 原子恢复, Conflict 或 OFPA owner unresolved 禁用. `.umap`, `.uexp`, `.ubulk`, `.uptnl`, `.upayload` 和其他非 `.uasset` package 不在本期范围.
 - OFPA 行优先使用 Asset Registry `OptionalOuterPath`/actor descriptor 解析友好名称与所属关卡; dirty owner map 或无法唯一解析 owner 时禁止 Revert.
 - Changed Assets 刷新是显式, 准确, 异步的一次性 repository status 查询, 不使用 DirectoryWatcher, 后台轮询或跨刷新 status cache.
@@ -28,7 +29,7 @@ branch、remote、commit、merge、push、pull、conflict resolution、asset del
 
 ## 安装与验证
 
-将插件放入项目 `Plugins/` 或 Engine `Plugins/` 后, 使用项目 Unreal Editor target 构建。Git 从显式操作开始时的 Editor process `PATH` 解析, module startup 不执行 Git probe。
+将插件放入项目 `Plugins/` 或 Engine `Plugins/` 后, 使用项目 Unreal Editor target 构建. 插件启动时异步检查 Editor process `PATH` 中的 Git executable 与最低版本 2.53.0, 每个 Editor session 只检查一次. 安装或升级 Git 后重启 Editor 才会重新探测; 不在运行中自动重探.
 
 ```text
 npm run build:regular
@@ -36,7 +37,7 @@ npm run test:unreal:automation -- Cthulhu.GitSourceControl
 npm run as:diagnostics
 ```
 
-插件需要可执行的 Git; 使用 Git LFS 的项目还需要 Git LFS 能通过该 Git executable 访问本地 object store。插件不提供 Git、Git LFS 或预编译 binary。
+插件需要 Git 2.53.0 或更新版本. 使用 Git LFS 的项目还需要 Git LFS 3.7.1 或更新版本; LFS capability 只在首次确实需要 LFS object 的显式操作时 lazy 检查, 只缓存成功的 3.7.1+ 结果, 不阻塞普通 Git Changes. 缺失、版本过低或瞬时检查失败只使当前 LFS 动作失败, 下次显式 LFS 动作会重试, 无需重启 Editor. 插件不提供 Git、Git LFS 或预编译 binary.
 
 ## Attribution and license
 

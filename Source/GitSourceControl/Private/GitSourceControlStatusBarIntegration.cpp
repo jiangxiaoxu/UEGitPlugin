@@ -2,6 +2,7 @@
 
 #include "GitSourceControlStatusBarIntegration.h"
 
+#include "GitSourceControlUtils.h"
 #include "ToolMenu.h"
 #include "ToolMenuContext.h"
 #include "ToolMenuEntry.h"
@@ -47,7 +48,12 @@ namespace GitSourceControlStatusBarIntegrationPrivate
 				SNew(SButton)
 				.ButtonStyle(FAppStyle::Get(), "SimpleButton")
 				.ContentPadding(FMargin(6.0f, 0.0f))
-				.ToolTipText(LOCTEXT("ChangedAssetsStatusBarTooltip", "Open Git Changes"))
+				.ToolTipText_Lambda([]()
+				{
+					return GitSourceControlUtils::IsStartupGitCapabilityAvailable()
+						? LOCTEXT("ChangedAssetsStatusBarTooltip", "Open Git Changes")
+						: GitSourceControlUtils::GetStartupGitCapabilityMessage();
+				})
 				.OnClicked_Lambda([OpenChangedAssets]()
 				{
 					OpenChangedAssets.ExecuteIfBound();
@@ -206,7 +212,9 @@ bool FGitSourceControlStatusBarIntegration::TryReplaceEntry()
 			true,
 			false,
 			false,
-			LOCTEXT("ChangedAssetsStatusBarEntryTooltip", "Open Git Changes"));
+			GitSourceControlUtils::IsStartupGitCapabilityAvailable()
+				? LOCTEXT("ChangedAssetsStatusBarEntryTooltip", "Open Git Changes")
+				: GitSourceControlUtils::GetStartupGitCapabilityMessage());
 		Section->Blocks[SourceControlIndex] = MoveTemp(Replacement);
 	}
 	return true;
