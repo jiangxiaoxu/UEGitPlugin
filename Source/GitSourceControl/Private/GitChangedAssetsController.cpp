@@ -6,12 +6,14 @@
 #include "GitChangedAssetsMetadata.h"
 #include "GitChangedAssetsStatus.h"
 #include "GitSourceControlUtils.h"
+#include "GitStandaloneLog.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Async/Async.h"
 #include "Containers/Ticker.h"
 #include "Editor.h"
 #include "HAL/CriticalSection.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/MessageDialog.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
@@ -20,6 +22,9 @@
 
 namespace GitChangedAssetsControllerPrivate
 {
+	constexpr int32 HeadMetadataApplyMaxResultsPerTick = 8;
+	constexpr double HeadMetadataApplyTimeBudgetSeconds = 0.003;
+
 	class FGameThreadDispatcher final : public TSharedFromThis<FGameThreadDispatcher, ESPMode::ThreadSafe>
 	{
 	public:
@@ -343,6 +348,7 @@ void FGitChangedAssetsController::Refresh(const bool bClearPreviousError)
 		return;
 	}
 
+	ClearPendingHeadMetadata();
 	bRefreshing = true;
 	bPreserveLastErrorForRefresh = !bClearPreviousError;
 	if (bClearPreviousError)
@@ -400,6 +406,7 @@ void FGitChangedAssetsController::Shutdown()
 	{
 		return;
 	}
+	ClearPendingHeadMetadata();
 	++Generation;
 	WorkerState->StopAccepting();
 	WorkerState->CancelCancellableWorkers();
@@ -527,7 +534,10 @@ void FGitChangedAssetsController::RevertToHead(TArray<FGitChangedAssetEntry> Ent
 				const bool bFinished = Lifecycle->Finish(CallbackEntries, AffectedFiles, Outcome, OutError);
 				if (Outcome == GitChangedAssetOperations::EGitChangedAssetMutationOutcome::Succeeded)
 				{
+					const double AssetRegistryStartSeconds = FPlatformTime::Seconds();
 					IAssetRegistry::GetChecked().ScanModifiedAssetFiles(AffectedFiles);
+					UE_LOG(LogGitStandalone, Log, TEXT("Changed Assets Revert Asset Registry refresh: files=%d elapsed=%.3fs"),
+						AffectedFiles.Num(), FPlatformTime::Seconds() - AssetRegistryStartSeconds);
 					FEditorDelegates::RefreshAllBrowsers.Broadcast();
 				}
 				return bFinished;
@@ -568,9 +578,21 @@ void FGitChangedAssetsController::CompleteRefresh(const uint64 CompletedGenerati
 	bPreserveLastErrorForRefresh = false;
 	if (!CompletedSnapshot.IsValid())
 	{
+		if (PostRevertStatusRefreshStartSeconds > 0.0)
+		{
+			UE_LOG(LogGitStandalone, Warning, TEXT("Changed Assets Revert full Git status refresh failed after %.3fs"),
+				FPlatformTime::Seconds() - PostRevertStatusRefreshStartSeconds);
+			PostRevertStatusRefreshStartSeconds = 0.0;
+		}
 		LastError = Error.IsEmpty() ? TEXT("Git Changes refresh failed without a diagnostic.") : MoveTemp(Error);
 		ChangedDelegate.Broadcast();
 		return;
+	}
+	if (PostRevertStatusRefreshStartSeconds > 0.0)
+	{
+		UE_LOG(LogGitStandalone, Log, TEXT("Changed Assets Revert full Git status refresh: entries=%d elapsed=%.3fs"),
+			CompletedSnapshot->Entries.Num(), FPlatformTime::Seconds() - PostRevertStatusRefreshStartSeconds);
+		PostRevertStatusRefreshStartSeconds = 0.0;
 	}
 
 	LastSuccessfulRefreshTime = FDateTime::UtcNow();
@@ -597,7 +619,8 @@ void FGitChangedAssetsController::CompleteCurrentMetadata(const uint64 Completed
 
 	const bool bNeedsHeadMetadata = Snapshot->Entries.ContainsByPredicate([](const FGitChangedAssetEntry& Entry)
 	{
-		return Entry.State == EGitChangedAssetState::Deleted && !Entry.bMetadataResolved;
+		return Entry.State == EGitChangedAssetState::Deleted ||
+			(Entry.State == EGitChangedAssetState::Renamed && !Entry.bMetadataResolved && !FPaths::FileExists(Entry.AbsoluteFilename));
 	});
 	if (!bNeedsHeadMetadata)
 	{
@@ -653,7 +676,90 @@ void FGitChangedAssetsController::CompleteHeadMetadata(const uint64 CompletedGen
 	{
 		return;
 	}
-	FGitChangedAssetsMetadataResolver::ApplyHeadOnlyMetadata(*CompletedSnapshot, Results);
+	ClearPendingHeadMetadata();
+	FPendingHeadMetadataApply& Pending = PendingHeadMetadataApply.Emplace();
+	Pending.Generation = CompletedGeneration;
+	Pending.Snapshot = MoveTemp(CompletedSnapshot);
+	Pending.Results = MoveTemp(Results);
+	Pending.Error = MoveTemp(Error);
+
+	const TWeakPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> WeakController = AsShared();
+	if (!GameThreadDispatcher->Post([WeakController, CompletedGeneration]()
+	{
+		if (const TSharedPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> Controller = WeakController.Pin())
+		{
+			Controller->ApplyPendingHeadMetadata(CompletedGeneration);
+		}
+		return true;
+	}))
+	{
+		ClearPendingHeadMetadata();
+	}
+	return;
+}
+
+void FGitChangedAssetsController::ApplyPendingHeadMetadata(const uint64 PendingGeneration)
+{
+	check(IsInGameThread());
+	if (bShuttingDown.Load() || PendingGeneration != Generation || !PendingHeadMetadataApply.IsSet() ||
+		PendingHeadMetadataApply->Generation != PendingGeneration || !PendingHeadMetadataApply->Snapshot.IsValid())
+	{
+		ClearPendingHeadMetadata();
+		return;
+	}
+
+	FPendingHeadMetadataApply& Pending = PendingHeadMetadataApply.GetValue();
+	const double BeginSeconds = FPlatformTime::Seconds();
+	int32 ProcessedResultCount = 0;
+	while (Pending.NextResultIndex < Pending.Results.Num() && ProcessedResultCount < GitChangedAssetsControllerPrivate::HeadMetadataApplyMaxResultsPerTick)
+	{
+		if (ProcessedResultCount > 0 && FPlatformTime::Seconds() - BeginSeconds >= GitChangedAssetsControllerPrivate::HeadMetadataApplyTimeBudgetSeconds)
+		{
+			break;
+		}
+		const int32 AppliedCount = FGitChangedAssetsMetadataResolver::ApplyHeadOnlyMetadataRange(*Pending.Snapshot, Pending.Results,
+			Pending.NextResultIndex, 1);
+		if (AppliedCount != 1)
+		{
+			Pending.NextResultIndex = Pending.Results.Num();
+			break;
+		}
+		Pending.NextResultIndex += AppliedCount;
+		++ProcessedResultCount;
+		if (bShuttingDown.Load() || PendingGeneration != Generation || PendingHeadMetadataApply->Generation != PendingGeneration)
+		{
+			ClearPendingHeadMetadata();
+			return;
+		}
+	}
+
+	if (Pending.NextResultIndex < Pending.Results.Num())
+	{
+		const TWeakPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> WeakController = AsShared();
+		if (!GameThreadDispatcher->Post([WeakController, PendingGeneration]()
+		{
+			if (const TSharedPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> Controller = WeakController.Pin())
+			{
+				Controller->ApplyPendingHeadMetadata(PendingGeneration);
+			}
+			return true;
+		}))
+		{
+			ClearPendingHeadMetadata();
+		}
+		return;
+	}
+
+	if (bShuttingDown.Load() || PendingGeneration != Generation || PendingHeadMetadataApply->Generation != PendingGeneration)
+	{
+		ClearPendingHeadMetadata();
+		return;
+	}
+
+	FGitChangedAssetsMetadataResolver::FinalizeHeadOnlyMetadata(*Pending.Snapshot);
+	TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> CompletedSnapshot = MoveTemp(Pending.Snapshot);
+	FString Error = MoveTemp(Pending.Error);
+	ClearPendingHeadMetadata();
 	Snapshot = MoveTemp(*CompletedSnapshot);
 	if (!Error.IsEmpty())
 	{
@@ -661,14 +767,19 @@ void FGitChangedAssetsController::CompleteHeadMetadata(const uint64 CompletedGen
 	}
 	ChangedDelegate.Broadcast();
 	const TWeakPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> WeakController = AsShared();
-	GameThreadDispatcher->Post([WeakController, CompletedGeneration]()
+	GameThreadDispatcher->Post([WeakController, PendingGeneration]()
 	{
 		if (const TSharedPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> Controller = WeakController.Pin())
 		{
-			Controller->CompleteOwnerFallback(CompletedGeneration);
+			Controller->CompleteOwnerFallback(PendingGeneration);
 		}
 		return true;
 	});
+}
+
+void FGitChangedAssetsController::ClearPendingHeadMetadata()
+{
+	PendingHeadMetadataApply.Reset();
 }
 
 void FGitChangedAssetsController::CompleteOwnerFallback(const uint64 CompletedGeneration)
@@ -744,12 +855,14 @@ void FGitChangedAssetsController::CompleteRevert(const bool bDiskMutationSucceed
 	{
 		LastError = MoveTemp(ResultMessage);
 		ChangedDelegate.Broadcast();
+		PostRevertStatusRefreshStartSeconds = FPlatformTime::Seconds();
 		Refresh(false);
 		return;
 	}
 
 	LastError.Empty();
 	ChangedDelegate.Broadcast();
+	PostRevertStatusRefreshStartSeconds = FPlatformTime::Seconds();
 	Refresh();
 }
 

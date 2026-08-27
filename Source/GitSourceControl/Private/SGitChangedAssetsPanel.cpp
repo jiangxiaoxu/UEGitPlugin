@@ -5,6 +5,9 @@
 #include "GitChangedAssetsController.h"
 #include "GitChangedAssetsModel.h"
 #include "Framework/Application/SlateApplication.h"
+#include "HAL/PlatformApplicationMisc.h"
+#include "Misc/PackageName.h"
+#include "Misc/Paths.h"
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Misc/AutomationTest.h"
 #endif
@@ -69,6 +72,8 @@ private:
 
 namespace SGitChangedAssetsPanelPrivate
 {
+	using FEntryPtr = TSharedPtr<FGitChangedAssetEntry>;
+
 	const FName NameColumn(TEXT("Name"));
 	const FName OwnerColumn(TEXT("OwnerLevel"));
 	const FName PathColumn(TEXT("AssetPath"));
@@ -122,10 +127,67 @@ namespace SGitChangedAssetsPanelPrivate
 		{
 			Result += FString::Printf(TEXT("\nMetadata: %s"), *Entry.MetadataFailureReason);
 		}
+		if (!Entry.FullDataLayerNames.IsEmpty())
+		{
+			Result += FString::Printf(TEXT("\nData Layers: %s"), *Entry.FullDataLayerNames);
+		}
 		return Result;
 	}
 
-	using FEntryPtr = TSharedPtr<FGitChangedAssetEntry>;
+	FString GetOwnerLevelDisplayText(const FString& OwnerLevel)
+	{
+		if (OwnerLevel.IsEmpty())
+		{
+			return TEXT("—");
+		}
+		const FString ShortName = FPackageName::GetShortName(OwnerLevel);
+		return ShortName.IsEmpty() ? OwnerLevel : ShortName;
+	}
+
+	FString GetObjectPathDisplayText(const FGitChangedAssetEntry& Entry)
+	{
+		if (!Entry.DisplayObjectPath.IsEmpty())
+		{
+			return Entry.DisplayObjectPath;
+		}
+		FString DisplayPath = Entry.ObjectPath.IsEmpty() ? Entry.RepositoryRelativePath : Entry.ObjectPath;
+		if (Entry.PackageKind != EGitChangedAssetPackageKind::ExternalActor
+			&& Entry.PackageKind != EGitChangedAssetPackageKind::ExternalObject)
+		{
+			return DisplayPath;
+		}
+
+		const int32 UaidIndex = DisplayPath.Find(TEXT("_UAID_"), ESearchCase::IgnoreCase);
+		if (UaidIndex != INDEX_NONE)
+		{
+			int32 SubObjectIndex = INDEX_NONE;
+			if (DisplayPath.FindLastChar(TEXT(':'), SubObjectIndex) && SubObjectIndex < UaidIndex)
+			{
+				DisplayPath = DisplayPath.Mid(SubObjectIndex + 1, UaidIndex - SubObjectIndex - 1);
+			}
+			else
+			{
+				DisplayPath.LeftInline(UaidIndex, EAllowShrinking::No);
+			}
+		}
+		return DisplayPath;
+	}
+
+	TArray<FString> BuildSelectedAbsolutePaths(const TArray<FEntryPtr>& InFilteredItems, const TArray<FEntryPtr>& InSelectedItems)
+	{
+		TArray<FString> Paths;
+		for (const FEntryPtr& Item : InFilteredItems)
+		{
+			if (Item.IsValid() && !Item->AbsoluteFilename.IsEmpty()
+				&& InSelectedItems.ContainsByPredicate([&Item](const FEntryPtr& Selected) { return Selected == Item; }))
+			{
+				FString AbsolutePath = FPaths::ConvertRelativePathToFull(Item->AbsoluteFilename);
+				FPaths::MakePlatformFilename(AbsolutePath);
+				Paths.Add(MoveTemp(AbsolutePath));
+			}
+		}
+		return Paths;
+	}
 
 	bool ContainsEntry(const TArray<FEntryPtr>& Entries, const FEntryPtr& Entry)
 	{
@@ -364,31 +426,76 @@ namespace SGitChangedAssetsPanelPrivate
 					.Padding(4.0f, 0.0f)
 					[
 						SNew(STextBlock)
-						.Text(FText::FromString(Item->DisplayName.IsEmpty() ? Item->RepositoryRelativePath : Item->DisplayName))
-						.ToolTipText(FText::FromString(BuildTooltip(*Item)))
+						.Text_Lambda([RowItem = Item]()
+						{
+							return FText::FromString(RowItem->DisplayName.IsEmpty() ? RowItem->RepositoryRelativePath : RowItem->DisplayName);
+						})
+						.OverflowPolicy(ETextOverflowPolicy::Ellipsis)
+						.ToolTipText_Lambda([RowItem = Item]()
+						{
+							return FText::FromString(BuildTooltip(*RowItem));
+						})
 					];
 			}
 			if (ColumnName == OwnerColumn)
 			{
-				return SNew(STextBlock).Text(FText::FromString(Item->OwnerLevel.IsEmpty() ? TEXT("—") : Item->OwnerLevel));
+				return SNew(STextBlock)
+					.Text_Lambda([RowItem = Item]()
+					{
+						return FText::FromString(RowItem->DisplayOwnerLevel.IsEmpty() ? GetOwnerLevelDisplayText(RowItem->OwnerLevel) : RowItem->DisplayOwnerLevel);
+					})
+					.OverflowPolicy(ETextOverflowPolicy::Ellipsis)
+					.ToolTipText_Lambda([RowItem = Item]()
+					{
+						return FText::FromString(RowItem->OwnerLevel.IsEmpty() ? TEXT("No owner level") : RowItem->OwnerLevel);
+					});
 			}
 			if (ColumnName == PathColumn)
 			{
 				return SNew(STextBlock)
-					.Text(FText::FromString(Item->ObjectPath.IsEmpty() ? Item->RepositoryRelativePath : Item->ObjectPath))
-					.ToolTipText(FText::FromString(BuildTooltip(*Item)));
+					.Text_Lambda([RowItem = Item]()
+					{
+						return FText::FromString(GetObjectPathDisplayText(*RowItem));
+					})
+					.OverflowPolicy(ETextOverflowPolicy::Ellipsis)
+					.ToolTipText_Lambda([RowItem = Item]()
+					{
+						const FString FullPath = RowItem->ObjectPath.IsEmpty() ? RowItem->RepositoryRelativePath : RowItem->ObjectPath;
+						const FString PathTooltip = RowItem->FullDataLayerNames.IsEmpty()
+							? FullPath
+							: FString::Printf(TEXT("%s\nData Layers: %s"), *FullPath, *RowItem->FullDataLayerNames);
+						return FText::FromString(PathTooltip);
+					});
 			}
 			if (ColumnName == TypeColumn)
 			{
-				const FString Type = Item->AssetType.IsEmpty() ? GetPackageKindText(Item->PackageKind) : Item->AssetType;
-				return SNew(STextBlock).Text(FText::FromString(Type));
+				return SNew(STextBlock)
+					.Text_Lambda([RowItem = Item]()
+					{
+						return FText::FromString(RowItem->AssetType.IsEmpty() ? GetPackageKindText(RowItem->PackageKind) : RowItem->AssetType);
+					})
+					.OverflowPolicy(ETextOverflowPolicy::Ellipsis)
+					.ToolTipText_Lambda([RowItem = Item]()
+					{
+						const FString Type = RowItem->AssetType.IsEmpty() ? GetPackageKindText(RowItem->PackageKind) : RowItem->AssetType;
+						return FText::FromString(Type);
+					});
 			}
 			if (ColumnName == StatusColumn)
 			{
 				return SNew(STextBlock)
-					.Text(FText::FromString(LexToString(Item->State)))
-					.ColorAndOpacity(GetStateColor(Item->State))
-					.ToolTipText(FText::FromString(Item->bCanRevert ? TEXT("Revertable") : Item->RevertBlockReason));
+					.Text_Lambda([RowItem = Item]()
+					{
+						return FText::FromString(LexToString(RowItem->State));
+					})
+					.ColorAndOpacity_Lambda([RowItem = Item]()
+					{
+						return GetStateColor(RowItem->State);
+					})
+					.ToolTipText_Lambda([RowItem = Item]()
+					{
+						return FText::FromString(RowItem->bCanRevert ? TEXT("Revertable") : RowItem->RevertBlockReason);
+					});
 			}
 
 			return SNew(STextBlock).Text(FText::GetEmpty());
@@ -521,6 +628,15 @@ void SGitChangedAssetsPanel::Construct(const FArguments& InArgs)
 					[
 						SNew(STextBlock).Text_Lambda([this]() { return SelectedRevertable.IsValid() ? FText::FromString(*SelectedRevertable) : FText::GetEmpty(); })
 					]
+				]
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.Padding(0.0f, 0.0f, 4.0f, 0.0f)
+				[
+					SNew(SButton)
+					.Text(this, &SGitChangedAssetsPanel::GetCopyPathsButtonText)
+					.IsEnabled(this, &SGitChangedAssetsPanel::HasSelection)
+					.OnClicked(this, &SGitChangedAssetsPanel::HandleCopyPathsClicked)
 				]
 				+ SHorizontalBox::Slot()
 				.AutoWidth()
@@ -811,7 +927,10 @@ bool SGitChangedAssetsPanel::MatchesFilters(const FGitChangedAssetEntry& Entry) 
 	{
 		const bool bMatches = Entry.DisplayName.Contains(SearchText, ESearchCase::IgnoreCase)
 			|| Entry.OwnerLevel.Contains(SearchText, ESearchCase::IgnoreCase)
+			|| Entry.DisplayOwnerLevel.Contains(SearchText, ESearchCase::IgnoreCase)
 			|| Entry.ObjectPath.Contains(SearchText, ESearchCase::IgnoreCase)
+			|| Entry.DisplayObjectPath.Contains(SearchText, ESearchCase::IgnoreCase)
+			|| Entry.FullDataLayerNames.Contains(SearchText, ESearchCase::IgnoreCase)
 			|| Entry.AssetType.Contains(SearchText, ESearchCase::IgnoreCase)
 			|| Entry.RepositoryRelativePath.Contains(SearchText, ESearchCase::IgnoreCase);
 		if (!bMatches)
@@ -884,6 +1003,26 @@ FReply SGitChangedAssetsPanel::HandleRefreshClicked()
 	if (Controller.IsValid())
 	{
 		Controller->Refresh();
+	}
+	return FReply::Handled();
+}
+
+bool SGitChangedAssetsPanel::HasSelection() const
+{
+	return ListView.IsValid() && ListView->GetNumItemsSelected() > 0;
+}
+
+FReply SGitChangedAssetsPanel::HandleCopyPathsClicked()
+{
+	if (!HasSelection())
+	{
+		return FReply::Unhandled();
+	}
+
+	const TArray<FString> Paths = SGitChangedAssetsPanelPrivate::BuildSelectedAbsolutePaths(FilteredItems, GetSelectedEntries());
+	if (!Paths.IsEmpty())
+	{
+		FPlatformApplicationMisc::ClipboardCopy(*FString::Join(Paths, TEXT("\n")));
 	}
 	return FReply::Handled();
 }
@@ -1010,6 +1149,14 @@ FText SGitChangedAssetsPanel::GetRevertButtonText() const
 		: FText::Format(LOCTEXT("ChangedAssetsRevertCount", "Revert {0} to HEAD..."), FText::AsNumber(SelectedCount));
 }
 
+FText SGitChangedAssetsPanel::GetCopyPathsButtonText() const
+{
+	const int32 SelectedCount = ListView.IsValid() ? ListView->GetNumItemsSelected() : 0;
+	return SelectedCount <= 1
+		? LOCTEXT("ChangedAssetsCopyPath", "Copy File Path")
+		: FText::Format(LOCTEXT("ChangedAssetsCopyPaths", "Copy {0} File Paths"), FText::AsNumber(SelectedCount));
+}
+
 #if WITH_DEV_AUTOMATION_TESTS
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetsFileExplorerSelectionTest, "Cthulhu.GitSourceControl.ChangedAssets.FileExplorerSelection",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -1086,6 +1233,18 @@ bool FGitChangedAssetsFileExplorerSelectionTest::RunTest(const FString& Paramete
 	TestFalse(TEXT("Empty ListView selection clears a stale range anchor"), ResolveSelectionAnchor(FilteredItems, {}, B).IsValid());
 	TestTrue(TEXT("Native keyboard range anchor wins when it remains visible"), ResolveSelectionAnchor(FilteredItems, { A }, B) == B);
 	TestTrue(TEXT("Missing native range anchor falls back to a selected filtered item"), ResolveSelectionAnchor(FilteredItems, { C }, FEntryPtr()) == C);
+
+	const TArray<FString> CopiedPaths = BuildSelectedAbsolutePaths(FilteredItems, { D, B });
+	TestEqual(TEXT("Copied paths follow visible filtered order"), CopiedPaths.Num(), 2);
+	if (CopiedPaths.Num() == 2)
+	{
+		FString ExpectedB = FPaths::ConvertRelativePathToFull(B->AbsoluteFilename);
+		FString ExpectedD = FPaths::ConvertRelativePathToFull(D->AbsoluteFilename);
+		FPaths::MakePlatformFilename(ExpectedB);
+		FPaths::MakePlatformFilename(ExpectedD);
+		TestEqual(TEXT("Copied paths include the current target path first"), CopiedPaths[0], ExpectedB);
+		TestEqual(TEXT("Copied paths include the current target path second"), CopiedPaths[1], ExpectedD);
+	}
 
 	TArray<FEntryPtr> NavigationItems = { A, B };
 	const TSharedRef<SChangedAssetsListView> NavigationList = SNew(SChangedAssetsListView, TWeakPtr<SGitChangedAssetsPanel>())

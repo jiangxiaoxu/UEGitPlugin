@@ -5,6 +5,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "AssetRegistry/AssetData.h"
 
 enum class EGitChangedAssetState : uint8
 {
@@ -32,6 +33,49 @@ enum class EGitChangedAssetMetadataSource : uint8
 	DerivedExternalPath,
 };
 
+enum class EGitChangedAssetDataLayerMappingSource : uint8
+{
+	None,
+	Current,
+	Head,
+};
+
+/** 一个已索引的 WorldDataLayers external actor; 只保存 Asset Registry 值数据, 不持有 UObject. */
+struct FGitChangedAssetWorldDataLayersIndexEntry
+{
+	FString RepositoryRelativePath;
+	FAssetData AssetData;
+	EGitChangedAssetState State = EGitChangedAssetState::Modified;
+	bool bHasCurrentAssetData = false;
+	bool bChangedRelativeToHead = false;
+	/** rename 跨 owner 时此 current WDL 在其 current owner 的 fixed HEAD 中不存在. */
+	bool bKnownAbsentAtHead = false;
+};
+
+/** 同一 owner/source 的 Data Layer 映射缓存, 随 snapshot 复制并避免重复查询. */
+struct FGitChangedAssetDataLayerMappingCache
+{
+	TSet<FName> AttemptedIdentifiers;
+	TMap<FName, TSet<FString>> FriendlyNameCandidates;
+	TMap<FName, FString> ResolvedNames;
+	/** 仅 Head source: 已从 fixed HEAD 读取的 WorldDataLayers package paths. */
+	TSet<FString> AttemptedWorldDataLayersRepositoryPaths;
+	/** 仅 Head source: fixed HEAD metadata 不可用, 因而不得使用 current metadata. */
+	TSet<FString> UnavailableWorldDataLayersRepositoryPaths;
+	/** 仅 Head source: Added/Untracked WDL 在固定 HEAD 中按定义不存在, 不阻断其他 descriptor. */
+	TSet<FString> KnownAbsentWorldDataLayersRepositoryPaths;
+	TMap<FString, FAssetData> HeadWorldDataLayersAssetData;
+};
+
+/** 单个 owner level 的 snapshot-local WorldDataLayers index 与 source-specific caches. */
+struct FGitChangedAssetDataLayerOwnerCache
+{
+	bool bWorldDataLayersIndexed = false;
+	TArray<FGitChangedAssetWorldDataLayersIndexEntry> WorldDataLayers;
+	FGitChangedAssetDataLayerMappingCache Current;
+	FGitChangedAssetDataLayerMappingCache Head;
+};
+
 /** 一个相对固定 HEAD 的单 .uasset Git 变更. */
 struct FGitChangedAssetEntry
 {
@@ -50,6 +94,17 @@ struct FGitChangedAssetEntry
 	FString DisplayName;
 	FString OwnerLevel;
 	FString ObjectPath;
+	/** 纯显示用的 owner/path 文本; 不参与 Git identity 或回退操作. */
+	FString DisplayOwnerLevel;
+	FString DisplayObjectPath;
+	/** Data Layer 的原始 package/object path 列表, 仅用于 Tooltip. */
+	FString FullDataLayerNames;
+	/** Actor descriptor 中的精确 Data Layer 标识; 用于按 owner WorldDataLayers 无加载解析 private/legacy 短名. */
+	TArray<FName> ActorDataLayerIdentifiers;
+	/** Actor descriptor 中的精确 External Data Layer asset path, 仅用于显示和 Tooltip. */
+	FName ExternalDataLayerAssetPath;
+	/** Actor descriptor 的 object name; 与 ActorLabel 分离, 用于稳定构造显示 path. */
+	FString ActorObjectName;
 	FString AssetType;
 	FString MetadataFailureReason;
 
@@ -67,6 +122,8 @@ struct FGitChangedAssetEntry
 	/** Metadata resolver 用于 OFPA owner 资格检查. */
 	bool bOwnerLevelResolved = false;
 	bool bMetadataResolved = false;
+	bool bHasActorDescriptorMetadata = false;
+	EGitChangedAssetDataLayerMappingSource DataLayerMappingSource = EGitChangedAssetDataLayerMappingSource::None;
 
 	/** Core 资格不依赖 Asset Registry; 最终资格由 metadata/mutation 再收紧. */
 	bool bBaseRevertEligible = false;
@@ -90,6 +147,8 @@ struct FGitChangedAssetSnapshot
 	FDateTime CapturedAtUtc;
 	double StatusDurationSeconds = 0.0;
 	TArray<FGitChangedAssetEntry> Entries;
+	/** Owner-level WorldDataLayers data, cache and HEAD safety state; lifetime is one refresh snapshot. */
+	TMap<FString, FGitChangedAssetDataLayerOwnerCache> DataLayerOwnerCaches;
 };
 
 GITSOURCECONTROL_API const TCHAR* LexToString(EGitChangedAssetState InState);

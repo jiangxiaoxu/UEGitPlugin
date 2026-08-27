@@ -33,7 +33,6 @@ private:
 	FString Filename;
 };
 
-struct FGitVersion;
 class UPackage;
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -112,21 +111,13 @@ namespace GitSourceControlUtils
 	FString ChangeRepositoryRootIfSubmodule(FString & AbsoluteFilePath, const FString& PathToRepositoryRoot);
 
 /**
- * Find the path to the Git binary, looking into a few places (standalone Git install, and other common tools embedding Git)
- * @returns the path to the Git binary if found, or an empty string.
+ * Find and cache a supported Git release (2.53.0+) from standalone installs and common bundled locations.
+ * @returns the verified path to the Git binary if found, or an empty string.
  */
 GITSOURCECONTROL_API FString FindGitBinaryPath();
 
 /** Resolve a local Git executable and repository root for one explicit workspace file. */
 GITSOURCECONTROL_API bool ResolveStandaloneRepositoryForFile(const FString& InFilename, FString& OutGitBinary, FString& OutRepositoryRoot, FString& OutError);
-
-/**
- * Run a Git "version" command to check the availability of the binary.
- * @param InPathToGitBinary		The path to the Git binary
- * @param OutGitVersion         If provided, populate with the git version parsed from "version" command
- * @returns true if the command succeeded and returned no errors
- */
-bool CheckGitAvailability(const FString& InPathToGitBinary, FGitVersion* OutVersion = nullptr);
 
 /** Verify local-only porcelain-v2 status and literal-path query capabilities for explicit standalone mutations. */
 GITSOURCECONTROL_API bool CheckLocalGitCapabilities(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutError);
@@ -139,26 +130,8 @@ GITSOURCECONTROL_API bool RunRepositoryStatusPorcelainV2(const FString& InPathTo
 GITSOURCECONTROL_API bool RunPathsStatusPorcelainV2(const FString& InPathToGitBinary, const FString& InRepositoryRoot,
 	const TArray<FString>& InFiles, TArray<uint8>& OutStandardOutput, FString& OutError);
 
-/**
- * Parse the output from the "version" command into GitMajorVersion and GitMinorVersion.
- * @param InVersionString       The version string returned by `git --version`
- * @param OutVersion            The FGitVersion to populate
- */
- void ParseGitVersion(const FString& InVersionString, FGitVersion* OutVersion);
-
-	/**
-		* Check git for various optional capabilities by various means.
-		* @param InPathToGitBinary		The path to the Git binary
-		* @param OutGitVersion			If provided, populate with the git version parsed from "version" command
-		*/
-	void FindGitCapabilities(const FString& InPathToGitBinary, FGitVersion* OutVersion);
-
-	/**
-		* Run a Git "lfs" command to check the availability of the "Large File System" extension.
-		* @param InPathToGitBinary		The path to the Git binary
-		* @param OutGitVersion			If provided, populate with the git version parsed from "version" command
-		*/
-	void FindGitLfsCapabilities(const FString& InPathToGitBinary, FGitVersion* OutVersion);
+/** Drop a cached Git binary after an external launcher observes a launch failure. */
+GITSOURCECONTROL_API void InvalidateVerifiedGitBinary(const FString& InPathToGitBinary);
 
 /**
  * Find the root of the Git repository, looking from the provided path and upward in its parent directories
@@ -240,7 +213,8 @@ GITSOURCECONTROL_API bool DumpRevisionBlobToFile(const FString& InPathToGitBinar
 
 /**
  * Verify a local Git LFS object against its pointer metadata using the resolved
- * Git binary's local `git lfs pointer` command. This never invokes fetch or transfer.
+ * Git binary's local `git lfs pointer` command. Git LFS 3.7.1+ is required and
+ * lazily capability-cached on the first explicit LFS operation. This never invokes fetch or transfer.
  */
 	GITSOURCECONTROL_API bool VerifyLocalLfsObject(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InObjectFilename, const FString& InExpectedOid, int64 InExpectedSize, FString& OutError);
 
@@ -255,6 +229,7 @@ GITSOURCECONTROL_API bool DumpRevisionBlobToFile(const FString& InPathToGitBinar
 	namespace Testing
 	{
 		GITSOURCECONTROL_API void ResetGitProcessLaunchCount();
+		GITSOURCECONTROL_API void ResetVerifiedGitBinaryCache();
 		GITSOURCECONTROL_API uint64 GetGitProcessLaunchCount();
 		GITSOURCECONTROL_API uint64 GetGitLfsFetchLaunchCount();
 		GITSOURCECONTROL_API uint64 GetGitProcessLaunchCountAtModuleStartup();

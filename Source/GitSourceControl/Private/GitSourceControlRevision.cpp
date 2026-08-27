@@ -6,6 +6,7 @@
 #include "GitSourceControlRevision.h"
 
 #include "Algo/AllOf.h"
+#include "GitLfsLocalObjectStore.h"
 #include "GitStandaloneLog.h"
 #include "GitSourceControlUtils.h"
 #include "HAL/FileManager.h"
@@ -60,24 +61,6 @@ namespace GitSourceControlRevisionPrivate
 			&& FPaths::GetCleanFilename(NormalizedFilename).StartsWith(TemporaryExportFilenamePrefix, ESearchCase::CaseSensitive);
 	}
 
-	const TArray<FString>& GetEmptyStringArray()
-	{
-		static const TArray<FString> Empty;
-		return Empty;
-	}
-	bool IsLfsPointerFile(const FString& Filename)
-	{
-		TArray<uint8> Data;
-		if (!FFileHelper::LoadFileToArray(Data, *Filename))
-		{
-			return false;
-		}
-
-		static constexpr ANSICHAR Signature[] = "version https://git-lfs.github.com/spec/v1";
-		return Data.Num() >= UE_ARRAY_COUNT(Signature) - 1
-			&& FMemory::Memcmp(Data.GetData(), Signature, UE_ARRAY_COUNT(Signature) - 1) == 0;
-	}
-
 	bool IsPackageFile(const FString& Filename)
 	{
 		return Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase);
@@ -111,114 +94,29 @@ namespace GitSourceControlRevisionPrivate
 		return Tag == PACKAGE_FILE_TAG || Tag == PACKAGE_FILE_TAG_SWAPPED;
 	}
 
-	bool ParseLfsPointer(const FString& Filename, FString& OutOid, int64& OutSize)
-	{
-		OutOid.Reset();
-		OutSize = 0;
-		FString Text;
-		if (!FFileHelper::LoadFileToString(Text, *Filename))
-		{
-			return false;
-		}
-
-		TArray<FString> Lines;
-		Text.ParseIntoArrayLines(Lines, false);
-		bool bFoundOid = false;
-		bool bFoundSize = false;
-		for (const FString& Line : Lines)
-		{
-			static const FString Prefix(TEXT("oid sha256:"));
-			if (Line.StartsWith(TEXT("oid sha256:"), ESearchCase::CaseSensitive))
-			{
-				if (bFoundOid)
-				{
-					return false;
-				}
-				OutOid = Line.Mid(Prefix.Len()).TrimStartAndEnd();
-				bFoundOid = true;
-			}
-			else if (Line.StartsWith(TEXT("size "), ESearchCase::CaseSensitive))
-			{
-				if (bFoundSize)
-				{
-					return false;
-				}
-				const FString SizeValue = Line.Mid(5).TrimStartAndEnd();
-				if (SizeValue.IsEmpty())
-				{
-					return false;
-				}
-				for (const TCHAR Character : SizeValue)
-				{
-					if (Character < TEXT('0') || Character > TEXT('9'))
-					{
-						return false;
-					}
-				}
-				OutSize = FCString::Atoi64(*SizeValue);
-				bFoundSize = true;
-			}
-		}
-		return bFoundOid && bFoundSize && OutOid.Len() == 64 && Algo::AllOf(OutOid, [](TCHAR Character)
-		{
-			return FChar::IsHexDigit(Character);
-		});
-	}
-
-	bool MaterializeLocalLfsObject(const FString& GitBinary, const FString& RepositoryRoot, const FString& PointerFilename,
+	bool MaterializeLocalLfsObject(FGitLfsLocalObjectStore& InObjectStore, const FString& GitBinary, const FString& RepositoryRoot, const FString& PointerFilename,
 		const FString& Destination, bool& bOutNeedsFetch, FString& OutError)
 	{
 		bOutNeedsFetch = false;
 		OutError.Reset();
-		FString Oid;
-		int64 ExpectedSize = 0;
-		if (!ParseLfsPointer(PointerFilename, Oid, ExpectedSize))
+		FGitLfsPointer Pointer;
+		if (ParseGitLfsPointerFile(PointerFilename, Pointer) != EGitLfsPointerParseResult::ValidPointer)
 		{
 			OutError = TEXT("The revision contains an invalid Git LFS pointer.");
 			return false;
 		}
 
-		FString StorageOutput;
-		FString StorageErrors;
-		FString LfsStorage;
-		if (GitSourceControlUtils::RunCommandInternalRaw(TEXT("config"), GitBinary, RepositoryRoot,
-			{ TEXT("--path"), TEXT("--get"), TEXT("lfs.storage") }, GetEmptyStringArray(),
-			StorageOutput, StorageErrors, 0, false))
-		{
-			LfsStorage = MoveTemp(StorageOutput);
-			LfsStorage.TrimStartAndEndInline();
-		}
-
-		if (LfsStorage.IsEmpty())
-		{
-			FString CommonGitDir;
-			FString Errors;
-			if (!GitSourceControlUtils::RunCommandInternalRaw(
-				TEXT("rev-parse"), GitBinary, RepositoryRoot, { TEXT("--git-common-dir") },
-				GetEmptyStringArray(), CommonGitDir, Errors))
-			{
-				OutError = Errors.IsEmpty() ? TEXT("Could not resolve local Git LFS storage.") : Errors;
-				return false;
-			}
-			CommonGitDir.TrimStartAndEndInline();
-			LfsStorage = FPaths::Combine(CommonGitDir, TEXT("lfs"));
-		}
-		if (FPaths::IsRelative(LfsStorage))
-		{
-			LfsStorage = FPaths::ConvertRelativePathToFull(RepositoryRoot, LfsStorage);
-		}
-
-		const FString ObjectPath = FPaths::Combine(LfsStorage, TEXT("objects"), Oid.Left(2), Oid.Mid(2, 2), Oid);
-		if (!IFileManager::Get().FileExists(*ObjectPath))
+		FString ObjectPath;
+		const EGitLfsLocalObjectLookupResult LookupResult = InObjectStore.FindObject(Pointer, ObjectPath, OutError);
+		if (LookupResult == EGitLfsLocalObjectLookupResult::Missing)
 		{
 			bOutNeedsFetch = true;
-			OutError = FString::Printf(TEXT("Git LFS object %s is not available locally."), *Oid);
+			OutError = FString::Printf(TEXT("Git LFS object %s is not available locally."), *Pointer.Oid);
 			return false;
 		}
-		FString VerificationError;
-		if (!GitSourceControlUtils::VerifyLocalLfsObject(GitBinary, RepositoryRoot, ObjectPath, Oid, ExpectedSize, VerificationError))
+		if (LookupResult != EGitLfsLocalObjectLookupResult::Found ||
+			!GitSourceControlUtils::VerifyLocalLfsObject(GitBinary, RepositoryRoot, ObjectPath, Pointer.Oid, Pointer.Size, OutError))
 		{
-			OutError = VerificationError;
 			return false;
 		}
 
@@ -252,10 +150,6 @@ namespace GitSourceControlRevisionPrivate
 		TemporaryExports.Add(Filename);
 	}
 
-	bool FetchMissingLfsContent(const FString& GitBinary, const FString& RepositoryRoot, const FString& CommitId, const FString& HistoricalPath, FString& OutError)
-	{
-		return GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, RepositoryRoot, CommitId, HistoricalPath, OutError);
-	}
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -343,14 +237,25 @@ bool FGitSourceControlRevision::ExportToFile(const FString& InFilename) const
 	const FString RevisionSpec = FString::Printf(TEXT("%s:%s"), *CommitId, *Filename);
 	FString ExportError;
 	bool bSuccess = GitSourceControlUtils::DumpRevisionBlobToFile(GitBinary, RepositoryRoot, RevisionSpec, TemporaryFilename, ExportError);
-	if (bSuccess && GitSourceControlRevisionPrivate::IsLfsPointerFile(TemporaryFilename))
+	FGitLfsPointer LfsPointer;
+	const EGitLfsPointerParseResult LfsPointerResult = bSuccess
+		? ParseGitLfsPointerFile(TemporaryFilename, LfsPointer)
+		: EGitLfsPointerParseResult::NotPointer;
+	if (bSuccess && LfsPointerResult == EGitLfsPointerParseResult::InvalidPointer)
+	{
+		bSuccess = false;
+		ExportError = TEXT("The revision contains an invalid Git LFS pointer.");
+	}
+	else if (bSuccess && LfsPointerResult == EGitLfsPointerParseResult::ValidPointer)
 	{
 		const FString MaterializedFilename = TemporaryFilename + TEXT(".lfs");
+		FGitLfsLocalObjectStore LfsObjectStore(GitBinary, RepositoryRoot);
 		bool bNeedsFetch = false;
-		bSuccess = GitSourceControlRevisionPrivate::MaterializeLocalLfsObject(GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsFetch, ExportError);
-		if (!bSuccess && bNeedsFetch && GitSourceControlRevisionPrivate::FetchMissingLfsContent(GitBinary, RepositoryRoot, CommitId, Filename, ExportError))
+		bSuccess = GitSourceControlRevisionPrivate::MaterializeLocalLfsObject(LfsObjectStore, GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsFetch, ExportError);
+		if (!bSuccess && bNeedsFetch && GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, RepositoryRoot, CommitId, Filename, ExportError))
 		{
-			bSuccess = GitSourceControlRevisionPrivate::MaterializeLocalLfsObject(GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsFetch, ExportError);
+			LfsObjectStore.InvalidateCachedObject(LfsPointer);
+			bSuccess = GitSourceControlRevisionPrivate::MaterializeLocalLfsObject(LfsObjectStore, GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsFetch, ExportError);
 		}
 		if (bSuccess)
 		{

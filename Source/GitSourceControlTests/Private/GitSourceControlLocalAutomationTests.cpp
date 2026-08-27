@@ -554,6 +554,10 @@ bool FGitSourceControlStandaloneZeroImplicitGitAutomationTest::RunTest(const FSt
 	TestEqual(TEXT("Standalone module startup snapshot starts no Git process"), GitSourceControlUtils::Testing::GetGitProcessLaunchCountAtModuleStartup(), static_cast<uint64>(0));
 	FGitTestFixture Fixture(*this);
 	if (!Fixture.Initialize() || !CreateCommittedFixture(Fixture)) return false;
+	// Fixture setup has its own explicit Git discovery. Reset the test-only
+	// binary capability cache before checking the product lifecycle so the final
+	// explicit discovery still proves that it launches Git after idle startup.
+	GitSourceControlUtils::Testing::ResetVerifiedGitBinaryCache();
 	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
 	FGitSourceControlModule& Module = FModuleManager::LoadModuleChecked<FGitSourceControlModule>(TEXT("GitSourceControl"));
 	static_cast<void>(Module);
@@ -680,6 +684,30 @@ bool FGitSourceControlLfsObjectVerificationAutomationTest::RunTest(const FString
 	return TestFalse(TEXT("Same-size corrupt local LFS object is rejected"), GitSourceControlUtils::VerifyLocalLfsObject(GitBinary, Directory, ObjectFilename, Oid, Size, VerifyError));
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlGitBinaryCapabilityCacheAutomationTest, "Cthulhu.GitSourceControl.Local.GitBinaryCapabilityCache", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlGitBinaryCapabilityCacheAutomationTest::RunTest(const FString& Parameters)
+{
+	static_cast<void>(Parameters);
+	GitSourceControlUtils::Testing::ResetVerifiedGitBinaryCache();
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	const FString FirstGitBinary = GitSourceControlUtils::FindGitBinaryPath();
+	if (!TestTrue(TEXT("First explicit Git discovery finds a supported Git release"), !FirstGitBinary.IsEmpty()))
+	{
+		return false;
+	}
+	const uint64 FirstDiscoveryLaunchCount = GitSourceControlUtils::Testing::GetGitProcessLaunchCount();
+	if (!TestTrue(TEXT("First explicit Git discovery validates at least one candidate"), FirstDiscoveryLaunchCount > 0))
+	{
+		return false;
+	}
+
+	const FString CachedGitBinary = GitSourceControlUtils::FindGitBinaryPath();
+	TestTrue(TEXT("Cached Git discovery returns the verified binary"), FPaths::IsSamePath(CachedGitBinary, FirstGitBinary));
+	return TestEqual(TEXT("Cached Git discovery does not launch another Git process"),
+		GitSourceControlUtils::Testing::GetGitProcessLaunchCount(), FirstDiscoveryLaunchCount);
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlLfsRevisionFetchAutomationTest, "Cthulhu.GitSourceControl.Local.LfsRevisionFetch", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
 
 bool FGitSourceControlLfsRevisionFetchAutomationTest::RunTest(const FString& Parameters)
@@ -708,10 +736,11 @@ bool FGitSourceControlLfsRevisionFetchAutomationTest::RunTest(const FString& Par
 	{
 		return false;
 	}
-	const FString Payload = FPaths::Combine(Source, TEXT("Content/LfsPayload.bin"));
+	const FString HistoricalPayloadPath = TEXT("Content/Lfs Payload.bin");
+	const FString Payload = FPaths::Combine(Source, HistoricalPayloadPath);
 	if (!IFileManager::Get().MakeDirectory(*FPaths::GetPath(Payload), true)
 		|| !FFileHelper::SaveStringToFile(TEXT("LFS revision payload\n"), *Payload, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)
-		|| !RunGitAt(*this, GitBinary, Source, TEXT("add .gitattributes Content/LfsPayload.bin"), Output)
+		|| !RunGitAt(*this, GitBinary, Source, FString::Printf(TEXT("add .gitattributes %s"), *QuoteGitArgument(HistoricalPayloadPath)), Output)
 		|| !RunGitAt(*this, GitBinary, Source, TEXT("commit --no-gpg-sign -m \"LFS fetch fixture\""), Output)
 		|| !RunGitAt(*this, GitBinary, Source, FString::Printf(TEXT("remote add origin %s"), *QuoteGitArgument(Origin)), Output)
 		|| !RunGitAt(*this, GitBinary, Source, TEXT("push origin HEAD"), Output))
@@ -721,14 +750,16 @@ bool FGitSourceControlLfsRevisionFetchAutomationTest::RunTest(const FString& Par
 	FString Branch;
 	if (!RunGitAt(*this, GitBinary, Source, TEXT("branch --show-current"), Branch)) return false;
 	Branch.TrimStartAndEndInline();
-	if (Branch.IsEmpty() || !RunGitAt(*this, GitBinary, Origin, FString::Printf(TEXT("symbolic-ref HEAD refs/heads/%s"), *Branch), Output)
+	const FString BranchRef = FString::Printf(TEXT("refs/heads/%s"), *Branch);
+	if (Branch.IsEmpty() || !RunGitAt(*this, GitBinary, Origin, FString::Printf(TEXT("symbolic-ref HEAD %s"), *QuoteGitArgument(BranchRef)), Output)
 		|| !RunGitAt(*this, GitBinary, Root, FString::Printf(TEXT("clone %s %s"), *QuoteGitArgument(Origin), *QuoteGitArgument(Clone)), Output))
 	{
 		return false;
 	}
 	FString CommitId;
 	FString PointerText;
-	if (!RunGitAt(*this, GitBinary, Clone, TEXT("rev-parse HEAD"), CommitId) || !RunGitAt(*this, GitBinary, Clone, TEXT("show HEAD:Content/LfsPayload.bin"), PointerText)) return false;
+	if (!RunGitAt(*this, GitBinary, Clone, TEXT("rev-parse HEAD"), CommitId)
+		|| !RunGitAt(*this, GitBinary, Clone, FString::Printf(TEXT("show %s"), *QuoteGitArgument(TEXT("HEAD:Content/Lfs Payload.bin"))), PointerText)) return false;
 	CommitId.TrimStartAndEndInline();
 	FString Oid;
 	int64 Size = -1;
@@ -736,7 +767,7 @@ bool FGitSourceControlLfsRevisionFetchAutomationTest::RunTest(const FString& Par
 	const FString ObjectFilename = FPaths::Combine(Clone, TEXT(".git/lfs/objects"), Oid.Left(2), Oid.Mid(2, 2), Oid);
 	if (!TestTrue(TEXT("Clone has the initial local LFS object"), IFileManager::Get().FileExists(*ObjectFilename)) || !TestTrue(TEXT("Remove local LFS object before fetch"), IFileManager::Get().Delete(*ObjectFilename, false, true))) return false;
 	FString FetchError;
-	if (!TestTrue(TEXT("A sole upstream remote permits precise historical LFS fetch"), GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, Clone, CommitId, TEXT("Content/LfsPayload.bin"), FetchError)))
+	if (!TestTrue(TEXT("A sole upstream remote permits precise historical LFS fetch with a space-containing path"), GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, Clone, CommitId, HistoricalPayloadPath, FetchError)))
 	{
 		AddError(FetchError);
 		return false;
@@ -744,19 +775,19 @@ bool FGitSourceControlLfsRevisionFetchAutomationTest::RunTest(const FString& Par
 	if (!TestTrue(TEXT("Fetched local LFS object verifies"), GitSourceControlUtils::VerifyLocalLfsObject(GitBinary, Clone, ObjectFilename, Oid, Size, FetchError))
 		|| !TestTrue(TEXT("Remove object before ambiguity check"), IFileManager::Get().Delete(*ObjectFilename, false, true))
 		|| !RunGitAt(*this, GitBinary, Clone, FString::Printf(TEXT("remote add mirror %s"), *QuoteGitArgument(Origin)), Output)
-		|| !RunGitAt(*this, GitBinary, Clone, FString::Printf(TEXT("config --unset branch.%s.merge"), *Branch), Output))
+		|| !RunGitAt(*this, GitBinary, Clone, FString::Printf(TEXT("config --unset %s"), *QuoteGitArgument(FString::Printf(TEXT("branch.%s.merge"), *Branch))), Output))
 	{
 		return false;
 	}
 	FetchError.Reset();
-	TestFalse(TEXT("A branch remote without branch merge is not an upstream"), GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, Clone, CommitId, TEXT("Content/LfsPayload.bin"), FetchError));
+	TestFalse(TEXT("A branch remote without branch merge is not an upstream"), GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, Clone, CommitId, HistoricalPayloadPath, FetchError));
 	TestTrue(TEXT("Incomplete upstream configuration keeps the LFS object absent"), !IFileManager::Get().FileExists(*ObjectFilename));
-	if (!RunGitAt(*this, GitBinary, Clone, FString::Printf(TEXT("config --unset branch.%s.remote"), *Branch), Output))
+	if (!RunGitAt(*this, GitBinary, Clone, FString::Printf(TEXT("config --unset %s"), *QuoteGitArgument(FString::Printf(TEXT("branch.%s.remote"), *Branch))), Output))
 	{
 		return false;
 	}
 	FetchError.Reset();
-	TestFalse(TEXT("Multiple remotes without an upstream are rejected"), GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, Clone, CommitId, TEXT("Content/LfsPayload.bin"), FetchError));
+	TestFalse(TEXT("Multiple remotes without an upstream are rejected"), GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, Clone, CommitId, HistoricalPayloadPath, FetchError));
 	TestTrue(TEXT("Remote ambiguity keeps the LFS object absent"), !IFileManager::Get().FileExists(*ObjectFilename));
 	TestTrue(TEXT("Remote ambiguity reports a configuration error"), FetchError.Contains(TEXT("no remote could be selected"), ESearchCase::IgnoreCase));
 	const TSharedRef<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe> CancellationContext = MakeShared<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>();
@@ -764,7 +795,7 @@ bool FGitSourceControlLfsRevisionFetchAutomationTest::RunTest(const FString& Par
 	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
 	GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(CancellationContext);
 	FetchError.Reset();
-	TestFalse(TEXT("Pre-cancelled LFS fetch is rejected"), GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, Clone, CommitId, TEXT("Content/LfsPayload.bin"), FetchError));
+	TestFalse(TEXT("Pre-cancelled LFS fetch is rejected"), GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, Clone, CommitId, HistoricalPayloadPath, FetchError));
 	TestEqual(TEXT("Pre-cancelled LFS fetch starts no Git process"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount(), static_cast<uint64>(0));
 	return TestTrue(TEXT("Pre-cancelled LFS fetch reports cancellation"), FetchError.Contains(TEXT("cancel"), ESearchCase::IgnoreCase));
 }

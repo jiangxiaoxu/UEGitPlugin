@@ -35,7 +35,7 @@ struct FGitCatFileBatchResult
  * Binary-safe, bounded reader for one short-lived `git cat-file --batch-command -Z` process.
  * It deliberately does not invoke Git LFS or any network operation.
  */
-class FGitCatFileBatchReader final
+class GITSOURCECONTROL_API FGitCatFileBatchReader final
 {
 public:
 	/**

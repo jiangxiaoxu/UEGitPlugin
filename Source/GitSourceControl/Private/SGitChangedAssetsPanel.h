@@ -55,7 +55,9 @@ private:
 	TSharedRef<SWidget> GenerateFilterOption(TSharedPtr<FString> Option) const;
 
 	FReply HandleRefreshClicked();
+	FReply HandleCopyPathsClicked();
 	FReply HandleRevertClicked();
+	bool HasSelection() const;
 	bool CanRevertSelection() const;
 
 public:
@@ -69,6 +71,7 @@ private:
 	FText GetStatusText() const;
 	FText GetErrorText() const;
 	EVisibility GetErrorVisibility() const;
+	FText GetCopyPathsButtonText() const;
 	FText GetRevertButtonText() const;
 
 	FControllerPtr Controller;

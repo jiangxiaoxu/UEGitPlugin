@@ -8,6 +8,7 @@
 #include "GitChangedAssetsModel.h"
 
 class UPackage;
+class UWorld;
 
 namespace GitChangedAssetOperations
 {
@@ -89,10 +90,16 @@ namespace GitChangedAssetOperations
 		bool BeginMutation(const TArray<FGitChangedAssetEntry>& InEntries, FString& OutError);
 		bool Finish(const TArray<FGitChangedAssetEntry>& InEntries, const TArray<FString>& InAffectedFiles, EGitChangedAssetMutationOutcome InOutcome, FString& OutError);
 
+#if WITH_DEV_AUTOMATION_TESTS
+		/** Test-only override for constructing an isolated Editor-world lifecycle fixture. */
+		static void SetCurrentEditorWorldForTesting(UWorld* InWorld);
+#endif
+
 	private:
 		TArray<TWeakObjectPtr<UPackage>> PackagesToResetLoaders;
 		TArray<TWeakObjectPtr<UPackage>> PackagesToReload;
 		FString ConfirmedClosureSignature;
+		int32 OwnerPackageReloadCount = 0;
 		bool bClosureConfirmed = false;
 		bool bPrepared = false;
 		bool bLoadersReset = false;

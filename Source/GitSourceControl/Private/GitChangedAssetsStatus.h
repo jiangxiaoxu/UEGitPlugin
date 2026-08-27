@@ -12,7 +12,7 @@ class GITSOURCECONTROL_API FGitChangedAssetsStatus final
 {
 public:
 	/**
-	 * 在 status 前后固定并校验 HEAD. HEAD 变化时不发布部分或过期 snapshot.
+	 * 从带 branch.oid 的 status 固定 HEAD, 再以一次 rev-parse 校验. HEAD 变化时不发布部分或过期 snapshot.
 	 * 仅查询当前 repository, 不扫描 Asset Registry, 不加载 package, 不进行网络访问.
 	 */
 	static bool CaptureSnapshot(const FString& InGitBinary, const FString& InRepositoryRoot, uint64 InGeneration,

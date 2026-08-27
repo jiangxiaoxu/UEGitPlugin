@@ -6,13 +6,19 @@
 #include "GitSourceControlUtils.h"
 
 #include "Async/Async.h"
+#include "Engine/Level.h"
+#include "Engine/World.h"
+#include "GameFramework/Actor.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
+#include "Misc/PackageName.h"
 #include "Misc/Paths.h"
+#include "UObject/Package.h"
+#include "UObject/UObjectGlobals.h"
 
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
@@ -134,6 +140,20 @@ namespace GitChangedAssetOperationsAutomationTestsPrivate
 		FAutomationTestBase& Test;
 		FString GitBinary;
 		FString Root;
+	};
+
+	class FScopedCurrentEditorWorldOverride final
+	{
+	public:
+		explicit FScopedCurrentEditorWorldOverride(UWorld* InWorld)
+		{
+			GitChangedAssetOperations::FGitChangedAssetRevertLifecycle::SetCurrentEditorWorldForTesting(InWorld);
+		}
+
+		~FScopedCurrentEditorWorldOverride()
+		{
+			GitChangedAssetOperations::FGitChangedAssetRevertLifecycle::SetCurrentEditorWorldForTesting(nullptr);
+		}
 	};
 
 	FGitChangedAssetEntry MakeEntry(const FFixture& InFixture, const FString& InRelativeFilename, const EGitChangedAssetState InState)
@@ -486,6 +506,227 @@ bool FGitChangedAssetEmptyLifecycleClosureAutomationTest::RunTest(const FString&
 	if (!TestTrue(TEXT("Empty lifecycle closure enters the mutation commit point"), Lifecycle.BeginMutation({ Entry }, Error))) return false;
 	return TestTrue(TEXT("Empty lifecycle closure finalizes without reload or discard"),
 		Lifecycle.Finish({ Entry }, { Entry.AbsoluteFilename }, EGitChangedAssetMutationOutcome::NeverMutated, Error));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetInactiveOfpaLifecycleAutomationTest, "Cthulhu.GitSourceControl.ChangedAssets.InactiveOfpaLifecycle", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitChangedAssetInactiveOfpaLifecycleAutomationTest::RunTest(const FString& Parameters)
+{
+	static_cast<void>(Parameters);
+	using namespace GitChangedAssetOperations;
+	using namespace GitChangedAssetOperationsAutomationTestsPrivate;
+	FFixture Fixture(*this);
+	if (!Fixture.Initialize()) return false;
+
+	const FString TestId = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	const FString DestinationOwnerLevel = FString::Printf(TEXT("/Temp/GitChangedAssetsInactiveDestination_%s"), *TestId);
+	const FString SourceOwnerLevel = FString::Printf(TEXT("/Game/GitChangedAssetsInactiveSource_%s"), *TestId);
+	UPackage* const InactiveDestinationOwnerPackage = CreatePackage(*DestinationOwnerLevel);
+	UPackage* const InactiveSourceOwnerPackage = CreatePackage(*SourceOwnerLevel);
+	if (!TestNotNull(TEXT("Creates an isolated inactive destination owner package"), InactiveDestinationOwnerPackage) ||
+		!TestNotNull(TEXT("Creates an isolated inactive source owner package"), InactiveSourceOwnerPackage)) return false;
+	InactiveDestinationOwnerPackage->SetDirtyFlag(false);
+	InactiveSourceOwnerPackage->SetDirtyFlag(false);
+
+	FGitChangedAssetEntry Entry = MakeEntry(Fixture, TEXT("Content/__ExternalActors__/Map/A/B/INACTIVE.uasset"), EGitChangedAssetState::Modified);
+	Entry.PackageKind = EGitChangedAssetPackageKind::ExternalActor;
+	Entry.OwnerLevel = DestinationOwnerLevel;
+	Entry.bOwnerLevelResolved = true;
+	FGitChangedAssetRevertPreview Preview;
+	FString Error;
+	if (!TestTrue(TEXT("A clean inactive OFPA owner takes the disk-only lifecycle path"), FGitChangedAssetRevertLifecycle::BuildPreview({ Entry }, Preview, Error))) return false;
+	TestTrue(TEXT("The disk-only OFPA path does not reload an inactive owner map"), Preview.OwnerMapsToReload.IsEmpty());
+
+	FGitChangedAssetEntry RenameEntry = Entry;
+	RenameEntry.State = EGitChangedAssetState::Renamed;
+	RenameEntry.IndexStatus = TEXT('R');
+	const FString SourceExternalPackageName = TEXT("/Game/__ExternalActors__/") + FPackageName::GetShortName(SourceOwnerLevel) + TEXT("/A/B/INACTIVE_OLD");
+	RenameEntry.RenameFromRepositoryRelativePath = TEXT("Content/__ExternalActors__/") + FPackageName::GetShortName(SourceOwnerLevel) + TEXT("/A/B/INACTIVE_OLD.uasset");
+	RenameEntry.RenameFromAbsoluteFilename = FPackageName::LongPackageNameToFilename(SourceExternalPackageName, FPackageName::GetAssetPackageExtension());
+	if (!TestTrue(TEXT("An external rename source uses the same inactive disk-only lifecycle matcher"),
+		FGitChangedAssetRevertLifecycle::BuildPreview({ RenameEntry }, Preview, Error))) return false;
+	TestTrue(TEXT("The external rename source does not reload an inactive owner map"), Preview.OwnerMapsToReload.IsEmpty());
+
+	InactiveDestinationOwnerPackage->SetDirtyFlag(true);
+	TestFalse(TEXT("An inactive dirty OFPA owner blocks before disk mutation"), FGitChangedAssetRevertLifecycle::BuildPreview({ Entry }, Preview, Error));
+	InactiveDestinationOwnerPackage->SetDirtyFlag(false);
+	if (!TestTrue(TEXT("The inactive destination owner diagnostic identifies the safety gate"), Error.Contains(TEXT("inactive OFPA owner"), ESearchCase::IgnoreCase))) return false;
+
+	InactiveSourceOwnerPackage->SetDirtyFlag(true);
+	TestFalse(TEXT("An inactive dirty rename source owner blocks before disk mutation"), FGitChangedAssetRevertLifecycle::BuildPreview({ RenameEntry }, Preview, Error));
+	InactiveSourceOwnerPackage->SetDirtyFlag(false);
+	return TestTrue(TEXT("The inactive dirty rename source diagnostic identifies the source safety gate"), Error.Contains(TEXT("inactive OFPA owner"), ESearchCase::IgnoreCase));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetReloadFailureDiagnosticAutomationTest, "Cthulhu.GitSourceControl.ChangedAssets.ReloadFailureDiagnostic", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitChangedAssetReloadFailureDiagnosticAutomationTest::RunTest(const FString& Parameters)
+{
+	static_cast<void>(Parameters);
+	using namespace GitChangedAssetOperations;
+	using namespace GitChangedAssetOperationsAutomationTestsPrivate;
+	FFixture Fixture(*this);
+	if (!Fixture.Initialize() || !Fixture.WriteFile(TEXT("Content/ReloadFailure.uasset"), TEXT("head bytes\n")) || !Fixture.CommitAll(TEXT("Reload failure diagnostic fixture"))) return false;
+	FString PinnedHead;
+	if (!Fixture.RunGit(TEXT("rev-parse HEAD"), PinnedHead)) return false;
+	PinnedHead.TrimStartAndEndInline();
+	if (!Fixture.WriteFile(TEXT("Content/ReloadFailure.uasset"), TEXT("dirty bytes\n"))) return false;
+
+	TArray<FGitChangedAssetEntry> Entries;
+	if (!CaptureRevertEntries(*this, Fixture, PinnedHead, Entries)) return false;
+	int32 ConfirmCalls = 0;
+	int32 PrepareCalls = 0;
+	int32 BeginMutationCalls = 0;
+	int32 FinalizeCalls = 0;
+	FGitChangedAssetRevertCallbacks Callbacks = MakeCallbacks(ConfirmCalls, PrepareCalls, BeginMutationCalls, FinalizeCalls);
+	Callbacks.FinalizeEditor = [&FinalizeCalls](const TArray<FGitChangedAssetEntry>&, const TArray<FString>&,
+		const EGitChangedAssetMutationOutcome, FString& OutError)
+	{
+		++FinalizeCalls;
+		OutError = TEXT("Intentional reload diagnostic seam.");
+		return false;
+	};
+	FGitChangedAssetRevertResult Result;
+	const bool bDiskMutationSucceeded = FGitChangedAssetOperations(Fixture.GetGitBinary(), Fixture.GetRoot()).RevertToHead(PinnedHead, Entries, Callbacks, Result);
+	TestTrue(TEXT("A reload failure after the commit point preserves disk mutation success"), bDiskMutationSucceeded && Result.bSucceeded);
+	TestFalse(TEXT("A reload failure is surfaced independently from disk mutation"), Result.bReloadSucceeded);
+	TestEqual(TEXT("The reload failure finalizer runs exactly once"), FinalizeCalls, 1);
+	return TestTrue(TEXT("The reload failure retains its diagnostic"), Result.Errors.ContainsByPredicate([](const FString& Message)
+	{
+		return Message.Contains(TEXT("Intentional reload diagnostic seam."), ESearchCase::CaseSensitive);
+	}));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetStreamingOfpaDirtySiblingAutomationTest, "Cthulhu.GitSourceControl.ChangedAssets.StreamingOfpaDirtySibling", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitChangedAssetStreamingOfpaDirtySiblingAutomationTest::RunTest(const FString& Parameters)
+{
+	static_cast<void>(Parameters);
+	using namespace GitChangedAssetOperations;
+	using namespace GitChangedAssetOperationsAutomationTestsPrivate;
+	const FString TestId = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	UPackage* const EditorWorldPackage = CreatePackage(*FString::Printf(TEXT("/Game/GitChangedAssetsLifecycle_%s"), *TestId));
+	UPackage* const StreamingPackage = CreatePackage(*FString::Printf(TEXT("/Game/GitChangedAssetsStreaming_%s"), *TestId));
+	if (!TestNotNull(TEXT("Creates an isolated current Editor world package"), EditorWorldPackage) ||
+		!TestNotNull(TEXT("Creates an isolated streaming level package"), StreamingPackage)) return false;
+	const FName EditorWorldName(*FString::Printf(TEXT("EditorWorld_%s"), *TestId));
+	const FName StreamingWorldName(*FString::Printf(TEXT("StreamingWorld_%s"), *TestId));
+	UWorld* const EditorWorld = UWorld::CreateWorld(EWorldType::Editor, false, EditorWorldName, EditorWorldPackage);
+	UWorld* const StreamingOuterWorld = UWorld::CreateWorld(EWorldType::Inactive, false, StreamingWorldName, StreamingPackage);
+	if (!TestNotNull(TEXT("Creates an isolated Editor world"), EditorWorld) || !TestNotNull(TEXT("Creates an isolated streaming world"), StreamingOuterWorld)) return false;
+	ULevel* const StreamingLevel = StreamingOuterWorld->PersistentLevel;
+	if (!TestNotNull(TEXT("Creates an isolated streaming level"), StreamingLevel)) return false;
+	StreamingLevel->OwningWorld = EditorWorld;
+	EditorWorld->AddLevel(StreamingLevel);
+	StreamingPackage->SetDirtyFlag(false);
+
+	const TArray<FString> ExternalActorPaths = ULevel::GetExternalActorsPaths(StreamingPackage->GetName());
+	if (!TestTrue(TEXT("The isolated streaming level has an external-actor root"), !ExternalActorPaths.IsEmpty())) return false;
+	const FString SelectedExternalPackageName = ExternalActorPaths[0] + TEXT("/A/B/SELECTED");
+	const FString SiblingExternalPackageName = ExternalActorPaths[0] + TEXT("/A/B/SIBLING");
+	UPackage* const SelectedExternalPackage = CreatePackage(*SelectedExternalPackageName);
+	UPackage* const SiblingExternalPackage = CreatePackage(*SiblingExternalPackageName);
+	if (!TestNotNull(TEXT("Creates the selected external package"), SelectedExternalPackage) ||
+		!TestNotNull(TEXT("Creates the dirty sibling external package"), SiblingExternalPackage)) return false;
+	SelectedExternalPackage->SetDirtyFlag(false);
+
+	const FName DirtySiblingName(*FString::Printf(TEXT("DirtySibling_%s"), *TestId));
+	AActor* const DirtySiblingActor = NewObject<AActor>(StreamingLevel, DirtySiblingName, RF_Public | RF_Standalone);
+	if (!TestNotNull(TEXT("Creates a dirty external sibling actor"), DirtySiblingActor)) return false;
+	StreamingLevel->Actors.Add(DirtySiblingActor);
+	DirtySiblingActor->SetPackageExternal(true, false, SiblingExternalPackage);
+	SiblingExternalPackage->SetDirtyFlag(true);
+	if (!TestTrue(TEXT("The sibling is discoverable as the dirty external package asset"),
+		SiblingExternalPackage->FindAssetInPackage() == DirtySiblingActor && DirtySiblingActor->IsPackageExternal()))
+	{
+		SiblingExternalPackage->SetDirtyFlag(false);
+		return false;
+	}
+
+	FGitChangedAssetEntry SelectedEntry;
+	SelectedEntry.RepositoryRelativePath = TEXT("Content/__ExternalActors__/Test/Selected.uasset");
+	SelectedEntry.AbsoluteFilename = FPackageName::LongPackageNameToFilename(SelectedExternalPackageName, FPackageName::GetAssetPackageExtension());
+	SelectedEntry.PackageName = SelectedExternalPackageName;
+	SelectedEntry.OwnerLevel = StreamingPackage->GetName();
+	SelectedEntry.State = EGitChangedAssetState::Modified;
+	SelectedEntry.PackageKind = EGitChangedAssetPackageKind::ExternalActor;
+	SelectedEntry.bBaseRevertEligible = true;
+	SelectedEntry.bCanRevert = true;
+	SelectedEntry.bMetadataResolved = true;
+	SelectedEntry.bOwnerLevelResolved = true;
+	SelectedEntry.IndexStatus = TEXT('M');
+	SelectedEntry.WorktreeStatus = TEXT('M');
+
+	FScopedCurrentEditorWorldOverride EditorWorldOverride(EditorWorld);
+	FGitChangedAssetRevertPreview Preview;
+	FString Error;
+	TestFalse(TEXT("A dirty non-selected sibling in the matched streaming level blocks the reload closure"),
+		FGitChangedAssetRevertLifecycle::BuildPreview({ SelectedEntry }, Preview, Error));
+	SiblingExternalPackage->SetDirtyFlag(false);
+	return TestTrue(TEXT("The streaming dirty sibling diagnostic identifies the reload closure"),
+		Error.Contains(TEXT("owner level reload closure"), ESearchCase::CaseSensitive));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetDirectEditorWorldOfpaAutomationTest, "Cthulhu.GitSourceControl.ChangedAssets.DirectEditorWorldOfpa", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitChangedAssetDirectEditorWorldOfpaAutomationTest::RunTest(const FString& Parameters)
+{
+	static_cast<void>(Parameters);
+	using namespace GitChangedAssetOperations;
+	using namespace GitChangedAssetOperationsAutomationTestsPrivate;
+	const FString TestId = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	UPackage* const CurrentWorldPackage = CreatePackage(*FString::Printf(TEXT("/Game/GitChangedAssetsCurrent_%s"), *TestId));
+	UPackage* const DirectOwnerPackage = CreatePackage(*FString::Printf(TEXT("/Game/GitChangedAssetsDirectOwner_%s"), *TestId));
+	if (!TestNotNull(TEXT("Creates an isolated current world package"), CurrentWorldPackage) ||
+		!TestNotNull(TEXT("Creates an isolated direct owner package"), DirectOwnerPackage)) return false;
+	const FName CurrentWorldName(*FString::Printf(TEXT("CurrentWorld_%s"), *TestId));
+	const FName DirectWorldName(*FString::Printf(TEXT("DirectWorld_%s"), *TestId));
+	UWorld* const CurrentWorld = UWorld::CreateWorld(EWorldType::Editor, false, CurrentWorldName, CurrentWorldPackage);
+	UWorld* const DirectOwnerWorld = UWorld::CreateWorld(EWorldType::Editor, false, DirectWorldName, DirectOwnerPackage);
+	if (!TestNotNull(TEXT("Creates an isolated current Editor world"), CurrentWorld) ||
+		!TestNotNull(TEXT("Creates an isolated direct owner Editor world"), DirectOwnerWorld)) return false;
+
+	const TArray<FString> ExternalActorPaths = ULevel::GetExternalActorsPaths(DirectOwnerPackage->GetName());
+	if (!TestTrue(TEXT("The direct owner world has an external-actor root"), !ExternalActorPaths.IsEmpty())) return false;
+	const FString ExternalPackageName = ExternalActorPaths[0] + TEXT("/A/B/DIRECT");
+	UPackage* const ExternalPackage = CreatePackage(*ExternalPackageName);
+	if (!TestNotNull(TEXT("Creates the direct external package"), ExternalPackage)) return false;
+	const FName DirectActorName(*FString::Printf(TEXT("DirectActor_%s"), *TestId));
+	AActor* const DirectActor = NewObject<AActor>(DirectOwnerWorld->PersistentLevel, DirectActorName, RF_Public | RF_Standalone);
+	if (!TestNotNull(TEXT("Creates the direct external actor"), DirectActor)) return false;
+	DirectOwnerWorld->PersistentLevel->Actors.Add(DirectActor);
+	DirectActor->SetPackageExternal(true, false, ExternalPackage);
+	ExternalPackage->SetDirtyFlag(false);
+	DirectOwnerPackage->SetDirtyFlag(false);
+	if (!TestTrue(TEXT("The direct external actor is discoverable from its package"),
+		ExternalPackage->FindAssetInPackage() == DirectActor && DirectActor->IsPackageExternal()))
+	{
+		ExternalPackage->SetDirtyFlag(false);
+		DirectOwnerPackage->SetDirtyFlag(false);
+		return false;
+	}
+
+	FGitChangedAssetEntry Entry;
+	Entry.RepositoryRelativePath = TEXT("Content/__ExternalActors__/Test/Direct.uasset");
+	Entry.AbsoluteFilename = FPackageName::LongPackageNameToFilename(ExternalPackageName, FPackageName::GetAssetPackageExtension());
+	Entry.PackageName = ExternalPackageName;
+	Entry.OwnerLevel = DirectOwnerPackage->GetName();
+	Entry.State = EGitChangedAssetState::Modified;
+	Entry.PackageKind = EGitChangedAssetPackageKind::ExternalActor;
+	Entry.bBaseRevertEligible = true;
+	Entry.bCanRevert = true;
+	Entry.bMetadataResolved = true;
+	Entry.bOwnerLevelResolved = true;
+	Entry.IndexStatus = TEXT('M');
+	Entry.WorktreeStatus = TEXT('M');
+
+	FScopedCurrentEditorWorldOverride CurrentWorldOverride(CurrentWorld);
+	FGitChangedAssetRevertPreview Preview;
+	FString Error;
+	if (!TestTrue(TEXT("A direct non-current Editor-world OFPA builds a reload closure"),
+		FGitChangedAssetRevertLifecycle::BuildPreview({ Entry }, Preview, Error))) return false;
+	if (!TestEqual(TEXT("The direct OFPA has one owner world reload target"), Preview.OwnerMapsToReload.Num(), 1)) return false;
+	return TestEqual(TEXT("The direct OFPA reloads its metadata-matching owner world package"), Preview.OwnerMapsToReload[0], DirectOwnerPackage->GetName());
 }
 
 #endif

@@ -4,6 +4,7 @@
 
 #include "GitSourceControlUtils.h"
 
+#include "Misc/Char.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -74,6 +75,8 @@ namespace GitChangedAssetsStatusPrivate
 		return true;
 	}
 
+	bool IsFullObjectId(const FString& InObjectId);
+
 	bool ReadHeadCommitId(const FString& InGitBinary, const FString& InRepositoryRoot, FString& OutHead, FString& OutError)
 	{
 		OutHead.Reset();
@@ -89,12 +92,71 @@ namespace GitChangedAssetsStatusPrivate
 			return false;
 		}
 		StandardOutput.TrimStartAndEndInline();
-		if (StandardOutput.IsEmpty())
+		if (!IsFullObjectId(StandardOutput))
 		{
-			OutError = TEXT("Git did not return a HEAD commit.");
+			OutError = TEXT("Git did not return a complete HEAD commit.");
 			return false;
 		}
 		OutHead = MoveTemp(StandardOutput);
+		return true;
+	}
+
+	bool IsFullObjectId(const FString& InObjectId)
+	{
+		if (InObjectId.Len() != 40 && InObjectId.Len() != 64)
+		{
+			return false;
+		}
+		for (const TCHAR Character : InObjectId)
+		{
+			if (!FChar::IsHexDigit(Character))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool ExtractBranchObjectId(const TArray<uint8>& InStatusOutput, FString& OutHead, FString& OutError)
+	{
+		OutHead.Reset();
+		OutError.Reset();
+		const FString Prefix = TEXT("# branch.oid ");
+		int32 Offset = 0;
+		FString Record;
+		bool bFound = false;
+		while (ReadNulToken(InStatusOutput, Offset, Record))
+		{
+			if (!Record.StartsWith(TEXT("# branch.oid"), ESearchCase::CaseSensitive))
+			{
+				continue;
+			}
+			if (!Record.StartsWith(Prefix, ESearchCase::CaseSensitive))
+			{
+				OutError = TEXT("Git status returned a malformed branch.oid header.");
+				return false;
+			}
+			if (bFound)
+			{
+				OutError = TEXT("Git status returned multiple branch.oid headers.");
+				return false;
+			}
+
+			const FString ObjectId = Record.Mid(Prefix.Len());
+			if (!IsFullObjectId(ObjectId))
+			{
+				OutError = TEXT("Git status did not return a complete committed branch.oid. Create an initial commit and refresh again.");
+				return false;
+			}
+			OutHead = ObjectId;
+			bFound = true;
+		}
+
+		if (!bFound)
+		{
+			OutError = TEXT("Git status did not return a branch.oid header.");
+			return false;
+		}
 		return true;
 	}
 
@@ -249,12 +311,6 @@ bool FGitChangedAssetsStatus::CaptureSnapshot(const FString& InGitBinary, const 
 
 	FString RepositoryRoot = FPaths::ConvertRelativePathToFull(InRepositoryRoot);
 	FPaths::NormalizeDirectoryName(RepositoryRoot);
-	FString PinnedHead;
-	if (!GitChangedAssetsStatusPrivate::ReadHeadCommitId(InGitBinary, RepositoryRoot, PinnedHead, OutError))
-	{
-		return false;
-	}
-
 	const double StatusStartSeconds = FPlatformTime::Seconds();
 	TArray<uint8> StatusOutput;
 	if (!GitSourceControlUtils::RunRepositoryStatusPorcelainV2(InGitBinary, RepositoryRoot, StatusOutput, OutError))
@@ -262,6 +318,11 @@ bool FGitChangedAssetsStatus::CaptureSnapshot(const FString& InGitBinary, const 
 		return false;
 	}
 	const double StatusDurationSeconds = FPlatformTime::Seconds() - StatusStartSeconds;
+	FString PinnedHead;
+	if (!GitChangedAssetsStatusPrivate::ExtractBranchObjectId(StatusOutput, PinnedHead, OutError))
+	{
+		return false;
+	}
 
 	TArray<FGitChangedAssetEntry> Entries;
 	if (!ParsePorcelainV2(StatusOutput, RepositoryRoot, Entries, OutError))

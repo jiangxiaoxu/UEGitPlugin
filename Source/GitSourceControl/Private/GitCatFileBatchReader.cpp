@@ -20,6 +20,18 @@ bool IsCancellationRequested(const TSharedPtr<GitSourceControlUtils::FGitOperati
 	return InCancellationContext.IsValid() && InCancellationContext->IsCancellationRequested();
 }
 
+bool ContainsEmbeddedNul(const FString& InValue)
+{
+	for (int32 Index = 0; Index < InValue.Len(); ++Index)
+	{
+		if (InValue[Index] == TEXT('\0'))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 bool CancelProcessIfRequested(FProcHandle& InProcess,
 	const TSharedPtr<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>& InCancellationContext, FString& OutError)
 {
@@ -43,8 +55,7 @@ bool WriteCommand(void* InStandardInputWrite, const FString& InCommand,
 		OutError = TEXT("Git cat-file metadata read was cancelled.");
 		return false;
 	}
-	int32 NulIndex = INDEX_NONE;
-	if (InCommand.FindChar(TEXT('\0'), NulIndex))
+	if (ContainsEmbeddedNul(InCommand))
 	{
 		OutError = TEXT("Git cat-file object specification contains a NUL character.");
 		return false;
@@ -247,10 +258,11 @@ bool FGitCatFileBatchReader::ReadBlobs(const FString& InGitBinary, const FString
 		return false;
 	}
 
-	FProcHandle Process = FPlatformProcess::CreateProc(*InGitBinary, TEXT("cat-file --batch-command -Z"), false, true, true,
+	FProcHandle Process = FPlatformProcess::CreateProc(*InGitBinary, TEXT("--no-optional-locks cat-file --batch-command -Z"), false, true, true,
 		nullptr, 0, *InRepositoryRoot, StandardOutputWrite, StandardInputRead, StandardErrorWrite);
 	if (!Process.IsValid())
 	{
+		GitSourceControlUtils::InvalidateVerifiedGitBinary(InGitBinary);
 		FPlatformProcess::ClosePipe(StandardOutputRead, StandardOutputWrite);
 		FPlatformProcess::ClosePipe(StandardErrorRead, StandardErrorWrite);
 		FPlatformProcess::ClosePipe(StandardInputRead, StandardInputWrite);
@@ -287,6 +299,16 @@ bool FGitCatFileBatchReader::ReadBlobs(const FString& InGitBinary, const FString
 		}
 		FGitCatFileBatchResult& Result = OutResults.AddDefaulted_GetRef();
 		Result.ObjectSpec = Request.ObjectSpec;
+		if (Request.ObjectSpec.IsEmpty())
+		{
+			Result.Error = TEXT("Git cat-file object specification is empty.");
+			continue;
+		}
+		if (ContainsEmbeddedNul(Request.ObjectSpec))
+		{
+			Result.Error = TEXT("Git cat-file object specification contains an embedded NUL character.");
+			continue;
+		}
 		if (!WriteCommand(StandardInputWrite, FString::Printf(TEXT("info %s"), *Request.ObjectSpec), InCancellationContext, OutError) ||
 			!ReadUntil(StandardOutputRead, StandardErrorRead, Process, StandardOutput, StandardError, 0, Deadline, InCancellationContext, OutError))
 		{
@@ -316,13 +338,13 @@ bool FGitCatFileBatchReader::ReadBlobs(const FString& InGitBinary, const FString
 		}
 
 		if (!WriteCommand(StandardInputWrite, FString::Printf(TEXT("contents %s"), *Request.ObjectSpec), InCancellationContext, OutError) ||
-			!ReadUntil(StandardOutputRead, StandardErrorRead, Process, StandardOutput, StandardError, '\n', Deadline, InCancellationContext, OutError))
+			!ReadUntil(StandardOutputRead, StandardErrorRead, Process, StandardOutput, StandardError, 0, Deadline, InCancellationContext, OutError))
 		{
 			return false;
 		}
 
 		FString ContentsHeader;
-		check(ConsumeHeader(StandardOutput, '\n', ContentsHeader));
+		check(ConsumeHeader(StandardOutput, 0, ContentsHeader));
 		FString ContentsObjectId;
 		int64 ContentsSize = 0;
 		if (!ParseObjectHeader(ContentsHeader, ContentsObjectId, ContentsSize, HeaderError) || ContentsObjectId != Result.ObjectId || ContentsSize != Result.BlobSize)
@@ -344,7 +366,7 @@ bool FGitCatFileBatchReader::ReadBlobs(const FString& InGitBinary, const FString
 		Result.Data.Append(StandardOutput.GetData(), ContentsSizeInt);
 		TotalBlobBytes += ContentsSize;
 		const uint8 Terminator = StandardOutput[ContentsSizeInt];
-		if (Terminator != 0 && Terminator != '\n')
+		if (Terminator != 0)
 		{
 			OutError = TEXT("git cat-file returned an invalid blob terminator.");
 			return false;

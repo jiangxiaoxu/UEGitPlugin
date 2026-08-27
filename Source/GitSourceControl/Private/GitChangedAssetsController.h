@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "GitChangedAssetsMetadata.h"
 #include "GitChangedAssetsModel.h"
 
 namespace GitChangedAssetsControllerPrivate
@@ -10,8 +11,6 @@ namespace GitChangedAssetsControllerPrivate
 	class FGameThreadDispatcher;
 	class FWorkerState;
 }
-
-struct FGitChangedAssetHeadMetadataResult;
 
 /**
  * Game-thread owned coordinator for the Changed Assets tab.
@@ -48,10 +47,21 @@ public:
 	FOnChangedAssetsUpdated& OnChanged();
 
 private:
+	struct FPendingHeadMetadataApply
+	{
+		uint64 Generation = 0;
+		TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> Snapshot;
+		TArray<FGitChangedAssetHeadMetadataResult> Results;
+		int32 NextResultIndex = 0;
+		FString Error;
+	};
+
 	void CompleteRefresh(uint64 CompletedGeneration, TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> CompletedSnapshot, FString Error);
 	void CompleteCurrentMetadata(uint64 CompletedGeneration, TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> CompletedSnapshot);
 	void CompleteHeadMetadata(uint64 CompletedGeneration, TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> CompletedSnapshot,
 		TArray<FGitChangedAssetHeadMetadataResult> Results, FString Error);
+	void ApplyPendingHeadMetadata(uint64 PendingGeneration);
+	void ClearPendingHeadMetadata();
 	void CompleteOwnerFallback(uint64 CompletedGeneration);
 	void CompleteRevert(bool bDiskMutationSucceeded, bool bEditorReloadSucceeded, FString ResultMessage);
 	bool ConfirmRevert(const TArray<FGitChangedAssetEntry>& Entries, FString& OutError);
@@ -63,7 +73,9 @@ private:
 	bool bRefreshing = false;
 	bool bReverting = false;
 	bool bPreserveLastErrorForRefresh = false;
+	double PostRevertStatusRefreshStartSeconds = 0.0;
 	TAtomic<bool> bShuttingDown = false;
+	TOptional<FPendingHeadMetadataApply> PendingHeadMetadataApply;
 	TSharedPtr<GitChangedAssetsControllerPrivate::FGameThreadDispatcher, ESPMode::ThreadSafe> GameThreadDispatcher;
 	TSharedPtr<GitChangedAssetsControllerPrivate::FWorkerState, ESPMode::ThreadSafe> WorkerState;
 	FOnChangedAssetsUpdated ChangedDelegate;

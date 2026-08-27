@@ -36,10 +36,10 @@ namespace GitSourceControlAssetOperations
 		/** 在只读预检完成后调用, 只能收集用户确认. */
 		TFunction<bool(const FString& OperationDescription, const TArray<FString>& AffectedFiles)> Confirm;
 
-		/** 在确认和目标复核完成后、真正变更前调用. */
+		/** 在确认和目标复核完成后, 真正变更前调用. 返回 false 后仍可能需要 ReloadPackages 恢复已卸载 package. */
 		TFunction<bool(const TArray<FString>& AffectedFiles)> PrepareForMutation;
 
-		/** 仅在 Git/文件系统变更成功后调用. 返回 false 表示 package reload 失败. */
+		/** 在 PrepareForMutation 后的每个终止路径调用, 用于恢复已卸载 package. 返回 false 表示 package reload 失败. */
 		TFunction<bool(const TArray<FString>& AffectedFiles)> ReloadPackages;
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -48,11 +48,15 @@ namespace GitSourceControlAssetOperations
 
 		/** Test seam executed after the exact-path index reset and before worktree replacement. */
 		TFunction<bool()> AllowWorktreeReplaceForTesting;
+
+		/** Test seam executed immediately before the exact-path Git mutation. Returning false simulates a Git mutation failure. */
+		TFunction<bool(const FString& GitSubcommand)> AllowGitMutationForTesting;
 #endif
 	};
 
 	struct FGitAssetOperationResult
 	{
+		/** True only when the disk mutation and required package reload both succeed. */
 		bool bSucceeded = false;
 		bool bCancelled = false;
 		bool bReloadSucceeded = true;

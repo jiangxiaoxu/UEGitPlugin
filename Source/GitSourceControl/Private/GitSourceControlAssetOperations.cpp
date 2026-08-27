@@ -5,6 +5,7 @@
 #include "GitSourceControlAssetOperations.h"
 
 #include "Algo/AllOf.h"
+#include "GitLfsLocalObjectStore.h"
 #include "GitSourceControlFileStatus.h"
 #include "GitRepositoryMutationGuard.h"
 #include "GitSourceControlUtils.h"
@@ -171,143 +172,38 @@ namespace GitSourceControlAssetOperationsPrivate
 		return true;
 	}
 
-	enum class ELfsPointerParseResult : uint8
-	{
-		NotPointer,
-		ValidPointer,
-		InvalidPointer,
-	};
-
-	bool ParseLfsObjectSize(const FString& Value, int64& OutSize)
-	{
-		if (Value.IsEmpty())
-		{
-			return false;
-		}
-		int64 ParsedSize = 0;
-		for (const TCHAR Character : Value)
-		{
-			if (Character < TEXT('0') || Character > TEXT('9'))
-			{
-				return false;
-			}
-			const int64 Digit = Character - TEXT('0');
-			if (ParsedSize > (MAX_int64 - Digit) / 10)
-			{
-				return false;
-			}
-			ParsedSize = ParsedSize * 10 + Digit;
-		}
-		OutSize = ParsedSize;
-		return true;
-	}
-
-	ELfsPointerParseResult ParseLfsPointer(const FString& Filename, FString& OutOid, int64& OutSize)
-	{
-		OutOid.Reset();
-		OutSize = 0;
-		FString Text;
-		if (!FFileHelper::LoadFileToString(Text, *Filename))
-		{
-			return ELfsPointerParseResult::InvalidPointer;
-		}
-		if (!Text.StartsWith(TEXT("version https://git-lfs.github.com/spec/v1")))
-		{
-			return ELfsPointerParseResult::NotPointer;
-		}
-		TArray<FString> Lines;
-		Text.ParseIntoArrayLines(Lines);
-		bool bFoundOid = false;
-		bool bFoundSize = false;
-		for (const FString& Line : Lines)
-		{
-			if (Line.StartsWith(TEXT("oid sha256:")))
-			{
-				if (bFoundOid)
-				{
-					return ELfsPointerParseResult::InvalidPointer;
-				}
-				OutOid = Line.Mid(11).TrimStartAndEnd();
-				bFoundOid = true;
-			}
-			else if (Line.StartsWith(TEXT("size ")))
-			{
-				if (bFoundSize || !ParseLfsObjectSize(Line.Mid(5).TrimStartAndEnd(), OutSize))
-				{
-					return ELfsPointerParseResult::InvalidPointer;
-				}
-				bFoundSize = true;
-			}
-		}
-		if (!bFoundOid || !bFoundSize || OutOid.Len() != 64)
-		{
-			return ELfsPointerParseResult::InvalidPointer;
-		}
-		for (const TCHAR Character : OutOid)
-		{
-			if (!FChar::IsHexDigit(Character))
-			{
-				return ELfsPointerParseResult::InvalidPointer;
-			}
-		}
-		return ELfsPointerParseResult::ValidPointer;
-	}
-
-	bool MaterializeLocalLfsObject(const FString& GitBinary, const FString& RepositoryRoot, const FString& PointerFilename,
+	bool MaterializeLocalLfsObject(FGitLfsLocalObjectStore& InObjectStore, const FString& GitBinary, const FString& RepositoryRoot, const FString& PointerFilename,
 		const FString& OutputFilename, bool& bOutNeedsFetch, FString& OutError)
 	{
 		bOutNeedsFetch = false;
-		FString Oid;
-		int64 ExpectedSize = 0;
-		const ELfsPointerParseResult ParseResult = ParseLfsPointer(PointerFilename, Oid, ExpectedSize);
-		if (ParseResult == ELfsPointerParseResult::NotPointer)
+		FGitLfsPointer Pointer;
+		const EGitLfsPointerParseResult ParseResult = ParseGitLfsPointerFile(PointerFilename, Pointer);
+		if (ParseResult == EGitLfsPointerParseResult::NotPointer)
 		{
 			return true;
 		}
-		if (ParseResult == ELfsPointerParseResult::InvalidPointer)
+		if (ParseResult == EGitLfsPointerParseResult::InvalidPointer)
 		{
 			OutError = TEXT("The revision contains an invalid Git LFS pointer.");
 			return false;
 		}
-
-		FString StorageOutput;
-		FString StorageErrors;
-		FString Storage;
-		if (GitSourceControlUtils::RunCommandInternalRaw(TEXT("config"), GitBinary, RepositoryRoot,
-			{ TEXT("--path"), TEXT("--get"), TEXT("lfs.storage") }, {}, StorageOutput, StorageErrors, 0, false))
-		{
-			Storage = StorageOutput.TrimStartAndEnd();
-		}
-		if (Storage.IsEmpty())
-		{
-			FString CommonGitDir;
-			FString CommonGitDirErrors;
-			if (!GitSourceControlUtils::RunCommandInternalRaw(TEXT("rev-parse"), GitBinary, RepositoryRoot, { TEXT("--git-common-dir") }, {}, CommonGitDir, CommonGitDirErrors))
-			{
-				OutError = CommonGitDirErrors.IsEmpty() ? TEXT("Could not resolve the local Git common directory for LFS.") : CommonGitDirErrors;
-				return false;
-			}
-			Storage = FPaths::Combine(CommonGitDir.TrimStartAndEnd(), TEXT("lfs"));
-		}
-		if (FPaths::IsRelative(Storage))
-		{
-			Storage = FPaths::ConvertRelativePathToFull(RepositoryRoot, Storage);
-		}
-		const FString ObjectFilename = FPaths::Combine(Storage, TEXT("objects"), Oid.Left(2), Oid.Mid(2, 2), Oid);
-		if (!IFileManager::Get().FileExists(*ObjectFilename))
+		FString ObjectFilename;
+		const EGitLfsLocalObjectLookupResult LookupResult = InObjectStore.FindObject(Pointer, ObjectFilename, OutError);
+		if (LookupResult == EGitLfsLocalObjectLookupResult::Missing)
 		{
 			bOutNeedsFetch = true;
-			OutError = FString::Printf(TEXT("Git LFS object %s is not available locally."), *Oid);
+			OutError = FString::Printf(TEXT("Git LFS object %s is not available locally."), *Pointer.Oid);
 			return false;
 		}
-		if (!GitSourceControlUtils::VerifyLocalLfsObject(GitBinary, RepositoryRoot, ObjectFilename, Oid, ExpectedSize, OutError))
+		if (LookupResult != EGitLfsLocalObjectLookupResult::Found ||
+			!GitSourceControlUtils::VerifyLocalLfsObject(GitBinary, RepositoryRoot, ObjectFilename, Pointer.Oid, Pointer.Size, OutError))
 		{
 			return false;
 		}
-		if (IFileManager::Get().Copy(*OutputFilename, *ObjectFilename, true, true) != COPY_OK || IFileManager::Get().FileSize(*OutputFilename) != ExpectedSize)
+		if (IFileManager::Get().Copy(*OutputFilename, *ObjectFilename, true, true) != COPY_OK || IFileManager::Get().FileSize(*OutputFilename) != Pointer.Size)
 		{
 			IFileManager::Get().Delete(*OutputFilename, false, true, true);
-			OutError = FString::Printf(TEXT("Could not materialize verified Git LFS object %s."), *Oid);
+			OutError = FString::Printf(TEXT("Could not materialize verified Git LFS object %s."), *Pointer.Oid);
 			return false;
 		}
 		return true;
@@ -333,7 +229,7 @@ namespace GitSourceControlAssetOperationsPrivate
 		return true;
 	}
 
-	bool EnsureHeadBlobAvailable(const FString& GitBinary, const FString& RepositoryRoot, const FString& HeadCommitId,
+	bool EnsureHeadBlobAvailable(FGitLfsLocalObjectStore& InObjectStore, const FString& GitBinary, const FString& RepositoryRoot, const FString& HeadCommitId,
 		const FString& AbsoluteFilename, FString& OutError)
 	{
 		FString RelativePath = AbsoluteFilename;
@@ -350,11 +246,16 @@ namespace GitSourceControlAssetOperationsPrivate
 		if (GitSourceControlUtils::DumpRevisionBlobToFile(GitBinary, RepositoryRoot, HeadCommitId + TEXT(":") + RelativePath, TemporaryPointerFilename, OutError))
 		{
 			bool bNeedsFetch = false;
-			bSuccess = MaterializeLocalLfsObject(GitBinary, RepositoryRoot, TemporaryPointerFilename, MaterializedFilename, bNeedsFetch, OutError);
+			bSuccess = MaterializeLocalLfsObject(InObjectStore, GitBinary, RepositoryRoot, TemporaryPointerFilename, MaterializedFilename, bNeedsFetch, OutError);
 			if (!bSuccess && bNeedsFetch && GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, RepositoryRoot, HeadCommitId, RelativePath, OutError))
 			{
+				FGitLfsPointer Pointer;
+				if (ParseGitLfsPointerFile(TemporaryPointerFilename, Pointer) == EGitLfsPointerParseResult::ValidPointer)
+				{
+					InObjectStore.InvalidateCachedObject(Pointer);
+				}
 				bNeedsFetch = false;
-				bSuccess = MaterializeLocalLfsObject(GitBinary, RepositoryRoot, TemporaryPointerFilename, MaterializedFilename, bNeedsFetch, OutError);
+				bSuccess = MaterializeLocalLfsObject(InObjectStore, GitBinary, RepositoryRoot, TemporaryPointerFilename, MaterializedFilename, bNeedsFetch, OutError);
 			}
 		}
 		IFileManager::Get().Delete(*TemporaryPointerFilename, false, true, true);
@@ -570,6 +471,21 @@ namespace GitSourceControlAssetOperations
 		return true;
 	}
 
+	bool ReloadPackagesAfterPreparation(const TArray<FString>& Files, const FGitAssetOperationCallbacks& Callbacks, FGitAssetOperationResult& OutResult)
+	{
+		if (!Callbacks.ReloadPackages)
+		{
+			return true;
+		}
+
+		OutResult.bReloadSucceeded = Callbacks.ReloadPackages(Files);
+		if (!OutResult.bReloadSucceeded)
+		{
+			OutResult.AddError(TEXT("The editor package reload callback failed after standalone Git asset preparation. The affected packages may remain unloaded or stale."));
+		}
+		return OutResult.bReloadSucceeded;
+	}
+
 	bool FGitSourceControlAssetOperations::RecheckTargets(const TArray<FString>& Files, const TMap<FString, FGitAssetFileFingerprint>& Fingerprints,
 		const FGitIndexSnapshot& IndexSnapshot, const FString& ExpectedHeadCommitId, FGitAssetOperationResult& OutResult) const
 	{
@@ -670,17 +586,15 @@ namespace GitSourceControlAssetOperations
 		{
 			return false;
 		}
+		const bool bPrepareCallbackInstalled = static_cast<bool>(Callbacks.PrepareForMutation);
 		if (!PrepareForMutation(Files, Callbacks, OutResult))
 		{
+			if (bPrepareCallbackInstalled)
+			{
+				ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
+			}
 			return false;
 		}
-		auto ReloadAfterPreparedFailure = [&Callbacks, &Files]()
-		{
-			if (Callbacks.ReloadPackages)
-			{
-				Callbacks.ReloadPackages(Files);
-			}
-		};
 #if WITH_DEV_AUTOMATION_TESTS
 		if (Callbacks.BeforeCommitPointForTesting)
 		{
@@ -689,22 +603,23 @@ namespace GitSourceControlAssetOperations
 #endif
 		if (!RecheckTargets(Files, Fingerprints, IndexSnapshot, HeadCommitId, OutResult))
 		{
-			ReloadAfterPreparedFailure();
+			ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
 			return false;
 		}
 		FString CommitPointError;
 		if (!FGitSourceControlAssetOperations::ValidateStandaloneMutationPreflight(Files, {}, CommitPointError))
 		{
 			OutResult.AddError(CommitPointError);
-			ReloadAfterPreparedFailure();
+			ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
 			return false;
 		}
+		FGitLfsLocalObjectStore LfsObjectStore(GitBinary, RepositoryRoot);
 		for (const FString& Filename : RestoreFiles)
 		{
-			if (!GitSourceControlAssetOperationsPrivate::EnsureHeadBlobAvailable(GitBinary, RepositoryRoot, HeadCommitId, Filename, Error))
+			if (!GitSourceControlAssetOperationsPrivate::EnsureHeadBlobAvailable(LfsObjectStore, GitBinary, RepositoryRoot, HeadCommitId, Filename, Error))
 			{
 				OutResult.AddError(Error.IsEmpty() ? TEXT("Could not validate the HEAD package topology before discard.") : Error);
-				ReloadAfterPreparedFailure();
+				ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
 				return false;
 			}
 		}
@@ -712,10 +627,21 @@ namespace GitSourceControlAssetOperations
 		if (!GitSourceControlAssetOperationsPrivate::CreateBackups(Files, Backups, Error))
 		{
 			OutResult.AddError(Error);
-			ReloadAfterPreparedFailure();
+			ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
 			return false;
 		}
-		const bool bMutated = GitSourceControlUtils::RunExactPathspecMutation(GitBinary, RepositoryRoot, TEXT("restore"), { TEXT("--source=HEAD"), TEXT("--staged"), TEXT("--worktree") }, RestoreFiles, Error);
+		bool bCanRunGitMutation = true;
+#if WITH_DEV_AUTOMATION_TESTS
+		if (Callbacks.AllowGitMutationForTesting)
+		{
+			bCanRunGitMutation = Callbacks.AllowGitMutationForTesting(TEXT("restore"));
+		}
+#endif
+		if (!bCanRunGitMutation)
+		{
+			Error = TEXT("Git restore was rejected by the standalone mutation test seam.");
+		}
+		const bool bMutated = bCanRunGitMutation && GitSourceControlUtils::RunExactPathspecMutation(GitBinary, RepositoryRoot, TEXT("restore"), { TEXT("--source=HEAD"), TEXT("--staged"), TEXT("--worktree") }, RestoreFiles, Error);
 		if (!bMutated)
 		{
 			TArray<FString> FailedBackups;
@@ -732,15 +658,16 @@ namespace GitSourceControlAssetOperations
 			{
 				OutResult.AddError(FString::Printf(TEXT("Worktree rollback was incomplete. Safety backups were preserved at:\n%s"), *FString::Join(FailedBackups, TEXT("\n"))));
 			}
+			ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
 			return false;
 		}
 		GitSourceControlAssetOperationsPrivate::DeleteBackups(Backups);
-		OutResult.bSucceeded = true;
 		OutResult.AffectedFiles = Files;
-		if (Callbacks.ReloadPackages)
+		if (!ReloadPackagesAfterPreparation(Files, Callbacks, OutResult))
 		{
-			OutResult.bReloadSucceeded = Callbacks.ReloadPackages(Files);
+			return false;
 		}
+		OutResult.bSucceeded = true;
 		return true;
 	}
 
@@ -827,14 +754,20 @@ namespace GitSourceControlAssetOperations
 			return false;
 		}
 		const FString MaterializedFilename = TemporaryFilename + TEXT(".lfs");
+		FGitLfsLocalObjectStore LfsObjectStore(GitBinary, RepositoryRoot);
 		bool bNeedsLfsFetch = false;
 		bool bMaterialized = GitSourceControlAssetOperationsPrivate::MaterializeLocalLfsObject(
-			GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsLfsFetch, Error);
+			LfsObjectStore, GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsLfsFetch, Error);
 		if (!bMaterialized && bNeedsLfsFetch &&
 			GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, RepositoryRoot, ResolvedCommitId, HistoricalPath, Error))
 		{
+			FGitLfsPointer Pointer;
+			if (ParseGitLfsPointerFile(TemporaryFilename, Pointer) == EGitLfsPointerParseResult::ValidPointer)
+			{
+				LfsObjectStore.InvalidateCachedObject(Pointer);
+			}
 			bMaterialized = GitSourceControlAssetOperationsPrivate::MaterializeLocalLfsObject(
-				GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsLfsFetch, Error);
+				LfsObjectStore, GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsLfsFetch, Error);
 		}
 		if (!bMaterialized)
 		{
@@ -861,23 +794,21 @@ namespace GitSourceControlAssetOperations
 		}
 		TMap<FString, FGitAssetFileFingerprint> ExpectedFingerprints;
 		ExpectedFingerprints.Add(Target, Fingerprint);
-		if (!Confirm(FString::Printf(TEXT("Restore revision %s to the workspace. The Git index will remain unchanged."), *ResolvedCommitId.Left(12)), Files, Callbacks, OutResult))
+		if (!Confirm(FString::Printf(TEXT("Force-restore revision %s to the workspace. The selected Git index entry will be reset to HEAD, then the worktree file will be replaced."), *ResolvedCommitId.Left(12)), Files, Callbacks, OutResult))
 		{
 			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 			return false;
 		}
+		const bool bPrepareCallbackInstalled = static_cast<bool>(Callbacks.PrepareForMutation);
 		if (!PrepareForMutation(Files, Callbacks, OutResult))
 		{
+			if (bPrepareCallbackInstalled)
+			{
+				ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
+			}
 			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 			return false;
 		}
-		auto ReloadAfterPreparedFailure = [&Callbacks, &Files]()
-		{
-			if (Callbacks.ReloadPackages)
-			{
-				Callbacks.ReloadPackages(Files);
-			}
-		};
 #if WITH_DEV_AUTOMATION_TESTS
 		if (Callbacks.BeforeCommitPointForTesting)
 		{
@@ -886,7 +817,7 @@ namespace GitSourceControlAssetOperations
 #endif
 		if (!RecheckTargets(Files, ExpectedFingerprints, IndexSnapshot, HeadCommitId, OutResult))
 		{
-			ReloadAfterPreparedFailure();
+			ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
 			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 			return false;
 		}
@@ -894,7 +825,7 @@ namespace GitSourceControlAssetOperations
 		if (!FGitSourceControlAssetOperations::ValidateStandaloneMutationPreflight(Files, {}, CommitPointError))
 		{
 			OutResult.AddError(CommitPointError);
-			ReloadAfterPreparedFailure();
+			ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
 			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 			return false;
 		}
@@ -902,11 +833,22 @@ namespace GitSourceControlAssetOperations
 		if (!GitSourceControlAssetOperationsPrivate::CreateBackups(Files, Backups, Error))
 		{
 			OutResult.AddError(Error);
-			ReloadAfterPreparedFailure();
+			ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
 			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 			return false;
 		}
-		if (!GitSourceControlUtils::RunExactPathspecMutation(GitBinary, RepositoryRoot, TEXT("reset"), { TEXT("-q"), TEXT("HEAD") }, Files, Error))
+		bool bCanRunGitMutation = true;
+#if WITH_DEV_AUTOMATION_TESTS
+		if (Callbacks.AllowGitMutationForTesting)
+		{
+			bCanRunGitMutation = Callbacks.AllowGitMutationForTesting(TEXT("reset"));
+		}
+#endif
+		if (!bCanRunGitMutation)
+		{
+			Error = TEXT("Git reset was rejected by the standalone mutation test seam.");
+		}
+		if (!bCanRunGitMutation || !GitSourceControlUtils::RunExactPathspecMutation(GitBinary, RepositoryRoot, TEXT("reset"), { TEXT("-q"), TEXT("HEAD") }, Files, Error))
 		{
 			FString RestoreError;
 			GitSourceControlUtils::RestoreIndexEntries(GitBinary, RepositoryRoot, IndexSnapshot, RestoreError);
@@ -916,7 +858,7 @@ namespace GitSourceControlAssetOperations
 			{
 				OutResult.AddError(RestoreError);
 			}
-			ReloadAfterPreparedFailure();
+			ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
 			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 			return false;
 		}
@@ -945,7 +887,7 @@ namespace GitSourceControlAssetOperations
 			{
 				OutResult.AddError(RestoreError);
 			}
-			ReloadAfterPreparedFailure();
+			ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
 			IFileManager::Get().Delete(*TemporaryFilename, false, true, true);
 			OutResult.AddError(bCanReplaceWorktree
 				? FString::Printf(TEXT("Could not replace workspace file '%s'."), *Target)
@@ -953,9 +895,12 @@ namespace GitSourceControlAssetOperations
 			return false;
 		}
 		GitSourceControlAssetOperationsPrivate::DeleteBackups(Backups);
-		OutResult.bSucceeded = true;
 		OutResult.AffectedFiles = Files;
-		if (Callbacks.ReloadPackages) OutResult.bReloadSucceeded = Callbacks.ReloadPackages(Files);
+		if (!ReloadPackagesAfterPreparation(Files, Callbacks, OutResult))
+		{
+			return false;
+		}
+		OutResult.bSucceeded = true;
 		return true;
 	}
 }

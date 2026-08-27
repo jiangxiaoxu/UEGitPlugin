@@ -213,7 +213,7 @@ bool FGitChangedAssetsSnapshotAutomationTest::RunTest(const FString& Parameters)
 	}
 	TestEqual(TEXT("Snapshot preserves requested generation"), Snapshot.Generation, static_cast<uint64>(17));
 	TestTrue(TEXT("Snapshot pins HEAD"), !Snapshot.PinnedHead.IsEmpty());
-	TestTrue(TEXT("Repository-wide status process is bounded by two HEAD checks"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() == static_cast<uint64>(3));
+	TestTrue(TEXT("Repository-wide status snapshot uses branch.oid plus one final HEAD check"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() == static_cast<uint64>(2));
 	TestEqual(TEXT("Snapshot only contains changed .uasset files"), Snapshot.Entries.Num(), 5);
 	const FGitChangedAssetEntry* Modified = FindByPath(Snapshot.Entries, TEXT("Content/Modified.uasset"));
 	const FGitChangedAssetEntry* Deleted = FindByPath(Snapshot.Entries, TEXT("Content/Deleted.uasset"));

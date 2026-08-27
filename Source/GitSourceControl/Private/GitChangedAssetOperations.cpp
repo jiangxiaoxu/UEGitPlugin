@@ -6,13 +6,23 @@
 
 #include "Algo/AllOf.h"
 #include "GitChangedAssetsStatus.h"
+#include "GitLfsLocalObjectStore.h"
 #include "GitRepositoryMutationGuard.h"
 #include "GitSourceControlFileStatus.h"
 #include "GitSourceControlUtils.h"
+#include "GitStandaloneLog.h"
+#include "AssetRegistry/ARFilter.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "Editor.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
+#include "Engine/LevelStreaming.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformTime.h"
 #include "HAL/PlatformProcess.h"
+#include "LevelInstance/LevelInstanceEditorLevelStreaming.h"
+#include "LevelInstance/LevelInstanceLevelStreaming.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
@@ -22,9 +32,27 @@
 #include "Misc/PackageName.h"
 #include "UObject/UObjectIterator.h"
 #include "UObject/UObjectGlobals.h"
+#include "WorldPartition/ActorDescContainerInstance.h"
+#include "WorldPartition/ActorDescContainerSubsystem.h"
+#include "WorldPartition/WorldPartition.h"
 
 namespace GitChangedAssetOperationsPrivate
 {
+#if WITH_DEV_AUTOMATION_TESTS
+	TWeakObjectPtr<UWorld> CurrentEditorWorldOverrideForTesting;
+#endif
+
+	UWorld* GetCurrentEditorWorld()
+	{
+#if WITH_DEV_AUTOMATION_TESTS
+		if (UWorld* const OverrideWorld = CurrentEditorWorldOverrideForTesting.Get())
+		{
+			return OverrideWorld;
+		}
+#endif
+		return GEditor != nullptr ? GEditor->GetEditorWorldContext().World() : nullptr;
+	}
+
 	struct FFileFingerprint
 	{
 		bool bExists = false;
@@ -374,85 +402,7 @@ namespace GitChangedAssetOperationsPrivate
 		return !OutPlan.AllFiles.IsEmpty();
 	}
 
-	bool TryParseLfsPointer(const FString& InPointerFilename, FString& OutOid, int64& OutSize, FString& OutError)
-	{
-		OutOid.Reset();
-		OutSize = 0;
-		FString Text;
-		if (!FFileHelper::LoadFileToString(Text, *InPointerFilename))
-		{
-			OutError = TEXT("Could not read the exact HEAD Git blob while checking Git LFS content.");
-			return false;
-		}
-		if (!Text.StartsWith(TEXT("version https://git-lfs.github.com/spec/v1")))
-		{
-			return true;
-		}
-		TArray<FString> Lines;
-		Text.ParseIntoArrayLines(Lines);
-		for (const FString& Line : Lines)
-		{
-			if (Line.StartsWith(TEXT("oid sha256:")))
-			{
-				OutOid = Line.Mid(11).TrimStartAndEnd();
-			}
-			else if (Line.StartsWith(TEXT("size ")))
-			{
-				const FString SizeText = Line.Mid(5).TrimStartAndEnd();
-				if (SizeText.IsEmpty() || !Algo::AllOf(SizeText, [](const TCHAR Character) { return Character >= TEXT('0') && Character <= TEXT('9'); }))
-				{
-					OutError = TEXT("The HEAD Git LFS pointer has an invalid size.");
-					return false;
-				}
-				OutSize = FCString::Atoi64(*SizeText);
-			}
-		}
-		if (OutOid.IsEmpty())
-		{
-			OutError = TEXT("The HEAD Git LFS pointer is missing its SHA-256 object id.");
-			return false;
-		}
-		if (OutOid.Len() != 64 || !Algo::AllOf(OutOid, [](const TCHAR Character) { return FChar::IsHexDigit(Character); }))
-		{
-			OutError = TEXT("The HEAD Git LFS pointer has an invalid SHA-256 object id.");
-			return false;
-		}
-		return true;
-	}
-
-	bool ResolveLfsObjectFilename(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InOid, FString& OutObjectFilename, FString& OutError)
-	{
-		FString Storage;
-		FString Output;
-		FString ConfigError;
-		if (GitSourceControlUtils::RunCommandInternalRaw(TEXT("config"), InGitBinary, InRepositoryRoot,
-			{ TEXT("--path"), TEXT("--get"), TEXT("lfs.storage") }, {}, Output, ConfigError, 0, false))
-		{
-			Storage = Output.TrimStartAndEnd();
-		}
-		if (Storage.IsEmpty())
-		{
-			FString GitCommonDirectory;
-			if (!GitSourceControlUtils::RunCommandInternalRaw(TEXT("rev-parse"), InGitBinary, InRepositoryRoot,
-				{ TEXT("--git-common-dir") }, {}, GitCommonDirectory, OutError))
-			{
-				if (OutError.IsEmpty())
-				{
-					OutError = TEXT("Could not resolve the local Git common directory for Git LFS.");
-				}
-				return false;
-			}
-			Storage = FPaths::Combine(GitCommonDirectory.TrimStartAndEnd(), TEXT("lfs"));
-		}
-		if (FPaths::IsRelative(Storage))
-		{
-			Storage = FPaths::ConvertRelativePathToFull(InRepositoryRoot, Storage);
-		}
-		OutObjectFilename = FPaths::Combine(Storage, TEXT("objects"), InOid.Left(2), InOid.Mid(2, 2), InOid);
-		return true;
-	}
-
-	bool EnsureHeadLfsObjectsAvailable(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InPinnedHead,
+	bool EnsureHeadLfsObjectsAvailable(FGitLfsLocalObjectStore& InObjectStore, const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InPinnedHead,
 		const TArray<FString>& InRestoreFiles, FString& OutError)
 	{
 		for (const FString& Filename : InRestoreFiles)
@@ -469,31 +419,40 @@ namespace GitChangedAssetOperationsPrivate
 			{
 				return false;
 			}
-			FString Oid;
-			int64 Size = 0;
-			if (!TryParseLfsPointer(PointerFilename, Oid, Size, OutError))
+			FGitLfsPointer Pointer;
+			const EGitLfsPointerParseResult PointerResult = ParseGitLfsPointerFile(PointerFilename, Pointer);
+			if (PointerResult == EGitLfsPointerParseResult::InvalidPointer)
 			{
+				OutError = TEXT("The HEAD Git blob contains an invalid Git LFS pointer.");
 				return false;
 			}
-			if (Oid.IsEmpty())
+			if (PointerResult == EGitLfsPointerParseResult::NotPointer)
 			{
 				continue;
 			}
 			FString ObjectFilename;
-			if (!ResolveLfsObjectFilename(InGitBinary, InRepositoryRoot, Oid, ObjectFilename, OutError))
+			EGitLfsLocalObjectLookupResult LookupResult = InObjectStore.FindObject(Pointer, ObjectFilename, OutError);
+			if (LookupResult == EGitLfsLocalObjectLookupResult::Error)
 			{
 				return false;
 			}
-			FString VerifyError;
-			if (GitSourceControlUtils::VerifyLocalLfsObject(InGitBinary, InRepositoryRoot, ObjectFilename, Oid, Size, VerifyError))
+			if (LookupResult == EGitLfsLocalObjectLookupResult::Found &&
+				GitSourceControlUtils::VerifyLocalLfsObject(InGitBinary, InRepositoryRoot, ObjectFilename, Pointer.Oid, Pointer.Size, OutError))
 			{
 				continue;
+			}
+			if (LookupResult == EGitLfsLocalObjectLookupResult::Found)
+			{
+				return false;
 			}
 			if (!GitSourceControlUtils::FetchLfsContentForRevision(InGitBinary, InRepositoryRoot, InPinnedHead, Relative, OutError))
 			{
 				return false;
 			}
-			if (!GitSourceControlUtils::VerifyLocalLfsObject(InGitBinary, InRepositoryRoot, ObjectFilename, Oid, Size, OutError))
+			InObjectStore.InvalidateCachedObject(Pointer);
+			LookupResult = InObjectStore.FindObject(Pointer, ObjectFilename, OutError);
+			if (LookupResult != EGitLfsLocalObjectLookupResult::Found ||
+				!GitSourceControlUtils::VerifyLocalLfsObject(InGitBinary, InRepositoryRoot, ObjectFilename, Pointer.Oid, Pointer.Size, OutError))
 			{
 				return false;
 			}
@@ -597,12 +556,17 @@ namespace GitChangedAssetOperationsPrivate
 		TSet<UPackage*> PackagesToReload;
 		TSet<UPackage*> SelectedPackages;
 		TSet<UPackage*> OwnerWorldPackages;
+		TSet<UWorld*> OwnerEditorWorlds;
 		TArray<FString> SelectedDirtyPackageNames;
 		TArray<FString> OwnerMapsToReload;
 	};
 
-	void AddOwnerWorldPackage(UPackage* InOwnerPackage, FEditorLifecyclePlan& InOutPlan)
+	void AddOwnerPackageForReload(UPackage* InOwnerPackage, FEditorLifecyclePlan& InOutPlan, UWorld* InOwnerEditorWorld = nullptr)
 	{
+		if (InOwnerEditorWorld != nullptr)
+		{
+			InOutPlan.OwnerEditorWorlds.Add(InOwnerEditorWorld);
+		}
 		if (InOwnerPackage == nullptr || InOutPlan.OwnerWorldPackages.Contains(InOwnerPackage))
 		{
 			return;
@@ -613,68 +577,318 @@ namespace GitChangedAssetOperationsPrivate
 		InOutPlan.OwnerMapsToReload.Add(InOwnerPackage->GetName());
 	}
 
-	void AddOwnerWorldFromExternalPackage(UPackage* InExternalPackage, FEditorLifecyclePlan& InOutPlan)
+	bool IsPackageBelowExternalPath(const FString& InPackageName, const FString& InExternalPath)
 	{
-		if (InExternalPackage == nullptr)
-		{
-			return;
-		}
-		if (UObject* Asset = InExternalPackage->FindAssetInPackage(); Asset != nullptr && Asset->IsPackageExternal())
-		{
-			if (UWorld* World = Asset->GetWorld())
-			{
-				AddOwnerWorldPackage(World->GetPackage(), InOutPlan);
-			}
-		}
+		return !InExternalPath.IsEmpty() && InPackageName.StartsWith(InExternalPath + TEXT("/"), ESearchCase::IgnoreCase);
 	}
 
-	bool AddLoadedWorldOwnersForExternalFilename(const FString& InFilename, FEditorLifecyclePlan& InOutPlan, FString& OutError)
+	bool IsExternalPackageInLevel(const ULevel& InLevel, const FString& InExternalPackageName, const bool bExternalObject)
 	{
+		const TArray<FString> ExternalPaths = bExternalObject
+			? ULevel::GetExternalObjectsPaths(InLevel.GetPackage()->GetName())
+			: ULevel::GetExternalActorsPaths(InLevel.GetPackage()->GetName());
+		return ExternalPaths.ContainsByPredicate([&InExternalPackageName](const FString& ExternalPath)
+		{
+			return IsPackageBelowExternalPath(InExternalPackageName, ExternalPath);
+		});
+	}
+
+	bool IsExternalPackageInContainer(const UActorDescContainerInstance& InContainerInstance, const FString& InExternalPackageName, const bool bExternalObject)
+	{
+		return IsPackageBelowExternalPath(InExternalPackageName, bExternalObject
+			? InContainerInstance.GetExternalObjectPath()
+			: InContainerInstance.GetExternalActorPath());
+	}
+
+	bool ResolveUnloadedExternalOwnerFromFilename(const FString& InFilename, FString& OutOwnerLevel, FString& OutError)
+	{
+		OutOwnerLevel.Reset();
 		FString ExternalPackageName;
 		if (!FPackageName::TryConvertFilenameToLongPackageName(InFilename, ExternalPackageName))
 		{
 			OutError = FString::Printf(TEXT("Could not resolve the renamed external package name: %s"), *InFilename);
 			return false;
 		}
-
-		TSet<UPackage*> Matches;
-		for (TObjectIterator<ULevel> It; It; ++It)
+		const bool bExternalObject = ExternalPackageName.Contains(TEXT("/__ExternalObjects__/"), ESearchCase::IgnoreCase);
+		const TCHAR* const Marker = bExternalObject ? TEXT("/__ExternalObjects__/") : TEXT("/__ExternalActors__/");
+		const int32 MarkerIndex = ExternalPackageName.Find(Marker, ESearchCase::IgnoreCase);
+		if (MarkerIndex == INDEX_NONE)
 		{
-			ULevel* Level = *It;
-			if (Level == nullptr || Level->GetWorld() == nullptr || Level->GetWorld()->GetPackage() == nullptr)
+			OutError = FString::Printf(TEXT("The renamed package is not a standard external actor or object path: %s"), *InFilename);
+			return false;
+		}
+
+		TSet<FString> CandidateOwners;
+		auto AddKnownOwner = [&CandidateOwners](const FString& CandidateOwner)
+		{
+			FString OwnerFilename;
+			if (!FPackageName::TryConvertLongPackageNameToFilename(CandidateOwner, OwnerFilename, FPackageName::GetMapPackageExtension()))
+			{
+				return;
+			}
+			if (FPaths::FileExists(OwnerFilename) || FindPackage(nullptr, *CandidateOwner) != nullptr)
+			{
+				CandidateOwners.Add(CandidateOwner);
+			}
+		};
+
+		const FString MountPoint = ExternalPackageName.Left(MarkerIndex);
+		FString RelativeExternalPath = ExternalPackageName.Mid(MarkerIndex + FCString::Strlen(Marker));
+		TArray<FString> PathParts;
+		RelativeExternalPath.ParseIntoArray(PathParts, TEXT("/"), true);
+		if (!MountPoint.IsEmpty() && PathParts.Num() >= 4)
+		{
+			PathParts.SetNum(PathParts.Num() - 3, EAllowShrinking::No);
+			AddKnownOwner(MountPoint + TEXT("/") + FString::Join(PathParts, TEXT("/")));
+		}
+
+		FARFilter WorldFilter;
+		WorldFilter.ClassPaths.Add(UWorld::StaticClass()->GetClassPathName());
+		WorldFilter.bRecursiveClasses = true;
+		WorldFilter.bIncludeOnlyOnDiskAssets = true;
+		TArray<FAssetData> WorldAssets;
+		IAssetRegistry::GetChecked().GetAssets(WorldFilter, WorldAssets, false);
+		for (const FAssetData& WorldAsset : WorldAssets)
+		{
+			const FString CandidateOwner = WorldAsset.PackageName.ToString();
+			const TArray<FString> ExternalPaths = bExternalObject
+				? ULevel::GetExternalObjectsPaths(CandidateOwner)
+				: ULevel::GetExternalActorsPaths(CandidateOwner);
+			if (ExternalPaths.ContainsByPredicate([&ExternalPackageName](const FString& ExternalPath)
+			{
+				return IsPackageBelowExternalPath(ExternalPackageName, ExternalPath);
+			}))
+			{
+				CandidateOwners.Add(CandidateOwner);
+			}
+		}
+
+		if (CandidateOwners.Num() != 1)
+		{
+			OutError = CandidateOwners.IsEmpty()
+				? FString::Printf(TEXT("Could not resolve a unique owner level for the renamed external source: %s"), *InFilename)
+				: FString::Printf(TEXT("The renamed external source matches multiple owner levels: %s"), *InFilename);
+			return false;
+		}
+		OutOwnerLevel = CandidateOwners.Array()[0];
+		return true;
+	}
+
+	bool AddCurrentEditorOwnerForExternalFilename(const FString& InFilename, const FString& InExpectedOwnerLevel,
+		FEditorLifecyclePlan& InOutPlan, bool& bOutMatchedCurrentOwner, FString& OutError)
+	{
+		bOutMatchedCurrentOwner = false;
+		FString ExternalPackageName;
+		if (!FPackageName::TryConvertFilenameToLongPackageName(InFilename, ExternalPackageName))
+		{
+			return true;
+		}
+
+		UWorld* const EditorWorld = GetCurrentEditorWorld();
+		if (EditorWorld == nullptr)
+		{
+			return true;
+		}
+
+		const bool bExternalObject = InFilename.Contains(TEXT("__ExternalObjects__"), ESearchCase::IgnoreCase);
+		TSet<UPackage*> MatchingOwnerPackages;
+		FString ChildContainerOwner;
+		FString DifferentOwnerLevel;
+		for (ULevel* Level : EditorWorld->GetLevels())
+		{
+			if (Level == nullptr || Level->GetWorld() != EditorWorld || Level->GetOutermost() == nullptr)
 			{
 				continue;
 			}
-			if (Level->IsUsingExternalActors())
+
+			bool bMatchedInitializedContainer = false;
+			if (UWorldPartition* WorldPartition = Level->GetWorldPartition(); WorldPartition != nullptr && WorldPartition->IsInitialized())
 			{
-				for (const FString& ActorsPath : ULevel::GetExternalActorsPaths(Level->GetPackage()->GetName()))
+				WorldPartition->ForEachActorDescContainerInstance([&](UActorDescContainerInstance* ContainerInstance)
 				{
-					if (ExternalPackageName.StartsWith(ActorsPath + TEXT("/"), ESearchCase::IgnoreCase))
+					if (ContainerInstance == nullptr || !IsExternalPackageInContainer(*ContainerInstance, ExternalPackageName, bExternalObject))
 					{
-						Matches.Add(Level->GetWorld()->GetPackage());
+						return;
 					}
-				}
+					bMatchedInitializedContainer = true;
+					const FString ContainerOwnerLevel = ContainerInstance->GetContainerPackage().ToString();
+					if (!InExpectedOwnerLevel.IsEmpty() && !ContainerOwnerLevel.Equals(InExpectedOwnerLevel, ESearchCase::CaseSensitive))
+					{
+						DifferentOwnerLevel = ContainerOwnerLevel;
+						return;
+					}
+					if (ContainerInstance->GetParentContainerInstance() != nullptr)
+					{
+						ChildContainerOwner = ContainerOwnerLevel;
+						return;
+					}
+					MatchingOwnerPackages.Add(Level == EditorWorld->PersistentLevel ? EditorWorld->GetPackage() : Level->GetOutermost());
+				}, true);
 			}
-			if (Level->IsUsingExternalObjects())
+
+			if (!bMatchedInitializedContainer && IsExternalPackageInLevel(*Level, ExternalPackageName, bExternalObject))
 			{
-				for (const FString& ObjectsPath : ULevel::GetExternalObjectsPaths(Level->GetPackage()->GetName()))
+				UPackage* const LevelPackage = Level == EditorWorld->PersistentLevel ? EditorWorld->GetPackage() : Level->GetOutermost();
+				if (LevelPackage == nullptr)
 				{
-					if (ExternalPackageName.StartsWith(ObjectsPath + TEXT("/"), ESearchCase::IgnoreCase))
-					{
-						Matches.Add(Level->GetWorld()->GetPackage());
-					}
+					continue;
 				}
+				if (!InExpectedOwnerLevel.IsEmpty() && !LevelPackage->GetName().Equals(InExpectedOwnerLevel, ESearchCase::CaseSensitive))
+				{
+					DifferentOwnerLevel = LevelPackage->GetName();
+					continue;
+				}
+				MatchingOwnerPackages.Add(LevelPackage);
 			}
 		}
-		if (Matches.Num() > 1)
+
+		if (!ChildContainerOwner.IsEmpty())
 		{
-			OutError = FString::Printf(TEXT("The renamed OFPA source matches multiple loaded owner maps: %s"), *InFilename);
+			OutError = FString::Printf(TEXT("The OFPA package belongs to an initialized child or Level Instance container and cannot be safely reloaded: %s"), *InFilename);
 			return false;
 		}
-		for (UPackage* OwnerPackage : Matches)
+		if (!DifferentOwnerLevel.IsEmpty())
 		{
-			AddOwnerWorldPackage(OwnerPackage, InOutPlan);
+			OutError = FString::Printf(TEXT("The OFPA metadata owner does not match the current Editor container '%s': %s"), *DifferentOwnerLevel, *InFilename);
+			return false;
 		}
+		if (MatchingOwnerPackages.Num() > 1)
+		{
+			OutError = FString::Printf(TEXT("The OFPA package matches multiple current Editor levels and cannot be safely reloaded: %s"), *InFilename);
+			return false;
+		}
+		for (UPackage* OwnerPackage : MatchingOwnerPackages)
+		{
+			AddOwnerPackageForReload(OwnerPackage, InOutPlan, EditorWorld);
+		}
+		bOutMatchedCurrentOwner = !MatchingOwnerPackages.IsEmpty();
+		return true;
+	}
+
+	bool AddDirectExternalPackageOwner(UPackage* InDirectPackage, const FString& InExpectedOwnerLevel,
+		FEditorLifecyclePlan& InOutPlan, const FString& InFilename, FString& OutError)
+	{
+		if (InDirectPackage == nullptr)
+		{
+			return true;
+		}
+		UObject* const Asset = InDirectPackage->FindAssetInPackage();
+		UWorld* const AssetWorld = Asset != nullptr && Asset->IsPackageExternal() ? Asset->GetWorld() : nullptr;
+		if (AssetWorld == nullptr)
+		{
+			OutError = FString::Printf(TEXT("The loaded OFPA package cannot be mapped to an Editor world, so its reload closure is unsafe: %s"), *InFilename);
+			return false;
+		}
+		if (AssetWorld->WorldType == EWorldType::PIE)
+		{
+			OutError = FString::Printf(TEXT("The OFPA package is consumed by PIE and cannot be reverted while that consumer is initialized: %s"), *InFilename);
+			return false;
+		}
+		if (AssetWorld->WorldType != EWorldType::Editor)
+		{
+			OutError = FString::Printf(TEXT("The loaded OFPA package belongs to a non-Editor world and cannot be safely reloaded: %s"), *InFilename);
+			return false;
+		}
+
+		ULevel* const OwnerLevel = Asset->GetTypedOuter<ULevel>();
+		if (OwnerLevel == nullptr || OwnerLevel->GetWorld() != AssetWorld)
+		{
+			OutError = FString::Printf(TEXT("The loaded OFPA package cannot be mapped to its owning Editor level, so its reload closure is unsafe: %s"), *InFilename);
+			return false;
+		}
+		if (OwnerLevel != AssetWorld->PersistentLevel)
+		{
+			if (ULevelStreaming* const LevelStreaming = ULevelStreaming::FindStreamingLevel(OwnerLevel);
+				LevelStreaming != nullptr && (LevelStreaming->IsA<ULevelStreamingLevelInstance>() || LevelStreaming->IsA<ULevelStreamingLevelInstanceEditor>()))
+			{
+				OutError = FString::Printf(TEXT("The loaded OFPA package belongs to a Level Instance and cannot be safely reloaded: %s"), *InFilename);
+				return false;
+			}
+		}
+
+		const FString ExternalPackageName = InDirectPackage->GetName();
+		const bool bExternalObject = ExternalPackageName.Contains(TEXT("__ExternalObjects__"), ESearchCase::IgnoreCase);
+		int32 MatchingContainerCount = 0;
+		bool bMatchesChildContainer = false;
+		if (UWorldPartition* const WorldPartition = OwnerLevel->GetWorldPartition(); WorldPartition != nullptr && WorldPartition->IsInitialized())
+		{
+			WorldPartition->ForEachActorDescContainerInstance([&](UActorDescContainerInstance* ContainerInstance)
+			{
+				if (ContainerInstance == nullptr || !IsExternalPackageInContainer(*ContainerInstance, ExternalPackageName, bExternalObject))
+				{
+					return;
+				}
+				++MatchingContainerCount;
+				bMatchesChildContainer |= ContainerInstance->GetParentContainerInstance() != nullptr;
+			}, true);
+		}
+		if (bMatchesChildContainer)
+		{
+			OutError = FString::Printf(TEXT("The loaded OFPA package belongs to an initialized child container and cannot be safely reloaded: %s"), *InFilename);
+			return false;
+		}
+		if (MatchingContainerCount > 1 || (MatchingContainerCount == 0 && !IsExternalPackageInLevel(*OwnerLevel, ExternalPackageName, bExternalObject)))
+		{
+			OutError = FString::Printf(TEXT("The loaded OFPA package could not be uniquely matched to its owning Editor level: %s"), *InFilename);
+			return false;
+		}
+
+		UPackage* const OwnerPackage = OwnerLevel == AssetWorld->PersistentLevel ? AssetWorld->GetPackage() : OwnerLevel->GetOutermost();
+		if (OwnerPackage == nullptr || (!InExpectedOwnerLevel.IsEmpty() && !OwnerPackage->GetName().Equals(InExpectedOwnerLevel, ESearchCase::CaseSensitive)))
+		{
+			OutError = FString::Printf(TEXT("The loaded OFPA package owner does not match its metadata owner, so its reload closure is unsafe: %s"), *InFilename);
+			return false;
+		}
+		AddOwnerPackageForReload(OwnerPackage, InOutPlan, AssetWorld);
+		return true;
+	}
+
+	bool AddExternalEntryLifecycle(const FString& InFilename, const FString& InExpectedOwnerLevel, UPackage* InDirectPackage,
+		FEditorLifecyclePlan& InOutPlan, FString& OutError)
+	{
+		bool bMatchedCurrentOwner = false;
+		if (!AddCurrentEditorOwnerForExternalFilename(InFilename, InExpectedOwnerLevel, InOutPlan, bMatchedCurrentOwner, OutError))
+		{
+			return false;
+		}
+		if (bMatchedCurrentOwner)
+		{
+			return true;
+		}
+		if (InDirectPackage != nullptr && !AddDirectExternalPackageOwner(InDirectPackage, InExpectedOwnerLevel, InOutPlan, InFilename, OutError))
+		{
+			return false;
+		}
+		if (InDirectPackage != nullptr)
+		{
+			return true;
+		}
+		if (!InExpectedOwnerLevel.IsEmpty())
+		{
+			if (UActorDescContainerSubsystem* ContainerSubsystem = UActorDescContainerSubsystem::Get();
+				ContainerSubsystem != nullptr && ContainerSubsystem->GetActorDescContainer(InExpectedOwnerLevel) != nullptr)
+			{
+				OutError = FString::Printf(TEXT("The OFPA owner has an initialized ActorDesc container outside the current Editor level and cannot be safely reverted: %s"), *InFilename);
+				return false;
+			}
+			if (UPackage* InactiveOwnerPackage = FindPackage(nullptr, *InExpectedOwnerLevel); InactiveOwnerPackage != nullptr && InactiveOwnerPackage->IsDirty())
+			{
+				OutError = FString::Printf(TEXT("The inactive OFPA owner map has unsaved Editor changes. Save or discard it before Changed Assets Revert: %s"), *InactiveOwnerPackage->GetName());
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool ResolveDirectEditorOwnerForExternalPackage(UPackage& InExternalPackage, TSet<UPackage*>& OutOwnerPackages, FString& OutError)
+	{
+		OutOwnerPackages.Reset();
+		FEditorLifecyclePlan CandidatePlan;
+		if (!AddDirectExternalPackageOwner(&InExternalPackage, FString(), CandidatePlan, InExternalPackage.GetName(), OutError))
+		{
+			return false;
+		}
+		OutOwnerPackages = MoveTemp(CandidatePlan.OwnerWorldPackages);
 		return true;
 	}
 
@@ -691,13 +905,10 @@ namespace GitChangedAssetOperationsPrivate
 			}
 			if (IsExternalEntry(Entry))
 			{
-				UPackage* OwnerPackage = FindPackage(nullptr, *Entry.OwnerLevel);
-				if (DirectPackage != nullptr && OwnerPackage == nullptr)
+				if (!AddExternalEntryLifecycle(Entry.AbsoluteFilename, Entry.OwnerLevel, DirectPackage, OutPlan, OutError))
 				{
-					OutError = FString::Printf(TEXT("The loaded OFPA package's resolved owner map is not loaded, so its reload closure is unsafe: %s"), *Entry.AbsoluteFilename);
 					return false;
 				}
-				AddOwnerWorldPackage(OwnerPackage, OutPlan);
 			}
 			else if (DirectPackage != nullptr)
 			{
@@ -713,11 +924,18 @@ namespace GitChangedAssetOperationsPrivate
 			{
 				OutPlan.SelectedPackages.Add(RenameSourcePackage);
 				OutPlan.PackagesToResetLoaders.Add(RenameSourcePackage);
-				AddOwnerWorldFromExternalPackage(RenameSourcePackage, OutPlan);
 			}
-			if (IsExternalFilename(Entry.RenameFromAbsoluteFilename) && !AddLoadedWorldOwnersForExternalFilename(Entry.RenameFromAbsoluteFilename, OutPlan, OutError))
+			if (IsExternalFilename(Entry.RenameFromAbsoluteFilename))
 			{
-				return false;
+				FString RenameSourceOwnerLevel;
+				if (RenameSourcePackage == nullptr && !ResolveUnloadedExternalOwnerFromFilename(Entry.RenameFromAbsoluteFilename, RenameSourceOwnerLevel, OutError))
+				{
+					return false;
+				}
+				if (!AddExternalEntryLifecycle(Entry.RenameFromAbsoluteFilename, RenameSourceOwnerLevel, RenameSourcePackage, OutPlan, OutError))
+				{
+					return false;
+				}
 			}
 		}
 
@@ -748,10 +966,40 @@ namespace GitChangedAssetOperationsPrivate
 			{
 				continue;
 			}
-			UWorld* World = Asset->GetWorld();
-			if (World != nullptr && OutPlan.OwnerWorldPackages.Contains(World->GetPackage()))
+			UWorld* const AssetWorld = Asset->GetWorld();
+			if (AssetWorld == nullptr)
 			{
-				OutError = FString::Printf(TEXT("A non-selected external package in an owner map reload closure has unsaved Editor changes: %s"), *Candidate->GetName());
+				continue;
+			}
+			TSet<UPackage*> CandidateOwnerPackages;
+			FString CandidateOwnerError;
+			if (!ResolveDirectEditorOwnerForExternalPackage(*Candidate, CandidateOwnerPackages, CandidateOwnerError))
+			{
+				if (OutPlan.OwnerEditorWorlds.Contains(AssetWorld))
+				{
+					OutError = FString::Printf(TEXT("A non-selected dirty external package could not be uniquely mapped to an Editor lifecycle closure: %s\n%s"),
+						*Candidate->GetName(), *CandidateOwnerError);
+					return false;
+				}
+				continue;
+			}
+			bool bCandidateInReloadClosure = false;
+			for (UPackage* CandidateOwnerPackage : CandidateOwnerPackages)
+			{
+				if (OutPlan.OwnerWorldPackages.Contains(CandidateOwnerPackage))
+				{
+					bCandidateInReloadClosure = true;
+					break;
+				}
+			}
+			if (bCandidateInReloadClosure)
+			{
+				OutError = FString::Printf(TEXT("A non-selected external package in an owner level reload closure has unsaved Editor changes: %s"), *Candidate->GetName());
+				return false;
+			}
+			if (CandidateOwnerPackages.IsEmpty() && OutPlan.OwnerEditorWorlds.Contains(AssetWorld))
+			{
+				OutError = FString::Printf(TEXT("A non-selected dirty external package could not be mapped to a current Editor level, so the reload closure is unsafe: %s"), *Candidate->GetName());
 				return false;
 			}
 		}
@@ -782,6 +1030,13 @@ namespace GitChangedAssetOperationsPrivate
 		for (const FString& PackageName : InPlan.OwnerMapsToReload)
 		{
 			Tokens.Add(TEXT("Owner:") + PackageName);
+		}
+		for (UWorld* OwnerWorld : InPlan.OwnerEditorWorlds)
+		{
+			if (OwnerWorld != nullptr)
+			{
+				Tokens.Add(TEXT("OwnerWorld:") + OwnerWorld->GetPathName());
+			}
 		}
 		Tokens.Sort();
 		return FString::Join(Tokens, TEXT("\n"));
@@ -837,6 +1092,20 @@ namespace GitChangedAssetOperations
 		const FGitChangedAssetRevertCallbacks& InCallbacks, FGitChangedAssetRevertResult& OutResult) const
 	{
 		OutResult = FGitChangedAssetRevertResult();
+		const double RevertStartSeconds = FPlatformTime::Seconds();
+		double PreflightSeconds = 0.0;
+		double ConfirmationSeconds = 0.0;
+		double LfsSeconds = 0.0;
+		double PrepareSeconds = 0.0;
+		double LoaderResetSeconds = 0.0;
+		double DiskMutationSeconds = 0.0;
+		double EditorFinalizeSeconds = 0.0;
+		ON_SCOPE_EXIT
+		{
+			UE_LOG(LogGitStandalone, Log, TEXT("Changed Assets Revert timing: success=%d reloadSuccess=%d preflight=%.3fs confirm=%.3fs lfs=%.3fs prepare=%.3fs loaderReset=%.3fs diskMutation=%.3fs editorFinalize=%.3fs total=%.3fs"),
+				OutResult.bSucceeded, OutResult.bReloadSucceeded, PreflightSeconds, ConfirmationSeconds, LfsSeconds, PrepareSeconds,
+				LoaderResetSeconds, DiskMutationSeconds, EditorFinalizeSeconds, FPlatformTime::Seconds() - RevertStartSeconds);
+		};
 		if (GitBinary.IsEmpty() || RepositoryRoot.IsEmpty() || !GitChangedAssetOperationsPrivate::IsCompleteObjectId(InPinnedHead))
 		{
 			OutResult.AddError(TEXT("Changed Assets Revert requires a Git binary, repository root, and complete pinned HEAD commit id."));
@@ -890,20 +1159,28 @@ namespace GitChangedAssetOperations
 			OutResult.AddError(Error);
 			return false;
 		}
+		PreflightSeconds = FPlatformTime::Seconds() - RevertStartSeconds;
+		const double ConfirmationStartSeconds = FPlatformTime::Seconds();
 		if (InCallbacks.Confirm && !InCallbacks.Confirm(InEntries, Error))
 		{
+			ConfirmationSeconds = FPlatformTime::Seconds() - ConfirmationStartSeconds;
 			OutResult.bCancelled = Error.IsEmpty();
 			OutResult.AddError(Error);
 			return false;
 		}
+		ConfirmationSeconds = FPlatformTime::Seconds() - ConfirmationStartSeconds;
 
 		// Only an explicitly confirmed Revert may issue targeted LFS downloads. Do this
 		// before unlinking Editor packages so a network failure leaves the Editor intact.
-		if (!GitChangedAssetOperationsPrivate::EnsureHeadLfsObjectsAvailable(GitBinary, RepositoryRoot, InPinnedHead, Plan.RestoreFromHeadFiles, Error))
+		const double LfsStartSeconds = FPlatformTime::Seconds();
+		FGitLfsLocalObjectStore LfsObjectStore(GitBinary, RepositoryRoot);
+		if (!GitChangedAssetOperationsPrivate::EnsureHeadLfsObjectsAvailable(LfsObjectStore, GitBinary, RepositoryRoot, InPinnedHead, Plan.RestoreFromHeadFiles, Error))
 		{
+			LfsSeconds = FPlatformTime::Seconds() - LfsStartSeconds;
 			OutResult.AddError(Error);
 			return false;
 		}
+		LfsSeconds = FPlatformTime::Seconds() - LfsStartSeconds;
 
 		bool bPrepared = false;
 		auto FinalizePreparedEditor = [&](const EGitChangedAssetMutationOutcome Outcome)
@@ -913,18 +1190,23 @@ namespace GitChangedAssetOperations
 				return;
 			}
 			FString FinalizeError;
+			const double FinalizeStartSeconds = FPlatformTime::Seconds();
 			if (!InCallbacks.FinalizeEditor(InEntries, Plan.AllFiles, Outcome, FinalizeError))
 			{
 				OutResult.bReloadSucceeded = false;
 				OutResult.AddError(FinalizeError.IsEmpty() ? TEXT("The Editor package reload did not complete." ) : FinalizeError);
 			}
+			EditorFinalizeSeconds += FPlatformTime::Seconds() - FinalizeStartSeconds;
 		};
 
+		const double PrepareStartSeconds = FPlatformTime::Seconds();
 		if (InCallbacks.PrepareForMutation && !InCallbacks.PrepareForMutation(InEntries, Error))
 		{
+			PrepareSeconds = FPlatformTime::Seconds() - PrepareStartSeconds;
 			OutResult.AddError(Error.IsEmpty() ? TEXT("The Editor could not prepare the selected packages for Revert.") : Error);
 			return false;
 		}
+		PrepareSeconds = FPlatformTime::Seconds() - PrepareStartSeconds;
 		bPrepared = true;
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -971,13 +1253,17 @@ namespace GitChangedAssetOperations
 			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
 			return false;
 		}
+		const double LoaderResetStartSeconds = FPlatformTime::Seconds();
 		if (InCallbacks.BeginMutation && !InCallbacks.BeginMutation(InEntries, Error))
 		{
+			LoaderResetSeconds = FPlatformTime::Seconds() - LoaderResetStartSeconds;
 			OutResult.AddError(Error.IsEmpty() ? TEXT("The Editor could not enter the Changed Assets mutation commit point.") : Error);
 			GitChangedAssetOperationsPrivate::DeleteBackups(Backups);
 			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
 			return false;
 		}
+		LoaderResetSeconds = FPlatformTime::Seconds() - LoaderResetStartSeconds;
+		const double DiskMutationStartSeconds = FPlatformTime::Seconds();
 
 		auto RollBack = [&](const FString& MutationError)
 		{
@@ -1013,11 +1299,13 @@ namespace GitChangedAssetOperations
 
 		if (!GitChangedAssetOperationsPrivate::RestoreExactPathsFromPinnedHead(GitBinary, RepositoryRoot, InPinnedHead, Plan.RestoreFromHeadFiles, Error))
 		{
+			DiskMutationSeconds = FPlatformTime::Seconds() - DiskMutationStartSeconds;
 			RollBack(Error.IsEmpty() ? TEXT("Could not restore the selected tracked assets from the pinned HEAD.") : Error);
 			return false;
 		}
 		if (!GitChangedAssetOperationsPrivate::ResetExactIndexPathsToPinnedHead(GitBinary, RepositoryRoot, InPinnedHead, Plan.RemoveFromIndexFiles, Error))
 		{
+			DiskMutationSeconds = FPlatformTime::Seconds() - DiskMutationStartSeconds;
 			RollBack(Error.IsEmpty() ? TEXT("Could not reset the exact Added or Renamed Git index paths to the pinned HEAD.") : Error);
 			return false;
 		}
@@ -1031,6 +1319,7 @@ namespace GitChangedAssetOperations
 #endif
 		if (!bAllowFilesystemMutation || !GitChangedAssetOperationsPrivate::DeleteExactFiles(Plan.DeleteFromWorktreeFiles, Error))
 		{
+			DiskMutationSeconds = FPlatformTime::Seconds() - DiskMutationStartSeconds;
 			RollBack(bAllowFilesystemMutation
 				? (Error.IsEmpty() ? TEXT("Could not delete the exact Added or Untracked asset files.") : Error)
 				: TEXT("Filesystem mutation was rejected by the Changed Assets rollback test seam."));
@@ -1038,11 +1327,20 @@ namespace GitChangedAssetOperations
 		}
 
 		GitChangedAssetOperationsPrivate::DeleteBackups(Backups);
+		DiskMutationSeconds = FPlatformTime::Seconds() - DiskMutationStartSeconds;
 		OutResult.bSucceeded = true;
 		OutResult.AffectedFiles = Plan.AllFiles;
 		FinalizePreparedEditor(EGitChangedAssetMutationOutcome::Succeeded);
 		return true;
 	}
+
+#if WITH_DEV_AUTOMATION_TESTS
+	void FGitChangedAssetRevertLifecycle::SetCurrentEditorWorldForTesting(UWorld* InWorld)
+	{
+		check(IsInGameThread());
+		GitChangedAssetOperationsPrivate::CurrentEditorWorldOverrideForTesting = InWorld;
+	}
+#endif
 
 	bool FGitChangedAssetRevertLifecycle::BuildPreview(const TArray<FGitChangedAssetEntry>& InEntries, FGitChangedAssetRevertPreview& OutPreview, FString& OutError)
 	{
@@ -1085,6 +1383,7 @@ namespace GitChangedAssetOperations
 		OutError.Reset();
 		PackagesToResetLoaders.Reset();
 		PackagesToReload.Reset();
+		OwnerPackageReloadCount = 0;
 		bPrepared = false;
 		bLoadersReset = false;
 		if (!IsInGameThread())
@@ -1114,6 +1413,7 @@ namespace GitChangedAssetOperations
 		{
 			PackagesToReload.Add(Package);
 		}
+		OwnerPackageReloadCount = Plan.OwnerWorldPackages.Num();
 		bPrepared = true;
 		return true;
 	}
@@ -1170,6 +1470,7 @@ namespace GitChangedAssetOperations
 		static_cast<void>(InEntries);
 		static_cast<void>(InAffectedFiles);
 		OutError.Reset();
+		const double FinishStartSeconds = FPlatformTime::Seconds();
 		if (!IsInGameThread())
 		{
 			OutError = TEXT("Changed Assets package finalization must run on the GameThread.");
@@ -1181,9 +1482,12 @@ namespace GitChangedAssetOperations
 		}
 		ON_SCOPE_EXIT
 		{
+			UE_LOG(LogGitStandalone, Log, TEXT("Changed Assets Revert editor finalize: outcome=%d reloadOwners=%d resetTargets=%d reloadTargets=%d elapsed=%.3fs"),
+				static_cast<int32>(InOutcome), OwnerPackageReloadCount, PackagesToResetLoaders.Num(), PackagesToReload.Num(), FPlatformTime::Seconds() - FinishStartSeconds);
 			PackagesToResetLoaders.Reset();
 			PackagesToReload.Reset();
 			ConfirmedClosureSignature.Reset();
+			OwnerPackageReloadCount = 0;
 			bClosureConfirmed = false;
 			bPrepared = false;
 			bLoadersReset = false;
@@ -1257,13 +1561,27 @@ namespace GitChangedAssetOperations
 				return true;
 			}
 			FText ReloadError;
-			UPackageTools::ReloadPackages(Packages, ReloadError, EReloadPackagesInteractionMode::AssumePositive);
+			const bool bReloaded = UPackageTools::ReloadPackages(Packages, ReloadError, EReloadPackagesInteractionMode::AssumePositive);
 			if (!ReloadError.IsEmpty())
 			{
 				OutError = ReloadError.ToString();
 				return false;
 			}
-			return true;
+			if (bReloaded)
+			{
+				return true;
+			}
+
+			UWorld* const CurrentEditorWorld = GEditor != nullptr ? GEditor->GetEditorWorldContext().World() : nullptr;
+			const bool bReloadedCurrentWorld = CurrentEditorWorld != nullptr && Packages.Contains(CurrentEditorWorld->GetOutermost());
+			if (bReloadedCurrentWorld)
+			{
+				// UPackageTools intentionally reports false for its CreateNewMapForEditing/
+				// OpenEditorsForAssets current-world route even when that route succeeds.
+				return true;
+			}
+			OutError = TEXT("UPackageTools did not reload any requested Changed Assets package.");
+			return false;
 		};
 		return ReloadGroup(NonWorldPackages) && ReloadGroup(WorldPackages);
 	}

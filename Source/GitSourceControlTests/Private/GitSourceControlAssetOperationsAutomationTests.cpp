@@ -208,6 +208,40 @@ bool FGitSourceControlAssetDiscardAutomationTest::RunTest(const FString& Paramet
 	TestTrue(TEXT("Discard commit-point rejection keeps index readable"), Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), IndexAfterCommitPoint));
 	TestEqual(TEXT("Discard commit-point rejection keeps index unchanged"), IndexAfterCommitPoint, IndexBeforeCommitPoint);
 	if (!TestCallbacks(*this, RaceConfirmCalls, RacePrepareCalls, RaceReloadCalls)) return false;
+
+	FString IndexBeforeInjectedFailure;
+	FString WorktreeBeforeInjectedFailure;
+	if (!Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), IndexBeforeInjectedFailure)
+		|| !Fixture.ReadFile(TEXT("Content/Tracked.uasset"), WorktreeBeforeInjectedFailure)) return false;
+	int32 FailedMutationConfirmCalls = 0;
+	int32 FailedMutationPrepareCalls = 0;
+	int32 FailedMutationReloadCalls = 0;
+	FGitAssetOperationCallbacks FailedMutationCallbacks = MakeAcceptingCallbacks(FailedMutationConfirmCalls, FailedMutationPrepareCalls, FailedMutationReloadCalls);
+	FailedMutationCallbacks.AllowGitMutationForTesting = [](const FString& GitSubcommand)
+	{
+		return !GitSubcommand.Equals(TEXT("restore"), ESearchCase::CaseSensitive);
+	};
+	FailedMutationCallbacks.ReloadPackages = [&FailedMutationReloadCalls](const TArray<FString>&)
+	{
+		++FailedMutationReloadCalls;
+		return false;
+	};
+	FGitAssetOperationResult FailedMutationResult;
+	TestFalse(TEXT("Discard reports the injected Git restore failure"), Operations.DiscardTrackedFiles({ Filename }, FailedMutationCallbacks, FailedMutationResult));
+	TestFalse(TEXT("Injected Git restore failure does not report success"), FailedMutationResult.bSucceeded);
+	TestFalse(TEXT("Injected Git restore failure reports failed package recovery"), FailedMutationResult.bReloadSucceeded);
+	TestTrue(TEXT("Injected Git restore failure records the package recovery diagnostic"), FailedMutationResult.Errors.ContainsByPredicate([](const FString& Error)
+	{
+		return Error.Contains(TEXT("reload callback failed"), ESearchCase::IgnoreCase);
+	}));
+	FString IndexAfterInjectedFailure;
+	FString WorktreeAfterInjectedFailure;
+	TestTrue(TEXT("Injected Git restore failure keeps index readable"), Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), IndexAfterInjectedFailure));
+	TestEqual(TEXT("Injected Git restore failure rolls back the index"), IndexAfterInjectedFailure, IndexBeforeInjectedFailure);
+	TestTrue(TEXT("Injected Git restore failure keeps worktree readable"), Fixture.ReadFile(TEXT("Content/Tracked.uasset"), WorktreeAfterInjectedFailure));
+	TestEqual(TEXT("Injected Git restore failure rolls back worktree bytes"), WorktreeAfterInjectedFailure, WorktreeBeforeInjectedFailure);
+	if (!TestCallbacks(*this, FailedMutationConfirmCalls, FailedMutationPrepareCalls, FailedMutationReloadCalls)) return false;
+
 	int32 ConfirmCalls = 0;
 	int32 PrepareCalls = 0;
 	int32 ReloadCalls = 0;
@@ -366,20 +400,33 @@ bool FGitSourceControlAssetHistoryRestoreAutomationTest::RunTest(const FString& 
 	int32 PrepareCalls = 0;
 	int32 ReloadCalls = 0;
 	FGitAssetOperationCallbacks Callbacks = MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls);
+	FString ConfirmationDescription;
+	Callbacks.Confirm = [&ConfirmCalls, &ConfirmationDescription](const FString& Description, const TArray<FString>&)
+	{
+		++ConfirmCalls;
+		ConfirmationDescription = Description;
+		return true;
+	};
 	Callbacks.ReloadPackages = [&ReloadCalls](const TArray<FString>&)
 	{
 		++ReloadCalls;
 		return false;
 	};
 	FGitAssetOperationResult Result;
-	if (!TestTrue(TEXT("Same-path historical uasset Restore succeeds when reload reports failure"), Operations.RestoreRevisionToWorkspace(Filename, FirstCommit, RelativeFilename, Callbacks, Result))) { AddError(FString::Join(Result.Errors, TEXT("\n"))); return false; }
+	TestFalse(TEXT("Same-path historical uasset Restore fails when reload reports failure"), Operations.RestoreRevisionToWorkspace(Filename, FirstCommit, RelativeFilename, Callbacks, Result));
 	TArray<uint8> RestoredBytes;
 	TestTrue(TEXT("Restored uasset bytes are readable"), FFileHelper::LoadFileToArray(RestoredBytes, *Filename));
 	TestTrue(TEXT("Restore writes requested historical uasset bytes"), RestoredBytes == FirstBytes);
 	FString IndexAfter;
 	TestTrue(TEXT("Index is readable after same-path Restore"), Fixture.RunGit(TEXT("ls-files --stage -- Content/Tracked.uasset"), IndexAfter));
 	TestEqual(TEXT("Same-path Force Restore resets the index to HEAD"), IndexAfter, IndexBefore);
-	TestTrue(TEXT("Successful disk Restore propagates the reload failure"), Result.bSucceeded && !Result.bReloadSucceeded);
+	TestFalse(TEXT("Successful disk Restore does not misreport success after reload failure"), Result.bSucceeded);
+	TestFalse(TEXT("Successful disk Restore propagates the reload failure"), Result.bReloadSucceeded);
+	TestTrue(TEXT("Successful disk Restore records the reload failure diagnostic"), Result.Errors.ContainsByPredicate([](const FString& Error)
+	{
+		return Error.Contains(TEXT("reload callback failed"), ESearchCase::IgnoreCase);
+	}));
+	TestTrue(TEXT("Historical Restore confirmation states the selected index reset"), ConfirmationDescription.Contains(TEXT("selected Git index entry will be reset to HEAD"), ESearchCase::CaseSensitive));
 	if (!TestCallbacks(*this, ConfirmCalls, PrepareCalls, ReloadCalls)) return false;
 
 	auto ForceRestoreTracked = [&]()

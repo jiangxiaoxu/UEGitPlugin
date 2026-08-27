@@ -7,6 +7,7 @@
 
 #include "Algo/AllOf.h"
 #include "DiffUtils.h"
+#include "GitLfsLocalObjectStore.h"
 #include "GitSourceControlRevision.h"
 #include "GitStandaloneHistory.h"
 #include "GitStandaloneLog.h"
@@ -129,6 +130,12 @@ namespace GitSourceControlUtilsPrivate
 {
 constexpr double GitCommandTimeoutSeconds = 30.0;
 constexpr double GitNetworkCommandTimeoutSeconds = 90.0;
+constexpr int32 MinimumGitMajorVersion = 2;
+constexpr int32 MinimumGitMinorVersion = 53;
+constexpr int32 MinimumGitPatchVersion = 0;
+constexpr int32 MinimumGitLfsMajorVersion = 3;
+constexpr int32 MinimumGitLfsMinorVersion = 7;
+constexpr int32 MinimumGitLfsPatchVersion = 1;
 
 #if WITH_DEV_AUTOMATION_TESTS
 TAtomic<uint64> GitProcessLaunchCount = 0;
@@ -145,6 +152,7 @@ const TArray<FString>& GetEmptyStringArray()
 struct FGitProcessResult
 {
 	int32 ReturnCode = -1;
+	bool bLaunchFailed = false;
 	bool bCancelled = false;
 	bool bTimedOut = false;
 	bool bInputWriteFailed = false;
@@ -152,8 +160,31 @@ struct FGitProcessResult
 	TArray<uint8> StandardError;
 };
 
+struct FGitReleaseVersion
+{
+	int32 Major = 0;
+	int32 Minor = 0;
+	int32 Patch = 0;
+};
+
+struct FGitBinaryCapabilityCache
+{
+	FString NormalizedPath;
+	FGitReleaseVersion Version;
+	bool bIsValid = false;
+};
+
+struct FGitLfsCapabilityCache
+{
+	FString NormalizedPath;
+	bool bIsSupported = false;
+};
+
 FCriticalSection GitRepositoryGatesLock;
 TMap<FString, TSharedRef<FCriticalSection, ESPMode::ThreadSafe>> GitRepositoryGates;
+FCriticalSection GitBinaryCapabilityCacheLock;
+FGitBinaryCapabilityCache GitBinaryCapabilityCache;
+FGitLfsCapabilityCache GitLfsCapabilityCache;
 thread_local TSharedPtr<FGitOperationCancellationContext, ESPMode::ThreadSafe> ActiveGitCancellationContext;
 
 FString NormalizeRepositoryKey(const FString& InRepositoryRoot)
@@ -164,6 +195,67 @@ FString NormalizeRepositoryKey(const FString& InRepositoryRoot)
 	Result = Result.ToLower();
 #endif
 	return Result;
+}
+
+FString NormalizeGitBinaryPath(const FString& InPathToGitBinary)
+{
+	FString Result = FPaths::ConvertRelativePathToFull(InPathToGitBinary);
+	FPaths::NormalizeFilename(Result);
+#if PLATFORM_WINDOWS
+	Result.ToLowerInline();
+#endif
+	return Result;
+}
+
+void InvalidateVerifiedGitBinaryInternal(const FString& InPathToGitBinary)
+{
+	const FString NormalizedPath = NormalizeGitBinaryPath(InPathToGitBinary);
+	if (NormalizedPath.IsEmpty())
+	{
+		return;
+	}
+
+	FScopeLock Lock(&GitBinaryCapabilityCacheLock);
+	if (GitBinaryCapabilityCache.bIsValid && GitBinaryCapabilityCache.NormalizedPath == NormalizedPath)
+	{
+		GitBinaryCapabilityCache = FGitBinaryCapabilityCache();
+	}
+	if (GitLfsCapabilityCache.bIsSupported && GitLfsCapabilityCache.NormalizedPath == NormalizedPath)
+	{
+		GitLfsCapabilityCache = FGitLfsCapabilityCache();
+	}
+}
+
+bool TryGetVerifiedGitBinary(FString& OutGitBinary)
+{
+	OutGitBinary.Reset();
+	FScopeLock Lock(&GitBinaryCapabilityCacheLock);
+	if (!GitBinaryCapabilityCache.bIsValid)
+	{
+		return false;
+	}
+	if (!FPaths::FileExists(GitBinaryCapabilityCache.NormalizedPath))
+	{
+		GitBinaryCapabilityCache = FGitBinaryCapabilityCache();
+		return false;
+	}
+	OutGitBinary = GitBinaryCapabilityCache.NormalizedPath;
+	FPaths::MakePlatformFilename(OutGitBinary);
+	return true;
+}
+
+void CacheVerifiedGitBinary(const FString& InPathToGitBinary, const FGitReleaseVersion& InVersion)
+{
+	const FString NormalizedPath = NormalizeGitBinaryPath(InPathToGitBinary);
+	if (NormalizedPath.IsEmpty())
+	{
+		return;
+	}
+
+	FScopeLock Lock(&GitBinaryCapabilityCacheLock);
+	GitBinaryCapabilityCache.NormalizedPath = NormalizedPath;
+	GitBinaryCapabilityCache.Version = InVersion;
+	GitBinaryCapabilityCache.bIsValid = true;
 }
 
 bool MakeRepositoryRelativePath(const FString& InRepositoryRoot, FString& InOutPath)
@@ -311,6 +403,8 @@ FGitProcessResult ExecuteGitProcess(const FString& InPathToGitBinary, const FStr
 
 	if (!ProcessHandle.IsValid())
 	{
+		Result.bLaunchFailed = true;
+		InvalidateVerifiedGitBinaryInternal(InPathToGitBinary);
 		FPlatformProcess::ClosePipe(StandardOutputRead, StandardOutputWrite);
 		FPlatformProcess::ClosePipe(StandardErrorRead, StandardErrorWrite);
 		if (StandardInputRead || StandardInputWrite)
@@ -405,76 +499,68 @@ FGitProcessResult ExecuteGitProcessOffGameThreadWithInput(const FString& InPathT
 	}).Get();
 }
 
-FString QuoteGitFileArgument(const FString& InArgument)
+FString QuoteGitArgument(const FString& InArgument)
 {
-	FString Escaped = InArgument;
-	Escaped.ReplaceInline(TEXT("\\\""), TEXT("\\\\\""));
-	Escaped.ReplaceInline(TEXT("\""), TEXT("\\\""));
-	return FString::Printf(TEXT("\"%s\""), *Escaped);
+	FString Result;
+	Result.Reserve(InArgument.Len() + 2);
+	Result.AppendChar(TEXT('"'));
+
+	int32 ConsecutiveBackslashes = 0;
+	for (const TCHAR Character : InArgument)
+	{
+		if (Character == TEXT('\\'))
+		{
+			++ConsecutiveBackslashes;
+			continue;
+		}
+
+		if (Character == TEXT('"'))
+		{
+			Result += FString::ChrN(ConsecutiveBackslashes * 2 + 1, TEXT('\\'));
+			Result.AppendChar(TEXT('"'));
+			ConsecutiveBackslashes = 0;
+			continue;
+		}
+
+		if (ConsecutiveBackslashes > 0)
+		{
+			Result += FString::ChrN(ConsecutiveBackslashes, TEXT('\\'));
+			ConsecutiveBackslashes = 0;
+		}
+		Result.AppendChar(Character);
+	}
+
+	// Backslashes immediately before the closing quote must be doubled for the
+	// Windows command-line parser. This representation is also accepted by the
+	// platform process implementations used by the other supported hosts.
+	Result += FString::ChrN(ConsecutiveBackslashes * 2, TEXT('\\'));
+	Result.AppendChar(TEXT('"'));
+	return Result;
+}
+
+void AppendGitArgument(FString& InOutArguments, const FString& InArgument)
+{
+	if (!InOutArguments.IsEmpty())
+	{
+		InOutArguments.AppendChar(TEXT(' '));
+	}
+	InOutArguments += QuoteGitArgument(InArgument);
 }
 
 bool ParseLfsPointerOutput(const FString& InOutput, FString& OutOid, int64& OutSize)
 {
 	OutOid.Reset();
 	OutSize = 0;
-	TArray<FString> Lines;
-	InOutput.ParseIntoArrayLines(Lines, false);
-	bool bFoundVersion = false;
-	bool bFoundOid = false;
-	bool bFoundSize = false;
-	for (FString Line : Lines)
-	{
-		Line.TrimStartAndEndInline();
-		if (Line.StartsWith(TEXT("version https://git-lfs.github.com/spec/v1"), ESearchCase::CaseSensitive))
-		{
-			if (bFoundVersion)
-			{
-				return false;
-			}
-			bFoundVersion = true;
-		}
-		else if (Line.StartsWith(TEXT("oid sha256:"), ESearchCase::CaseSensitive))
-		{
-			if (bFoundOid)
-			{
-				return false;
-			}
-			OutOid = Line.Mid(11).TrimStartAndEnd();
-			bFoundOid = true;
-		}
-		else if (Line.StartsWith(TEXT("size "), ESearchCase::CaseSensitive))
-		{
-			if (bFoundSize)
-			{
-				return false;
-			}
-			const FString Value = Line.Mid(5).TrimStartAndEnd();
-			if (Value.IsEmpty())
-			{
-				return false;
-			}
-			for (const TCHAR Character : Value)
-			{
-				if (Character < TEXT('0') || Character > TEXT('9'))
-				{
-					return false;
-				}
-			}
-			OutSize = FCString::Atoi64(*Value);
-			bFoundSize = true;
-		}
-	}
-	if (!bFoundVersion || !bFoundOid || !bFoundSize || OutOid.Len() != 64)
+	FTCHARToUTF8 Utf8(*InOutput);
+	TArray<uint8> Data;
+	Data.Append(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
+	FGitLfsPointer Pointer;
+	if (ParseGitLfsPointer(Data, Pointer) != EGitLfsPointerParseResult::ValidPointer)
 	{
 		return false;
 	}
-	for (const TCHAR Character : OutOid)
-	{
-		if (!FChar::IsHexDigit(Character))
-		{
-			return false;
-		}
-	}
+	OutOid = MoveTemp(Pointer.Oid);
+	OutSize = Pointer.Size;
 	return true;
 }
 
@@ -601,6 +687,240 @@ bool ResolveLfsFetchRemote(const FString& InPathToGitBinary, const FString& InRe
 		: TEXT("Git LFS content is missing locally and no remote could be selected. Configure the current branch upstream or leave exactly one remote, then retry.");
 	return false;
 }
+
+bool ParseGitReleaseVersion(const FString& InVersionOutput, FGitReleaseVersion& OutVersion)
+{
+	OutVersion = FGitReleaseVersion();
+	const FString Prefix = TEXT("git version ");
+	if (!InVersionOutput.StartsWith(Prefix, ESearchCase::CaseSensitive))
+	{
+		return false;
+	}
+
+	FString VersionToken = InVersionOutput.Mid(Prefix.Len());
+	VersionToken.TrimStartAndEndInline();
+	int32 FirstWhitespace = INDEX_NONE;
+	for (int32 Index = 0; Index < VersionToken.Len(); ++Index)
+	{
+		if (FChar::IsWhitespace(VersionToken[Index]))
+		{
+			FirstWhitespace = Index;
+			break;
+		}
+	}
+	if (FirstWhitespace != INDEX_NONE)
+	{
+		VersionToken = VersionToken.Left(FirstWhitespace);
+	}
+
+	int32 Cursor = 0;
+	auto ReadNumericComponent = [&VersionToken, &Cursor](int32& OutComponent) -> bool
+	{
+		const int32 Start = Cursor;
+		int64 Value = 0;
+		while (Cursor < VersionToken.Len() && FChar::IsDigit(VersionToken[Cursor]))
+		{
+			Value = Value * 10 + (VersionToken[Cursor] - TEXT('0'));
+			if (Value > MAX_int32)
+			{
+				return false;
+			}
+			++Cursor;
+		}
+		if (Cursor == Start)
+		{
+			return false;
+		}
+		OutComponent = static_cast<int32>(Value);
+		return true;
+	};
+
+	if (!ReadNumericComponent(OutVersion.Major) || Cursor >= VersionToken.Len() || VersionToken[Cursor++] != TEXT('.') ||
+		!ReadNumericComponent(OutVersion.Minor) || Cursor >= VersionToken.Len() || VersionToken[Cursor++] != TEXT('.') ||
+		!ReadNumericComponent(OutVersion.Patch))
+	{
+		return false;
+	}
+
+	// Git for Windows appends `.windows.N`; allow release packaging suffixes while
+	// rejecting pre-release builds such as `2.53.0-rc1` and `2.53.0.rc1`.
+	const FString Suffix = VersionToken.Mid(Cursor).ToLower();
+	if (Suffix.StartsWith(TEXT("-"), ESearchCase::CaseSensitive))
+	{
+		return false;
+	}
+	if (!Suffix.IsEmpty())
+	{
+		if (!Suffix.StartsWith(TEXT("."), ESearchCase::CaseSensitive))
+		{
+			return false;
+		}
+		TArray<FString> SuffixSegments;
+		Suffix.Mid(1).ParseIntoArray(SuffixSegments, TEXT("."), false);
+		if (SuffixSegments.IsEmpty())
+		{
+			return false;
+		}
+		for (const FString& Segment : SuffixSegments)
+		{
+			if (Segment.IsEmpty() || Segment.StartsWith(TEXT("rc"), ESearchCase::CaseSensitive) ||
+				Segment.StartsWith(TEXT("alpha"), ESearchCase::CaseSensitive) || Segment.StartsWith(TEXT("beta"), ESearchCase::CaseSensitive) ||
+				Segment.StartsWith(TEXT("pre"), ESearchCase::CaseSensitive))
+			{
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+bool IsSupportedGitRelease(const FGitReleaseVersion& InVersion)
+{
+	if (InVersion.Major != MinimumGitMajorVersion)
+	{
+		return InVersion.Major > MinimumGitMajorVersion;
+	}
+	if (InVersion.Minor != MinimumGitMinorVersion)
+	{
+		return InVersion.Minor > MinimumGitMinorVersion;
+	}
+	return InVersion.Patch >= MinimumGitPatchVersion;
+}
+
+bool ParseGitLfsReleaseVersion(const FString& InVersionOutput, FGitReleaseVersion& OutVersion)
+{
+	OutVersion = FGitReleaseVersion();
+	const FString Prefix = TEXT("git-lfs/");
+	if (!InVersionOutput.StartsWith(Prefix, ESearchCase::CaseSensitive))
+	{
+		return false;
+	}
+	FString VersionToken = InVersionOutput.Mid(Prefix.Len());
+	int32 FirstWhitespace = INDEX_NONE;
+	for (int32 Index = 0; Index < VersionToken.Len(); ++Index)
+	{
+		if (FChar::IsWhitespace(VersionToken[Index]))
+		{
+			FirstWhitespace = Index;
+			break;
+		}
+	}
+	if (FirstWhitespace != INDEX_NONE)
+	{
+		VersionToken = VersionToken.Left(FirstWhitespace);
+	}
+
+	int32 Cursor = 0;
+	auto ReadComponent = [&VersionToken, &Cursor](int32& OutComponent)
+	{
+		const int32 Start = Cursor;
+		int64 Value = 0;
+		while (Cursor < VersionToken.Len() && FChar::IsDigit(VersionToken[Cursor]))
+		{
+			Value = Value * 10 + (VersionToken[Cursor] - TEXT('0'));
+			if (Value > MAX_int32)
+			{
+				return false;
+			}
+			++Cursor;
+		}
+		if (Cursor == Start)
+		{
+			return false;
+		}
+		OutComponent = static_cast<int32>(Value);
+		return true;
+	};
+	return ReadComponent(OutVersion.Major) && Cursor < VersionToken.Len() && VersionToken[Cursor++] == TEXT('.') &&
+		ReadComponent(OutVersion.Minor) && Cursor < VersionToken.Len() && VersionToken[Cursor++] == TEXT('.') &&
+		ReadComponent(OutVersion.Patch) && Cursor == VersionToken.Len();
+}
+
+bool IsSupportedGitLfsRelease(const FGitReleaseVersion& InVersion)
+{
+	if (InVersion.Major != MinimumGitLfsMajorVersion)
+	{
+		return InVersion.Major > MinimumGitLfsMajorVersion;
+	}
+	if (InVersion.Minor != MinimumGitLfsMinorVersion)
+	{
+		return InVersion.Minor > MinimumGitLfsMinorVersion;
+	}
+	return InVersion.Patch >= MinimumGitLfsPatchVersion;
+}
+
+bool EnsureGitLfsCapability(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutError)
+{
+	OutError.Reset();
+	const FString NormalizedPath = NormalizeGitBinaryPath(InPathToGitBinary);
+	if (NormalizedPath.IsEmpty() || !FPaths::FileExists(NormalizedPath))
+	{
+		InvalidateVerifiedGitBinaryInternal(InPathToGitBinary);
+		OutError = TEXT("The resolved Git executable is no longer available for Git LFS.");
+		return false;
+	}
+	{
+		FScopeLock Lock(&GitBinaryCapabilityCacheLock);
+		if (GitLfsCapabilityCache.bIsSupported && GitLfsCapabilityCache.NormalizedPath == NormalizedPath)
+		{
+			return true;
+		}
+	}
+
+	const FGitProcessResult Result = ExecuteGitProcessOffGameThread(InPathToGitBinary, InRepositoryRoot, TEXT("lfs version"));
+	if (Result.bCancelled || Result.bTimedOut)
+	{
+		OutError = Result.bCancelled
+			? TEXT("Git LFS capability detection was cancelled.")
+			: TEXT("Git LFS capability detection timed out.");
+		return false;
+	}
+	FGitReleaseVersion Version;
+	const bool bSupported = !Result.bLaunchFailed && Result.ReturnCode == 0 &&
+		ParseGitLfsReleaseVersion(BytesToString(Result.StandardOutput), Version) && IsSupportedGitLfsRelease(Version);
+	if (!bSupported)
+	{
+		if (Result.bLaunchFailed)
+		{
+			InvalidateVerifiedGitBinaryInternal(InPathToGitBinary);
+		}
+		OutError = BytesToString(Result.StandardError);
+		OutError.TrimStartAndEndInline();
+		if (OutError.IsEmpty())
+		{
+			OutError = TEXT("Git LFS 3.7.1 or a newer release is required.");
+		}
+		return false;
+	}
+	{
+		FScopeLock Lock(&GitBinaryCapabilityCacheLock);
+		GitLfsCapabilityCache.NormalizedPath = NormalizedPath;
+		GitLfsCapabilityCache.bIsSupported = true;
+	}
+	return true;
+}
+
+bool CheckGitAvailability(const FString& InPathToGitBinary)
+{
+	if (InPathToGitBinary.IsEmpty() || !FPaths::FileExists(InPathToGitBinary))
+	{
+		InvalidateVerifiedGitBinaryInternal(InPathToGitBinary);
+		return false;
+	}
+
+	const FGitProcessResult Result = ExecuteGitProcessOffGameThread(InPathToGitBinary, FString(), TEXT("version"));
+	FGitReleaseVersion Version;
+	if (Result.bLaunchFailed || Result.bCancelled || Result.bTimedOut || Result.ReturnCode != 0 ||
+		!ParseGitReleaseVersion(BytesToString(Result.StandardOutput), Version) || !IsSupportedGitRelease(Version))
+	{
+		InvalidateVerifiedGitBinaryInternal(InPathToGitBinary);
+		UE_LOG(LogGitStandalone, Verbose, TEXT("Ignoring Git executable '%s': this plugin requires Git 2.53.0 or a newer release."), *InPathToGitBinary);
+		return false;
+	}
+
+	CacheVerifiedGitBinary(InPathToGitBinary, Version);
+	return true;
+}
 } // namespace GitSourceControlUtilsPrivate
 
 using namespace GitSourceControlUtilsPrivate;
@@ -613,6 +933,11 @@ void FGitOperationCancellationContext::Cancel()
 bool FGitOperationCancellationContext::IsCancellationRequested() const
 {
 	return bCancellationRequested.Load();
+}
+
+void InvalidateVerifiedGitBinary(const FString& InPathToGitBinary)
+{
+	InvalidateVerifiedGitBinaryInternal(InPathToGitBinary);
 }
 
 FGitOperationCancellationScope::FGitOperationCancellationScope(TSharedPtr<FGitOperationCancellationContext, ESPMode::ThreadSafe> InContext)
@@ -647,16 +972,14 @@ bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitB
 	FString Arguments = InCommand;
 	for (const FString& Parameter : InParameters)
 	{
-		Arguments += TEXT(" ");
-		Arguments += Parameter;
+		AppendGitArgument(Arguments, Parameter);
 	}
 	if (InFiles.Num() > 0)
 	{
 		Arguments += TEXT(" --");
 		for (const FString& File : InFiles)
 		{
-			Arguments += TEXT(" ");
-			Arguments += QuoteGitFileArgument(File);
+			AppendGitArgument(Arguments, File);
 		}
 	}
 
@@ -703,6 +1026,12 @@ static bool RunCommandInternal(const FString& InCommand, const FString& InPathTo
 
 FString FindGitBinaryPath()
 {
+	FString CachedGitBinary;
+	if (TryGetVerifiedGitBinary(CachedGitBinary))
+	{
+		return CachedGitBinary;
+	}
+
 #if PLATFORM_WINDOWS
 	FString GitBinaryPath;
 	bool bFound = false;
@@ -959,7 +1288,7 @@ bool ResolveStandaloneRepositoryForFile(const FString& InFilename, FString& OutG
 	OutGitBinary = FindGitBinaryPath();
 	if (OutGitBinary.IsEmpty())
 	{
-		OutError = TEXT("Could not locate a usable local Git executable.");
+		OutError = TEXT("Could not locate a supported local Git executable. Git 2.53.0 or a newer release is required.");
 		return false;
 	}
 	if (!FindRootDirectory(Filename, OutRepositoryRoot))
@@ -981,6 +1310,13 @@ namespace Testing
 		GitSourceControlUtilsPrivate::GitProcessLaunchCount.Store(0);
 		GitSourceControlUtilsPrivate::GitLfsFetchLaunchCount.Store(0);
 	}
+
+void ResetVerifiedGitBinaryCache()
+{
+	FScopeLock Lock(&GitSourceControlUtilsPrivate::GitBinaryCapabilityCacheLock);
+	GitSourceControlUtilsPrivate::GitBinaryCapabilityCache = GitSourceControlUtilsPrivate::FGitBinaryCapabilityCache();
+	GitSourceControlUtilsPrivate::GitLfsCapabilityCache = GitSourceControlUtilsPrivate::FGitLfsCapabilityCache();
+}
 
 	uint64 GetGitProcessLaunchCount()
 	{
@@ -1060,26 +1396,6 @@ namespace Testing
 }
 #endif
 
-bool CheckGitAvailability(const FString& InPathToGitBinary, FGitVersion* OutVersion)
-{
-	FString InfoMessages;
-	FString ErrorMessages;
-	bool bGitAvailable = RunCommandInternalRaw(TEXT("version"), InPathToGitBinary, FString(), GetEmptyStringArray(), GetEmptyStringArray(), InfoMessages, ErrorMessages);
-	if (bGitAvailable)
-	{
-		if (!InfoMessages.StartsWith("git version"))
-		{
-			bGitAvailable = false;
-		}
-		else if (OutVersion)
-		{
-			ParseGitVersion(InfoMessages, OutVersion);
-		}
-	}
-
-	return bGitAvailable;
-}
-
 bool VerifyLocalLfsObject(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InObjectFilename, const FString& InExpectedOid, const int64 InExpectedSize, FString& OutError)
 {
 	OutError.Reset();
@@ -1099,9 +1415,15 @@ bool VerifyLocalLfsObject(const FString& InPathToGitBinary, const FString& InRep
 		OutError = FString::Printf(TEXT("The local Git LFS object has size %lld, but the pointer requires %lld bytes."), ObjectSize, InExpectedSize);
 		return false;
 	}
+	if (!EnsureGitLfsCapability(InPathToGitBinary, InRepositoryRoot, OutError))
+	{
+		return false;
+	}
 
-	const FString Arguments = FString::Printf(TEXT("pointer --file=%s"), *QuoteGitFileArgument(InObjectFilename));
-	const FGitProcessResult ProcessResult = ExecuteGitProcessOffGameThread(InPathToGitBinary, InRepositoryRoot, FString::Printf(TEXT("lfs %s"), *Arguments));
+	FString Arguments = TEXT("lfs");
+	AppendGitArgument(Arguments, TEXT("pointer"));
+	AppendGitArgument(Arguments, TEXT("--file=") + InObjectFilename);
+	const FGitProcessResult ProcessResult = ExecuteGitProcessOffGameThread(InPathToGitBinary, InRepositoryRoot, Arguments);
 	if (ProcessResult.bCancelled)
 	{
 		OutError = TEXT("Git LFS object verification was cancelled.");
@@ -1149,6 +1471,10 @@ bool FetchLfsContentForRevision(const FString& InPathToGitBinary, const FString&
 		OutError = TEXT("Git binary, repository root, complete commit id and a repository-relative historical path are required for Git LFS download.");
 		return false;
 	}
+	if (!EnsureGitLfsCapability(InPathToGitBinary, InRepositoryRoot, OutError))
+	{
+		return false;
+	}
 
 	FString Remote;
 	if (!ResolveLfsFetchRemote(InPathToGitBinary, InRepositoryRoot, Remote, OutError))
@@ -1156,8 +1482,12 @@ bool FetchLfsContentForRevision(const FString& InPathToGitBinary, const FString&
 		return false;
 	}
 
-	const FString Arguments = FString::Printf(TEXT("lfs fetch %s %s --include=%s --exclude="),
-		*QuoteGitFileArgument(Remote), *QuoteGitFileArgument(InFullCommitId), *QuoteGitFileArgument(HistoricalPath));
+	FString Arguments = TEXT("lfs");
+	AppendGitArgument(Arguments, TEXT("fetch"));
+	AppendGitArgument(Arguments, Remote);
+	AppendGitArgument(Arguments, InFullCommitId);
+	AppendGitArgument(Arguments, TEXT("--include=") + HistoricalPath);
+	AppendGitArgument(Arguments, TEXT("--exclude="));
 	UE_LOG(LogGitStandalone, Log, TEXT("Fetching requested Git LFS revision content from remote '%s'."), *Remote);
 #if WITH_DEV_AUTOMATION_TESTS
 	++GitSourceControlUtilsPrivate::GitLfsFetchLaunchCount;
@@ -1184,56 +1514,6 @@ bool FetchLfsContentForRevision(const FString& InPathToGitBinary, const FString&
 		return false;
 	}
 	return true;
-}
-
-void ParseGitVersion(const FString& InVersionString, FGitVersion* OutVersion)
-{
-#if UE_BUILD_DEBUG
-	// Parse "git version 2.31.1.vfs.0.3" into the string "2.31.1.vfs.0.3"
-	const FString& TokenVersionStringPtr = InVersionString.RightChop(12);
-	if (!TokenVersionStringPtr.IsEmpty())
-	{
-		// Parse the version into its numerical components
-		TArray<FString> ParsedVersionString;
-		TokenVersionStringPtr.ParseIntoArray(ParsedVersionString, TEXT("."));
-		const int Num = ParsedVersionString.Num();
-		if (Num >= 3)
-		{
-			if (ParsedVersionString[0].IsNumeric() && ParsedVersionString[1].IsNumeric() && ParsedVersionString[2].IsNumeric())
-			{
-				OutVersion->Major = FCString::Atoi(*ParsedVersionString[0]);
-				OutVersion->Minor = FCString::Atoi(*ParsedVersionString[1]);
-				OutVersion->Patch = FCString::Atoi(*ParsedVersionString[2]);
-				if (Num >= 5)
-				{
-					// If labeled with fork
-					if (!ParsedVersionString[3].IsNumeric())
-					{
-						OutVersion->Fork = ParsedVersionString[3];
-						OutVersion->bIsFork = true;
-						OutVersion->ForkMajor = FCString::Atoi(*ParsedVersionString[4]);
-						if (Num >= 6)
-						{
-							OutVersion->ForkMinor = FCString::Atoi(*ParsedVersionString[5]);
-							if (Num >= 7)
-							{
-								OutVersion->ForkPatch = FCString::Atoi(*ParsedVersionString[6]);
-							}
-						}
-					}
-				}
-				if (OutVersion->bIsFork)
-				{
-					UE_LOG(LogGitStandalone, Log, TEXT("Git version %d.%d.%d.%s.%d.%d.%d"), OutVersion->Major, OutVersion->Minor, OutVersion->Patch, *OutVersion->Fork, OutVersion->ForkMajor, OutVersion->ForkMinor, OutVersion->ForkPatch);
-				}
-				else
-				{
-					UE_LOG(LogGitStandalone, Log, TEXT("Git version %d.%d.%d"), OutVersion->Major, OutVersion->Minor, OutVersion->Patch);
-				}
-			}
-		}
-	}
-#endif
 }
 
 // Find the root of the Git repository, looking from the provided path and upward in its parent directories.
@@ -1456,7 +1736,7 @@ bool RunStatusCommands(const FString& InPathToGitBinary, const FString& InReposi
 			return false;
 		}
 		FPaths::NormalizeFilename(RelativeFile);
-		const FString QuotedPath = QuoteGitFileArgument(RelativeFile);
+		const FString QuotedPath = QuoteGitArgument(RelativeFile);
 		if (Arguments.Len() + QuotedPath.Len() + 1 > MaxCommandLineLength && Arguments.Len() > Prefix.Len())
 		{
 			TArray<uint8> BatchOutput;
@@ -1494,7 +1774,7 @@ bool RunLsFilesCommands(const FString& InPathToGitBinary, const FString& InRepos
 			return false;
 		}
 		FPaths::NormalizeFilename(RelativeFile);
-		const FString QuotedPath = QuoteGitFileArgument(RelativeFile);
+		const FString QuotedPath = QuoteGitArgument(RelativeFile);
 		if (Arguments.Len() + QuotedPath.Len() + 1 > MaxCommandLineLength && Arguments.Len() > Prefix.Len())
 		{
 			TArray<uint8> BatchOutput;
@@ -1524,8 +1804,7 @@ bool BuildLiteralPathArguments(const FString& InRepositoryRoot, const FString& I
 	OutArguments = TEXT("--no-optional-locks --literal-pathspecs ") + InVerb;
 	for (const FString& Parameter : InParameters)
 	{
-		OutArguments += TEXT(" ");
-		OutArguments += Parameter;
+		AppendGitArgument(OutArguments, Parameter);
 	}
 	OutArguments += TEXT(" --");
 	for (const FString& File : InFiles)
@@ -1537,7 +1816,7 @@ bool BuildLiteralPathArguments(const FString& InRepositoryRoot, const FString& I
 			return false;
 		}
 		FPaths::NormalizeFilename(RelativeFile);
-		const FString QuotedPath = QuoteGitFileArgument(RelativeFile);
+		const FString QuotedPath = QuoteGitArgument(RelativeFile);
 		if (OutArguments.Len() + QuotedPath.Len() + 1 > MaxCommandLineLength)
 		{
 			OutError = TEXT("The selected file set exceeds Git's safe command-line limit.");
@@ -1825,7 +2104,7 @@ bool AppendUnstagedRenameFallbackPairs(const FString& InPathToGitBinary, const F
 	for (const FString& RelativePath : DeletedPaths)
 	{
 		FString ObjectId;
-		const FString Arguments = FString::Printf(TEXT("--no-optional-locks rev-parse --verify HEAD:%s"), *QuoteGitFileArgument(RelativePath));
+		const FString Arguments = FString::Printf(TEXT("--no-optional-locks rev-parse --verify HEAD:%s"), *QuoteGitArgument(RelativePath));
 		if (!ReadGitObjectId(InPathToGitBinary, InRepositoryRoot, Arguments, ObjectId, OutErrorMessages))
 		{
 			return false;
@@ -1836,7 +2115,7 @@ bool AppendUnstagedRenameFallbackPairs(const FString& InPathToGitBinary, const F
 	for (const FString& RelativePath : UntrackedPaths)
 	{
 		FString ObjectId;
-		const FString Arguments = FString::Printf(TEXT("--no-optional-locks --literal-pathspecs hash-object --path=%s -- %s"), *QuoteGitFileArgument(RelativePath), *QuoteGitFileArgument(RelativePath));
+		const FString Arguments = FString::Printf(TEXT("--no-optional-locks --literal-pathspecs hash-object --path=%s -- %s"), *QuoteGitArgument(RelativePath), *QuoteGitArgument(RelativePath));
 		if (!ReadGitObjectId(InPathToGitBinary, InRepositoryRoot, Arguments, ObjectId, OutErrorMessages))
 		{
 			return false;
@@ -1966,7 +2245,7 @@ bool RunRepositoryStatusPorcelainV2(const FString& InPathToGitBinary, const FStr
 	FPaths::NormalizeDirectoryName(RepositoryRoot);
 	TArray<FString> Errors;
 	if (!RunLocalCommand(InPathToGitBinary, RepositoryRoot,
-		TEXT("--no-optional-locks --literal-pathspecs status --porcelain=v2 -z --renames --untracked-files=all --ignored=no"),
+		TEXT("--no-optional-locks --literal-pathspecs status --porcelain=v2 --branch --no-ahead-behind -z --renames --untracked-files=all --ignored=no"),
 		OutStandardOutput, Errors))
 	{
 		OutError = Errors.IsEmpty() ? TEXT("Repository-wide Git status query failed.") : Errors[0];
@@ -2014,7 +2293,7 @@ bool RunPathsStatusPorcelainV2(const FString& InPathToGitBinary, const FString& 
 			continue;
 		}
 
-		const FString QuotedPath = QuoteGitFileArgument(RelativeFilename);
+		const FString QuotedPath = QuoteGitArgument(RelativeFilename);
 		if (Arguments.Len() + QuotedPath.Len() + 1 > MaxCommandLineLength)
 		{
 			OutError = TEXT("The exact Changed Assets recheck path set exceeds the one-process command-line limit.");
@@ -2618,12 +2897,11 @@ bool LoadSegment(const FString& InPathToGitBinary, const FString& InRepositoryRo
 	const FString& InLocalFilename, const int32 InMaxCount, TArray<FString>& OutErrorMessages, TGitSourceControlHistory& OutHistory)
 {
 	TArray<uint8> Output;
-	const FString Arguments = FString::Printf(
-		// Manual port of upstream 9d5f309 intent: keep machine-parsed history records free of ANSI sequences.
-		TEXT("--no-optional-locks --literal-pathspecs log --no-color %s --date=raw --name-status -z --max-count=%d --format=%%x1e%%H%%x1f%%an%%x1f%%at%%x1f%%s%%x00 -- %s"),
-		*InStartCommit,
-		InMaxCount,
-		*QuoteGitFileArgument(InRelativePath));
+	// Manual port of upstream 9d5f309 intent: keep machine-parsed history records free of ANSI sequences.
+	FString Arguments = FString::Printf(TEXT("--no-optional-locks --literal-pathspecs log --no-color --date=raw --name-status -z --max-count=%d --format=%%x1e%%H%%x1f%%an%%x1f%%at%%x1f%%s%%x00"), InMaxCount);
+	AppendGitArgument(Arguments, InStartCommit);
+	Arguments += TEXT(" --");
+	AppendGitArgument(Arguments, InRelativePath);
 	if (!RunLocalCommand(InPathToGitBinary, InRepositoryRoot, Arguments, Output, OutErrorMessages))
 	{
 		return false;
@@ -2667,8 +2945,9 @@ bool FindExactRenamePredecessor(const FString& InPathToGitBinary, const FString&
 	OutOldPath.Reset();
 
 	TArray<uint8> ParentOutput;
-	if (!RunLocalCommand(InPathToGitBinary, InRepositoryRoot,
-		FString::Printf(TEXT("--no-optional-locks rev-list --parents -n 1 %s"), *InCommit), ParentOutput, OutErrorMessages))
+	FString ParentArguments = TEXT("--no-optional-locks rev-list --parents -n 1");
+	AppendGitArgument(ParentArguments, InCommit);
+	if (!RunLocalCommand(InPathToGitBinary, InRepositoryRoot, ParentArguments, ParentOutput, OutErrorMessages))
 	{
 		return false;
 	}
@@ -2681,10 +2960,11 @@ bool FindExactRenamePredecessor(const FString& InPathToGitBinary, const FString&
 	}
 
 	TArray<uint8> DiffOutput;
-	if (!RunLocalCommand(InPathToGitBinary, InRepositoryRoot,
-		// Manual port of upstream 9d5f309 intent: keep machine-parsed rename records free of ANSI sequences.
-		FString::Printf(TEXT("--no-optional-locks diff-tree --no-color --no-commit-id -r --name-status -z --find-renames=100%% %s %s"), *ParentFields[1], *InCommit),
-		DiffOutput, OutErrorMessages))
+	// Manual port of upstream 9d5f309 intent: keep machine-parsed rename records free of ANSI sequences.
+	FString DiffArguments = TEXT("--no-optional-locks diff-tree --no-color --no-commit-id -r --name-status -z --find-renames=100%");
+	AppendGitArgument(DiffArguments, ParentFields[1]);
+	AppendGitArgument(DiffArguments, InCommit);
+	if (!RunLocalCommand(InPathToGitBinary, InRepositoryRoot, DiffArguments, DiffOutput, OutErrorMessages))
 	{
 		return false;
 	}
@@ -2862,7 +3142,7 @@ bool DumpRevisionBlobToFile(const FString& InPathToGitBinary, const FString& InR
 		return false;
 	}
 	const FString TemporaryFile = FPaths::CreateTempFilename(*OutputDirectory, TEXT(".git-source-control-blob-"), TEXT(".tmp"));
-	const FString Arguments = FString::Printf(TEXT("--no-optional-locks cat-file blob %s"), *QuoteGitFileArgument(InRevisionSpec));
+	const FString Arguments = FString::Printf(TEXT("--no-optional-locks cat-file blob %s"), *QuoteGitArgument(InRevisionSpec));
 	const FGitProcessResult ProcessResult = ExecuteGitProcessOffGameThread(InPathToGitBinary, InRepositoryRoot, Arguments);
 	if (ProcessResult.bCancelled || ProcessResult.bTimedOut || ProcessResult.ReturnCode != 0)
 	{
