@@ -19,8 +19,9 @@
 4. 普通单击或 Ctrl+单击会切换单行选择并保留其他选择; Shift 选择当前过滤结果中的连续范围, Ctrl+Shift 追加范围. checkbox 与行高亮使用同一选择状态. 不可回退行可以被选中, 但混合选择会按 all-or-nothing 规则禁用整批 Revert.
 5. 选择一行或多行后执行 `Revert Selected to HEAD...`. 该操作会同时丢弃所选项 staged 与 unstaged 内容; `Modified`/`Deleted` 恢复 HEAD, `Added`/`Untracked` 精确删除, `Renamed` 原子恢复旧/新路径, `Conflicted` 不可回退. OFPA 的 dirty owner map 或 unresolved owner 同样阻止操作. 确认后没有 Undo.
 
-Changed Assets 不使用 DirectoryWatcher, 后台轮询或跨刷新 status cache. 刷新结果按 generation 合并; 新一代 snapshot 会使旧异步 metadata 结果失效. 刷新失败保留上一次成功列表并显示错误.
-一次刷新只执行一个 repository-wide status process; 列表不为每一行启动 Git, 不联网, 也不扫描未变更目录.
+Changed Assets 刷新按 `Git status` -> 当前文件 metadata -> 固定 `HEAD` metadata -> owner/DataLayer fallback 的阶段推进. 面板持续显示当前 phase/progress; 直到 owner fallback 完成才认为刷新完成, `Refresh` 与 `Revert` 在整个过程中禁用. 刷新结果按 generation 合并; 新一代 snapshot 会使旧异步 metadata 结果失效. 刷新失败保留上一次成功列表并显示错误.
+现存 changed `.uasset` 的名称、类型和 object path 以磁盘 package header 为显示真值; 不强制刷新全局 Asset Registry. Asset Registry 只用于 owner level 与 DataLayer topology, metadata 批量回写时 activity-only 更新不会重建 rows. WorldDataLayers topology 继续使用 Asset Registry 和既有 owner-resolution 路径.
+一次刷新只执行一个 repository-wide status process; 列表不为每一行启动 Git, 不联网, 也不扫描未变更目录. 插件不使用 DirectoryWatcher、后台轮询或跨刷新 status cache.
 
 ## 入口与 History
 

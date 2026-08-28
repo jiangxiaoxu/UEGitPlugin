@@ -33,7 +33,9 @@ public:
 private:
 	using FEntryPtr = TSharedPtr<FGitChangedAssetEntry>;
 
-	void HandleControllerChanged();
+	void HandleControllerRowsChanged();
+	void HandleControllerActivityChanged();
+	void RequestInitialRefreshIfAvailable();
 	void RebuildItems();
 	bool RebuildOwnerOptions();
 	void ApplyFilters(bool bClearSelection);
@@ -76,7 +78,8 @@ private:
 	FText GetRevertButtonText() const;
 
 	FControllerPtr Controller;
-	FDelegateHandle ControllerChangedHandle;
+	FDelegateHandle ControllerRowsChangedHandle;
+	FDelegateHandle ControllerActivityChangedHandle;
 	TArray<FEntryPtr> AllItems;
 	TArray<FEntryPtr> FilteredItems;
 	/** Stable only within the displayed snapshot generation; protects selection across metadata enrichment. */

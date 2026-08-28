@@ -28,7 +28,8 @@ enum class EGitChangedAssetPackageKind : uint8
 enum class EGitChangedAssetMetadataSource : uint8
 {
 	Unresolved,
-	CurrentAssetRegistry,
+	/** 当前 worktree .uasset 的 package header; 不依赖全局 Asset Registry 的旧索引. */
+	CurrentPackageRegistry,
 	HeadPackageRegistry,
 	DerivedExternalPath,
 };

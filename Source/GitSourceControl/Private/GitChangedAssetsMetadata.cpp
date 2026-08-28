@@ -967,8 +967,6 @@ void ResolveDataLayerMappingForOwner(FGitChangedAssetDataLayerOwnerCache& InOutO
 	{
 		return;
 	}
-	MappingCache.AttemptedIdentifiers.Append(IdentifiersToResolve);
-
 	FOwnerDataLayerRequests RequestsToResolve;
 	for (const FName Identifier : IdentifiersToResolve)
 	{
@@ -981,6 +979,7 @@ void ResolveDataLayerMappingForOwner(FGitChangedAssetDataLayerOwnerCache& InOutO
 			RequestsToResolve.DeprecatedInstanceNames.Add(Identifier);
 		}
 	}
+	MappingCache.AttemptedIdentifiers.Append(IdentifiersToResolve);
 
 	if (InSource == EGitChangedAssetDataLayerMappingSource::Head && !HasCompleteHeadWorldDataLayersMetadata(InOutOwnerCache))
 	{
@@ -1024,11 +1023,11 @@ void ResolveDataLayerMappingForOwner(FGitChangedAssetDataLayerOwnerCache& InOutO
 	}
 }
 
-void RebuildCachedDataLayerDisplays(FGitChangedAssetSnapshot& InOutSnapshot)
+void RebuildCachedDataLayerDisplays(FGitChangedAssetSnapshot& InOutSnapshot, const EGitChangedAssetDataLayerMappingSource InSource)
 {
 	for (FGitChangedAssetEntry& Entry : InOutSnapshot.Entries)
 	{
-		if (!Entry.bHasActorDescriptorMetadata || !Entry.bOwnerLevelResolved || Entry.OwnerLevel.IsEmpty())
+		if (!Entry.bHasActorDescriptorMetadata || Entry.DataLayerMappingSource != InSource || !Entry.bOwnerLevelResolved || Entry.OwnerLevel.IsEmpty())
 		{
 			continue;
 		}
@@ -1078,7 +1077,8 @@ void ResolvePrivateAndDeprecatedDataLayerNames(FGitChangedAssetSnapshot& InOutSn
 			ResolveDataLayerMappingForOwner(InOutSnapshot.DataLayerOwnerCaches.FindChecked(Pair.Key), EGitChangedAssetDataLayerMappingSource::Head, Pair.Value, bForceRebuild);
 		}
 	}
-	RebuildCachedDataLayerDisplays(InOutSnapshot);
+	RebuildCachedDataLayerDisplays(InOutSnapshot, EGitChangedAssetDataLayerMappingSource::Current);
+	RebuildCachedDataLayerDisplays(InOutSnapshot, EGitChangedAssetDataLayerMappingSource::Head);
 }
 
 void FinalizeRevertEligibility(FGitChangedAssetEntry& InOutEntry)
@@ -1167,7 +1167,7 @@ bool ApplyCurrentPackageHeaderMetadata(IAssetRegistry& InAssetRegistry, const FS
 		OutFailureReason = TEXT("package header 不含 Asset Registry metadata。");
 		return false;
 	}
-	ApplyAssetData(InOutEntry, PackageData.Data[0], EGitChangedAssetMetadataSource::CurrentAssetRegistry, true);
+	ApplyAssetData(InOutEntry, PackageData.Data[0], EGitChangedAssetMetadataSource::CurrentPackageRegistry, true);
 	return true;
 }
 
@@ -1220,8 +1220,11 @@ void ApplyHeadWorldDataLayersMetadata(FGitChangedAssetSnapshot& InOutSnapshot, c
 		HeadCache.KnownAbsentWorldDataLayersRepositoryPaths.Add(InResult.WorldDataLayersRepositoryRelativePath);
 		HeadCache.UnavailableWorldDataLayersRepositoryPaths.Remove(InResult.WorldDataLayersRepositoryRelativePath);
 		HeadCache.HeadWorldDataLayersAssetData.Remove(InResult.WorldDataLayersRepositoryRelativePath);
-		SeedHeadOnlyWorldDataLayersIndex(InOutSnapshot, HeadOwnerLevel, InResult.WorldDataLayersRepositoryRelativePath,
-			InResult.WorldDataLayersState, InAssetData[0]);
+		if (InOutSnapshot.DataLayerOwnerCaches.Contains(HeadOwnerLevel))
+		{
+			SeedHeadOnlyWorldDataLayersIndex(InOutSnapshot, HeadOwnerLevel, InResult.WorldDataLayersRepositoryRelativePath,
+				InResult.WorldDataLayersState, InAssetData[0]);
+		}
 		return;
 	}
 	HeadCache.UnavailableWorldDataLayersRepositoryPaths.Remove(InResult.WorldDataLayersRepositoryRelativePath);
@@ -1414,97 +1417,60 @@ bool GetHeadMetadataSourcePath(const FGitChangedAssetEntry& InEntry, const bool 
 
 void FGitChangedAssetsMetadataResolver::ResolveCurrentMetadata(FGitChangedAssetSnapshot& InOutSnapshot)
 {
+	check(IsInGameThread());
+	BeginCurrentMetadata(InOutSnapshot);
+	ApplyCurrentMetadataRange(InOutSnapshot, 0, InOutSnapshot.Entries.Num());
+	FinalizeCurrentMetadata(InOutSnapshot);
+}
+
+void FGitChangedAssetsMetadataResolver::BeginCurrentMetadata(FGitChangedAssetSnapshot& InOutSnapshot)
+{
 	using namespace GitChangedAssetsMetadataPrivate;
 	check(IsInGameThread());
-
-	TArray<FName> PackageNames;
-	TMap<FName, TArray<FGitChangedAssetEntry*>> EntriesByPackage;
-	TArray<FGitChangedAssetEntry*> ExistingEntries;
 	for (FGitChangedAssetEntry& Entry : InOutSnapshot.Entries)
 	{
 		EnsureFallbackDisplay(Entry);
-		if (ShouldResolveCurrentFileMetadata(Entry) && FPaths::FileExists(Entry.AbsoluteFilename))
-		{
-			ExistingEntries.Add(&Entry);
-			if (!Entry.PackageName.IsEmpty())
-			{
-				const FName PackageName(*Entry.PackageName);
-				PackageNames.AddUnique(PackageName);
-				EntriesByPackage.FindOrAdd(PackageName).Add(&Entry);
-			}
-		}
+	}
+}
+
+int32 FGitChangedAssetsMetadataResolver::ApplyCurrentMetadataRange(FGitChangedAssetSnapshot& InOutSnapshot,
+	const int32 InStartIndex, const int32 InMaxCount)
+{
+	using namespace GitChangedAssetsMetadataPrivate;
+	check(IsInGameThread());
+	if (InMaxCount <= 0 || InStartIndex < 0 || InStartIndex >= InOutSnapshot.Entries.Num())
+	{
+		return 0;
 	}
 
 	IAssetRegistry& AssetRegistry = IAssetRegistry::GetChecked();
-	TMap<FName, FAssetData> AssetDataByPackage;
-	auto QueryPackages = [&AssetRegistry, &AssetDataByPackage](const TArray<FName>& InPackageNames)
+	const int32 EndIndex = FMath::Min(InStartIndex + InMaxCount, InOutSnapshot.Entries.Num());
+	for (int32 EntryIndex = InStartIndex; EntryIndex < EndIndex; ++EntryIndex)
 	{
-		if (InPackageNames.IsEmpty())
-		{
-			return;
-		}
-		FARFilter Filter;
-		Filter.PackageNames = InPackageNames;
-		Filter.bIncludeOnlyOnDiskAssets = true;
-		TArray<FAssetData> AssetData;
-		AssetRegistry.GetAssets(Filter, AssetData, false);
-		for (const FAssetData& Data : AssetData)
-		{
-			AssetDataByPackage.FindOrAdd(Data.PackageName) = Data;
-		}
-	};
-	QueryPackages(PackageNames);
-
-	TArray<FString> FilesToScan;
-	TArray<FName> MissedPackageNames;
-	for (FGitChangedAssetEntry* Entry : ExistingEntries)
-	{
-		if (Entry->PackageName.IsEmpty() || !AssetDataByPackage.Contains(FName(*Entry->PackageName)))
-		{
-			FilesToScan.AddUnique(Entry->AbsoluteFilename);
-			if (!Entry->PackageName.IsEmpty())
-			{
-				MissedPackageNames.AddUnique(FName(*Entry->PackageName));
-			}
-		}
-	}
-	if (!FilesToScan.IsEmpty())
-	{
-		AssetRegistry.ScanModifiedAssetFiles(FilesToScan);
-		QueryPackages(MissedPackageNames);
-	}
-
-	for (const TPair<FName, TArray<FGitChangedAssetEntry*>>& Pair : EntriesByPackage)
-	{
-		if (const FAssetData* Data = AssetDataByPackage.Find(Pair.Key))
-		{
-			for (FGitChangedAssetEntry* Entry : Pair.Value)
-			{
-				ApplyAssetData(*Entry, *Data, EGitChangedAssetMetadataSource::CurrentAssetRegistry, true);
-			}
-		}
-	}
-
-	for (FGitChangedAssetEntry* Entry : ExistingEntries)
-	{
-		const bool bResolvedByAssetRegistry = !Entry->PackageName.IsEmpty() && AssetDataByPackage.Contains(FName(*Entry->PackageName));
-		if (bResolvedByAssetRegistry)
+		FGitChangedAssetEntry& Entry = InOutSnapshot.Entries[EntryIndex];
+		if (!ShouldResolveCurrentFileMetadata(Entry) || !FPaths::FileExists(Entry.AbsoluteFilename))
 		{
 			continue;
 		}
 
+		// The worktree package header is the display truth.  Never substitute a stale
+		// global Asset Registry record or scan this file into the global registry.
 		FString HeaderFailureReason;
-		if (!ApplyCurrentPackageHeaderMetadata(AssetRegistry, Entry->AbsoluteFilename, *Entry, HeaderFailureReason))
+		if (!ApplyCurrentPackageHeaderMetadata(AssetRegistry, Entry.AbsoluteFilename, Entry, HeaderFailureReason))
 		{
-			SetMetadataFailure(*Entry, FString::Printf(TEXT("当前 .uasset 无法从 Asset Registry 或 package header 读取 metadata: %s"), *HeaderFailureReason));
+			SetMetadataFailure(Entry, FString::Printf(TEXT("当前 .uasset 无法从 package header 读取 metadata: %s"), *HeaderFailureReason));
 		}
 	}
+	return EndIndex - InStartIndex;
+}
 
+void FGitChangedAssetsMetadataResolver::FinalizeCurrentMetadata(FGitChangedAssetSnapshot& InOutSnapshot)
+{
+	using namespace GitChangedAssetsMetadataPrivate;
+	check(IsInGameThread());
 	for (FGitChangedAssetEntry& Entry : InOutSnapshot.Entries)
 	{
 		// This derives only standard external package topology and does not load a map.
-		// Resolve it for deleted entries as well so the fixed-HEAD batch can include a
-		// changed owner WorldDataLayers descriptor before HEAD actor metadata is applied.
 		if (!Entry.bOwnerLevelResolved)
 		{
 			TryDeriveStandardExternalOwnerLevel(Entry);
@@ -1790,7 +1756,7 @@ bool GitChangedAssetsMetadataTesting::LoadHeadMetadataBlob(const FString& InGitB
 void GitChangedAssetsMetadataTesting::ApplyAssetData(const FAssetData& InAssetData, FGitChangedAssetEntry& InOutEntry)
 {
 	check(IsInGameThread());
-	GitChangedAssetsMetadataPrivate::ApplyAssetData(InOutEntry, InAssetData, EGitChangedAssetMetadataSource::CurrentAssetRegistry, true);
+	GitChangedAssetsMetadataPrivate::ApplyAssetData(InOutEntry, InAssetData, EGitChangedAssetMetadataSource::CurrentPackageRegistry, true);
 }
 
 FString GitChangedAssetsMetadataTesting::FriendlyDataLayerName(const FString& InDataLayerPath)

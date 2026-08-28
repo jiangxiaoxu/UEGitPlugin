@@ -39,7 +39,7 @@ struct FGitChangedAssetHeadMetadataResult
 /**
  * 将 Changed Assets 的 Git 路径映射为 Editor 可显示的资产/OFPA metadata.
  *
- * Current metadata 会更新全局 Asset Registry, 必须在 Game Thread 调用. HEAD-only Git
+ * Current metadata 直接读取 worktree package header, 不写入全局 Asset Registry, 必须在 Game Thread 调用. HEAD-only Git
  * blob read 可在 background worker 调用, 但 payload 的 package-header decode/显示映射
  * 必须在 Game Thread 调用; 调用方负责以 Snapshot generation 丢弃过期结果.
  */
@@ -47,10 +47,18 @@ class GITSOURCECONTROL_API FGitChangedAssetsMetadataResolver final
 {
 public:
 	/**
-	 * 批量查询当前存在的 .uasset. 只对 exact Asset Registry miss 执行一次 scoped scan.
-	 * 此函数同时为 metadata 缺失的 OFPA 建立一次 snapshot-local owner map fallback.
+	 * 同步完成 current metadata, 仅供兼容的非增量调用者和测试使用.
 	 */
 	static void ResolveCurrentMetadata(FGitChangedAssetSnapshot& InOutSnapshot);
+
+	/** 初始化 current worktree package-header metadata 阶段, 但不发布 snapshot。 */
+	static void BeginCurrentMetadata(FGitChangedAssetSnapshot& InOutSnapshot);
+
+	/** 在 Game Thread 应用 current metadata range. 每行最多读取一个 package header, 不可抢占。 */
+	static int32 ApplyCurrentMetadataRange(FGitChangedAssetSnapshot& InOutSnapshot, int32 InStartIndex, int32 InMaxCount);
+
+	/** 在全部 current range 完成后建立 current-only Data Layer 映射和回退资格。 */
+	static void FinalizeCurrentMetadata(FGitChangedAssetSnapshot& InOutSnapshot);
 
 	/**
 	 * 读取当前 worktree 中不存在, 但固定 HEAD 中存在的 .uasset Git blob. 仅产生

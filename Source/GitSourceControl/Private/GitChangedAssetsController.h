@@ -12,6 +12,15 @@ namespace GitChangedAssetsControllerPrivate
 	class FWorkerState;
 }
 
+enum class EGitChangedAssetsRefreshPhase : uint8
+{
+	Idle,
+	GitStatus,
+	CurrentMetadata,
+	HeadMetadata,
+	OwnerFallback,
+};
+
 /**
  * Game-thread owned coordinator for the Changed Assets tab.
  *
@@ -21,7 +30,10 @@ namespace GitChangedAssetsControllerPrivate
 class FGitChangedAssetsController final : public TSharedFromThis<FGitChangedAssetsController, ESPMode::ThreadSafe>
 {
 public:
-	DECLARE_MULTICAST_DELEGATE(FOnChangedAssetsUpdated);
+	/** Snapshot rows changed. This never fires for phase/progress-only activity. */
+	DECLARE_MULTICAST_DELEGATE(FOnChangedAssetsRowsUpdated);
+	/** Refresh/revert activity changed; consumers update status and actions without reconciling rows. */
+	DECLARE_MULTICAST_DELEGATE(FOnChangedAssetsActivityUpdated);
 
 	FGitChangedAssetsController();
 	~FGitChangedAssetsController();
@@ -37,6 +49,9 @@ public:
 
 	bool IsRefreshing() const;
 	bool IsReverting() const;
+	EGitChangedAssetsRefreshPhase GetRefreshPhase() const;
+	int32 GetRefreshProgressCompleted() const;
+	int32 GetRefreshProgressTotal() const;
 	const FGitChangedAssetSnapshot* GetSnapshot() const;
 	const FString& GetLastError() const;
 	const FDateTime& GetLastSuccessfulRefreshTime() const;
@@ -47,9 +62,17 @@ public:
 	 */
 	void RevertToHead(TArray<FGitChangedAssetEntry> Entries);
 
-	FOnChangedAssetsUpdated& OnChanged();
+	FOnChangedAssetsRowsUpdated& OnRowsChanged();
+	FOnChangedAssetsActivityUpdated& OnActivityChanged();
 
 private:
+	struct FPendingCurrentMetadataApply
+	{
+		uint64 Generation = 0;
+		TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> Snapshot;
+		int32 NextEntryIndex = 0;
+	};
+
 	struct FPendingHeadMetadataApply
 	{
 		uint64 Generation = 0;
@@ -59,13 +82,28 @@ private:
 		FString Error;
 	};
 
+	struct FPendingOwnerFallback
+	{
+		uint64 Generation = 0;
+		TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> Snapshot;
+		FString Error;
+	};
+
 	void CompleteRefresh(uint64 CompletedGeneration, TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> CompletedSnapshot, FString Error);
+	void BeginCurrentMetadata(uint64 CompletedGeneration, TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> CompletedSnapshot);
+	void ApplyPendingCurrentMetadata(uint64 PendingGeneration);
 	void CompleteCurrentMetadata(uint64 CompletedGeneration, TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> CompletedSnapshot);
+	void BeginHeadMetadata(uint64 CompletedGeneration, TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> CompletedSnapshot);
 	void CompleteHeadMetadata(uint64 CompletedGeneration, TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> CompletedSnapshot,
 		TArray<FGitChangedAssetHeadMetadataResult> Results, FString Error);
 	void ApplyPendingHeadMetadata(uint64 PendingGeneration);
 	void ClearPendingHeadMetadata();
+	void BeginOwnerFallback(uint64 CompletedGeneration, TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> CompletedSnapshot, FString ExistingError);
 	void CompleteOwnerFallback(uint64 CompletedGeneration);
+	void FinishRefresh(uint64 CompletedGeneration, TSharedPtr<FGitChangedAssetSnapshot, ESPMode::ThreadSafe> CompletedSnapshot, FString Error);
+	void FailRefresh(uint64 CompletedGeneration, FString Error);
+	void ClearPendingRefreshWork();
+	void SetRefreshActivity(EGitChangedAssetsRefreshPhase InPhase, int32 InCompleted, int32 InTotal);
 	void CompleteRevert(bool bDiskMutationSucceeded, bool bEditorReloadSucceeded, FString ResultMessage);
 	bool ConfirmRevert(const TArray<FGitChangedAssetEntry>& Entries, FString& OutError);
 
@@ -78,8 +116,14 @@ private:
 	bool bPreserveLastErrorForRefresh = false;
 	double PostRevertStatusRefreshStartSeconds = 0.0;
 	TAtomic<bool> bShuttingDown = false;
+	EGitChangedAssetsRefreshPhase RefreshPhase = EGitChangedAssetsRefreshPhase::Idle;
+	int32 RefreshProgressCompleted = 0;
+	int32 RefreshProgressTotal = 0;
+	TOptional<FPendingCurrentMetadataApply> PendingCurrentMetadataApply;
 	TOptional<FPendingHeadMetadataApply> PendingHeadMetadataApply;
+	TOptional<FPendingOwnerFallback> PendingOwnerFallback;
 	TSharedPtr<GitChangedAssetsControllerPrivate::FGameThreadDispatcher, ESPMode::ThreadSafe> GameThreadDispatcher;
 	TSharedPtr<GitChangedAssetsControllerPrivate::FWorkerState, ESPMode::ThreadSafe> WorkerState;
-	FOnChangedAssetsUpdated ChangedDelegate;
+	FOnChangedAssetsRowsUpdated RowsChangedDelegate;
+	FOnChangedAssetsActivityUpdated ActivityChangedDelegate;
 };

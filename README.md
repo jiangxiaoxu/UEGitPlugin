@@ -15,8 +15,9 @@
 - Git executable 门禁状态为 `Pending`, `Available` 或 `Unavailable`. Content Browser 的 Git 资产菜单始终可见以便发现; `Pending`/`Unavailable` 时点击只显示诊断, `Available` 时才执行 action. 状态栏和面板入口保持可见以便给出诊断, 但门禁未通过时不会启动 refresh 或 mutation.
 - Changed Assets 的 `Revert to HEAD` 同时清除所选 `.uasset` 的 staged 与 worktree 改动: tracked 修改/删除恢复 HEAD, Added/Untracked 精确删除, Rename 原子恢复, Conflict 或 OFPA owner unresolved 禁用. `.umap`, `.uexp`, `.ubulk`, `.uptnl`, `.upayload` 和其他非 `.uasset` package 不在本期范围.
 - OFPA 行优先使用 Asset Registry `OptionalOuterPath`/actor descriptor 解析友好名称与所属关卡; dirty owner map 或无法唯一解析 owner 时禁止 Revert.
-- Changed Assets 刷新是显式, 准确, 异步的一次性 repository status 查询, 不使用 DirectoryWatcher, 后台轮询或跨刷新 status cache.
-- 刷新按 changed `.uasset` 数量处理, 每次只启动一个 status process; metadata 批量解析, 不逐行执行 Git, 不扫描全项目 package, 不访问网络.
+- Changed Assets 刷新是显式, 准确, 异步的一次性流水线: `Git status` -> 当前文件 metadata -> 固定 `HEAD` metadata -> owner/DataLayer fallback. 直到所有阶段完成才发布完整 snapshot; 阶段和进度在面板中可见, `Refresh` 与 `Revert` 在整个流水线期间禁用.
+- 现存 changed `.uasset` 的名称、类型和 object path 以磁盘 package header 为显示真值; 不强制刷新全局 Asset Registry. Asset Registry 只用于 owner level 和 DataLayer topology, metadata 回写按批次进行, activity-only 更新不会重建 rows.
+- 刷新按 changed `.uasset` 数量处理, 每次只启动一个 status process; 不逐行执行 Git, 不扫描全项目 package, 不访问网络, 不使用 DirectoryWatcher、后台轮询或跨刷新 status cache. WorldDataLayers topology 继续使用 Asset Registry 和既有 owner-resolution 路径.
 - History 默认使用固定 `HEAD` 的 `CurrentPath` 查询; `ExactRenames` 仅追踪 committed、single-parent、`R100` rename, 不使用 `--follow`。
 - standalone History window 提供 revision-workspace、revision-previous 和 selected-revisions 三种 Diff, 以及 selection-driven Restore、Refresh、Close 按钮。
 - Diff 失败或取消时立即清理临时导出; 成功打开的 Diff 导出保留到当前 Editor session 退出, 仅清理插件专用的 `Diff/UEGitPlugin/UEGit-Diff-*` 文件。
@@ -36,6 +37,8 @@ npm run build:regular
 npm run test:unreal:automation -- Cthulhu.GitSourceControl
 npm run as:diagnostics
 ```
+
+发布前还需通过 Changed Assets refresh phase/progress、metadata truth、OFPA owner/DataLayer fallback、UI disabled gate 和无 watcher/polling 的 automation coverage, 并执行 `git diff --check`.
 
 插件需要 Git 2.53.0 或更新版本. 使用 Git LFS 的项目还需要 Git LFS 3.7.1 或更新版本; LFS capability 只在首次确实需要 LFS object 的显式操作时 lazy 检查, 只缓存成功的 3.7.1+ 结果, 不阻塞普通 Git Changes. 缺失、版本过低或瞬时检查失败只使当前 LFS 动作失败, 下次显式 LFS 动作会重试, 无需重启 Editor. 插件不提供 Git、Git LFS 或预编译 binary.
 

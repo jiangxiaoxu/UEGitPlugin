@@ -33,9 +33,9 @@ Changed Assets tab 是 providerless, 显式触发的 repository-wide view: 一�
 
 列表的 Slate selection 是 checkbox, 行高亮, 计数和 Revert 输入的唯一真值. 普通点击切换单项, Shift/Ctrl 使用当前过滤结果的连续范围语义; filter 或 generation 变化必须剔除不可见/过期选择并同步 Slate navigation anchor, 防止隐藏资产进入 Revert.
 
-刷新性能契约是每次只启动一个 repository status process, 解析复杂度随 changed `.uasset` 数量增长, 不执行逐行 Git 查询, 目录递归扫描或网络访问. UI 行使用虚拟化列表, metadata 查询按批次执行并回到 Game Thread 更新.
+刷新性能契约是每次只启动一个 repository status process, 解析复杂度随 changed `.uasset` 数量增长, 不执行逐行 Git 查询, 目录递归扫描或网络访问. 刷新 generation 按以下阶段串行推进: `Git status` 固定 repository snapshot, 当前文件 metadata, 固定 `HEAD` metadata, 最后 owner/DataLayer fallback. 所有阶段完成前都保持 `IsRefreshing`, 面板显示当前 phase/progress, `Refresh` 与 `Revert` 均禁用; 旧 generation 的结果直接丢弃. UI 行使用虚拟化列表, metadata 结果按批次回到 Game Thread 更新, activity-only 通知不会触发 row reconcile/filter/sort 重建.
 
-资产行通过 Asset Registry metadata 渲染友好名称, 类型, object path 和所属关卡. OFPA 优先使用 `OptionalOuterPath`/actor descriptor; 无法唯一解析 owner 时保留原始 path 并禁用 Revert. dirty owner map 会阻止 OFPA Revert, 以避免内存状态与磁盘回滚不一致.
+现存 changed `.uasset` 的名称、类型和 object path 以磁盘 package header 为真值; 不为显示 metadata 强制刷新全局 Asset Registry. Asset Registry 只作为 owner level 与 DataLayer topology 的查询源, OFPA 仍优先使用 `OptionalOuterPath`/actor descriptor. 无法唯一解析 owner 时保留原始 path 并禁用 Revert, dirty owner map 同样阻止 OFPA Revert. WorldDataLayers topology 继续使用 Asset Registry 和既有 owner-resolution 路径.
 
 `Revert to HEAD` 必须复核 workspace fingerprint, HEAD, index snapshot 和单文件 `.uasset` 校验, 并在 repository mutex 内执行 all-or-nothing mutation. `Modified`/`Deleted` 恢复 HEAD 的 index 与 worktree; `Added`/`Untracked` 精确删除文件并清除 index; `Renamed` 成对原子恢复; `Conflicted` 或 owner unresolved 禁用. 操作同时丢弃 staged 与 unstaged 内容, 不执行 `git clean`, 目录删除或模糊 pathspec, 也不提供 Undo. 失败时 rollback 并保留无法恢复的 backup 路径.
 
@@ -58,6 +58,7 @@ Repository discovery 只接受用户显式选中的 asset path, 解析 nearest r
 - LFS capability 在首次需要 LFS 的显式操作中 lazy 探测, 只缓存成功的 3.7.1+ 结果; 缺失、版本过低或瞬时失败不缓存, 当前动作失败且下次显式 LFS 动作重试. cache hit 零 network fetch; miss 只进行目标 commit/path fetch; ambiguous remote 在网络前失败.
 - Restore/Discard 的 dirty、staged、conflict、untracked、index-added、package load/reload、rollback 和 index invariants。
 - Changed Assets 的 repository-wide status parser, `.uasset` state aggregation, Added/Untracked 删除, Rename 原子回退, OFPA owner unresolved/dirty-map gate, generation cancellation 和 mutation guard.
+- Changed Assets refresh phase/progress 从 status 持续到 current/HEAD/owner metadata 完成, 期间 Refresh/Revert 禁用; 现存文件使用 package-header truth, activity-only 更新不重建 rows, WDL topology 沿用 Asset Registry/既有 owner-resolution 路径, 且无 DirectoryWatcher、后台 polling 或全局 Asset Registry refresh.
 - window close、cancel、module shutdown 时无遗留 Git process、notification 或 temp package。
 
 交付前运行 `npm run build:regular`, 相关 Unreal automation filters, `npm run as:diagnostics` 和 `git diff --check`。需要 C++/AS API 变化时验证真实 generated surface。最终必须有独立 reviewer 审核 providerless 边界、零隐式 Git、LFS/Restore safety、API surface、测试证据和文档结论。

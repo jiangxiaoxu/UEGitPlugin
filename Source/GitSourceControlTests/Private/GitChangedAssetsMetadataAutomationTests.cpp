@@ -22,6 +22,7 @@ namespace GitChangedAssetsMetadataAutomationTestsPrivate
 	{
 		return FPaths::Combine(FPaths::ProjectContentDir(), TEXT("B_LyraGameInstance.uasset"));
 	}
+
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetsPackageHeaderMetadataAutomationTest,
@@ -40,6 +41,10 @@ bool FGitChangedAssetsPackageHeaderMetadataAutomationTest::RunTest(const FString
 	FGitChangedAssetEntry Entry;
 	Entry.AbsoluteFilename = Filename;
 	Entry.RepositoryRelativePath = TEXT("Content/B_LyraGameInstance.uasset");
+	const FAssetData StaleAssetRegistryData(FName(TEXT("/Game/Stale")), FName(TEXT("/Game/Stale")), FName(TEXT("StaleAssetRegistryName")),
+		FTopLevelAssetPath(FName(TEXT("/Script/Engine")), FName(TEXT("Object"))));
+	GitChangedAssetsMetadataTesting::ApplyAssetData(StaleAssetRegistryData, Entry);
+	TestEqual(TEXT("Fixture starts with a stale Asset Registry display value"), Entry.DisplayName, FString(TEXT("StaleAssetRegistryName")));
 	FString FailureReason;
 	if (!TestTrue(TEXT("Package header fallback succeeds"),
 		GitChangedAssetsMetadataTesting::ApplyPackageHeaderMetadata(Filename, Entry, FailureReason)))
@@ -51,6 +56,10 @@ bool FGitChangedAssetsPackageHeaderMetadataAutomationTest::RunTest(const FString
 	TestFalse(TEXT("Header fallback resolves a non-empty object path"), Entry.ObjectPath.IsEmpty());
 	TestFalse(TEXT("Header fallback resolves a non-empty type"), Entry.AssetType.IsEmpty());
 	TestFalse(TEXT("Header fallback corrects package name"), Entry.PackageName.IsEmpty());
+	TestFalse(TEXT("Current package header replaces stale Asset Registry display metadata"),
+		Entry.DisplayName.Equals(TEXT("StaleAssetRegistryName"), ESearchCase::CaseSensitive));
+	TestEqual(TEXT("Current display metadata is sourced from the worktree package header"), Entry.MetadataSource,
+		EGitChangedAssetMetadataSource::CurrentPackageRegistry);
 
 	FGitChangedAssetEntry MappingEntry;
 	MappingEntry.AbsoluteFilename = Filename;
@@ -329,6 +338,41 @@ bool FGitChangedAssetsHeadMetadataChunkedApplyAutomationTest::RunTest(const FStr
 	TestEqual(TEXT("Exhausted range cannot reapply completed results"),
 		FGitChangedAssetsMetadataResolver::ApplyHeadOnlyMetadataRange(Snapshot, Results, 3, 1), 0);
 	FGitChangedAssetsMetadataResolver::FinalizeHeadOnlyMetadata(Snapshot);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetsCurrentMetadataChunkedApplyAutomationTest,
+	"Cthulhu.GitSourceControl.ChangedAssets.Metadata.CurrentChunkedApply",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitChangedAssetsCurrentMetadataChunkedApplyAutomationTest::RunTest(const FString& Parameters)
+{
+	static_cast<void>(Parameters);
+	const FString Filename = GitChangedAssetsMetadataAutomationTestsPrivate::GetHeaderFallbackFixtureFilename();
+	if (!TestTrue(TEXT("Current metadata chunk fixture exists"), FPaths::FileExists(Filename)))
+	{
+		return false;
+	}
+
+	FGitChangedAssetSnapshot Snapshot;
+	for (int32 Index = 0; Index < 2; ++Index)
+	{
+		FGitChangedAssetEntry& Entry = Snapshot.Entries.AddDefaulted_GetRef();
+		Entry.AbsoluteFilename = Filename;
+		Entry.RepositoryRelativePath = FString::Printf(TEXT("Content/CurrentChunk%d.uasset"), Index);
+		Entry.State = EGitChangedAssetState::Modified;
+	}
+	FGitChangedAssetsMetadataResolver::BeginCurrentMetadata(Snapshot);
+	TestEqual(TEXT("Current metadata range applies exactly one non-preemptible package header"),
+		FGitChangedAssetsMetadataResolver::ApplyCurrentMetadataRange(Snapshot, 0, 1), 1);
+	TestTrue(TEXT("First current metadata entry is resolved by its own chunk"), Snapshot.Entries[0].bMetadataResolved);
+	TestFalse(TEXT("Second entry remains unresolved before its own chunk"), Snapshot.Entries[1].bMetadataResolved);
+	TestEqual(TEXT("Second current metadata chunk completes remaining entry"),
+		FGitChangedAssetsMetadataResolver::ApplyCurrentMetadataRange(Snapshot, 1, 8), 1);
+	TestTrue(TEXT("Second current metadata entry resolves after its own chunk"), Snapshot.Entries[1].bMetadataResolved);
+	TestEqual(TEXT("Current metadata range never reapplies exhausted entries"),
+		FGitChangedAssetsMetadataResolver::ApplyCurrentMetadataRange(Snapshot, 2, 1), 0);
+	FGitChangedAssetsMetadataResolver::FinalizeCurrentMetadata(Snapshot);
 	return true;
 }
 

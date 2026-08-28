@@ -9,7 +9,7 @@
 - `FGitSourceControlModule` 注册 standalone Content Browser UI 和 `GitChangedAssets` Nomad tab. Startup 异步且恰好执行一次 Git capability gate, 发现 Git executable 并验证版本 2.53.0+, 但不探测 repository; Content Browser 资产菜单始终注册以保持 discoverability, `Pending`/`Unavailable` 时点击只显示 actionable diagnostic 且不执行 Git, `Available` 时才执行 action. status bar 和 panel 在门禁未通过时只显示 actionable diagnostic 并禁止交互. Git Changes 用户入口仅为 Level Editor 右下角替换默认 Source Control 控件的 status bar 按钮, layout restore 或 programmatic tab invocation 仍受 gate 约束. 模块仍不创建 provider、`DirectoryWatcher`、state cache 或后台 status polling.
 - `GitLocalSourceControl` 和菜单操作在 startup gate `Available` 后解析 nearest repository root. 每个 job 使用 worker 和 Game Thread completion, 临时 repository context 在 job 结束后释放. 当前 Editor session 不重探 Git; 安装或升级后需重启.
 - `GitSourceControlUtils` 负责 exact path status preflight, repository-wide porcelain-v2 snapshot, fixed-HEAD history, exact blob 和 LFS materialization. Changed Assets status 仅通过窄接口触发一次全仓查询, 空路径的 legacy 操作不会升级为 repository-wide scan.
-- `FGitChangedAssetsMetadataResolver` 使用 Asset Registry 批量 metadata 和 OFPA owner fallback, `FGitChangedAssetsController` 负责 generation, 异步 enrich, 过滤结果刷新和 revert 完成后的状态重查.
+- `FGitChangedAssetsMetadataResolver` 以磁盘 package header 作为现存 changed `.uasset` 的名称、类型和 object path 真值, Asset Registry 只用于 owner/DataLayer topology; `FGitChangedAssetsController` 负责 generation, 异步 enrich, refresh phase/progress, 过滤结果刷新和 revert 完成后的状态重查. WorldDataLayers topology 继续使用 Asset Registry 和既有 owner-resolution 路径.
 - `FGitSourceControlMenu` 提供 History, 三种 Diff, same-path Force Restore 和 tracked Discard. Changed Assets 使用独立的 project-wide snapshot/list UI, 不注册 native changelist 或 Content Browser badge.
 - `FGitSourceControlAssetOperations` 是 Content Browser legacy path 使用的 UI 无关 mutation service. 它拒绝 directory, mixed-root, map 和 external package, 在 commit point 前复核 fingerprint, HEAD, index 和 package topology, 并在失败时 rollback. Changed Assets 使用独立的 `FGitChangedAssetOperations` 处理单 `.uasset`, 包括 OFPA owner gate.
 - `FGitSourceControlRevision` 是 standalone Diff 使用的 private `ISourceControlRevision` adapter。每个实例自带 Git binary、repository root、commit、historical path 和 current path, 不回查 module provider。
@@ -30,11 +30,11 @@ Git LFS 3.7.1+ capability 只在首次需要 LFS object 的显式操作时 lazy 
 
 ### Changed Assets
 
-Changed Assets 在显式打开或 Refresh 时执行一次 `git status --porcelain=v2 -z` 并固定 `HEAD`; 结果按单个 `.uasset` 聚合为 Modified, Deleted, Added, Untracked, Renamed 或 Conflicted. staged 与 worktree 状态合并为相对 HEAD 的总体状态, 不提供 staging/unstaging. 刷新无 DirectoryWatcher, 后台轮询或长期 status cache, generation 只用于丢弃过期异步 metadata 结果.
+Changed Assets 在显式打开或 Refresh 时执行一次 `git status --porcelain=v2 -z` 并固定 `HEAD`; 结果按单个 `.uasset` 聚合为 Modified, Deleted, Added, Untracked, Renamed 或 Conflicted. staged 与 worktree 状态合并为相对 HEAD 的总体状态, 不提供 staging/unstaging. 刷新阶段依次为 `Git status`、当前文件 metadata、固定 `HEAD` metadata 和 owner/DataLayer fallback; 所有阶段完成前持续报告 phase/progress 并禁用 Refresh/Revert, generation 只用于丢弃过期异步 metadata 结果. 刷新无 DirectoryWatcher, 后台轮询或长期 status cache.
 
-性能约束: 每次刷新只启动一个 repository status process, 不逐行启动 Git, 不递归扫描未变更 package, 不联网. 行列表使用虚拟化 Slate, metadata 解析按批次合并回 Game Thread.
+性能约束: 每次刷新只启动一个 repository status process, 不逐行启动 Git, 不递归扫描未变更 package, 不联网. 现存 changed `.uasset` 的名称、类型和 object path 以磁盘 package header 为真值, 不强制刷新全局 Asset Registry; Asset Registry 只用于 owner/DataLayer topology. 行列表使用虚拟化 Slate, metadata 解析按批次合并回 Game Thread, activity-only 更新不会重建 rows. WorldDataLayers topology 继续沿用 Asset Registry/既有 owner-resolution 路径.
 
-现存资产通过 Asset Registry 批量 metadata 渲染友好名称, 类型, object path 与 owner level; OFPA 优先使用 `OptionalOuterPath` 和 actor descriptor, owner 无法唯一解析时显示 unresolved 并禁用 Revert. Changed Assets 仅接受单个 `.uasset`, 不将 `.umap` 或 sidecar 合并为 artifact group.
+现存资产通过 package header 渲染友好名称、类型和 object path, owner level 仍通过 Asset Registry/OFPA `OptionalOuterPath` 与 actor descriptor 解析; owner 无法唯一解析时显示 unresolved 并禁用 Revert. Changed Assets 仅接受单个 `.uasset`, 不将 `.umap` 或 sidecar 合并为 artifact group.
 
 `Revert to HEAD` 是显式, 不可 Undo 的 all-or-nothing 事务, 同时丢弃 staged 与 unstaged: tracked Modified/Deleted 恢复 HEAD, Added/Untracked 精确删除, Rename 成对原子恢复, Conflict 禁用. OFPA dirty owner map 或 unresolved owner 阻止操作. 事务前复核 HEAD, index, fingerprint 和 package 校验, 禁止 `git clean`, 目录删除和模糊 pathspec.
 
@@ -61,7 +61,7 @@ npm run test:unreal:automation -- Cthulhu.GitSourceControl.ChangedAssets.RevertT
 npm run as:diagnostics
 ```
 
-测试使用 isolated temporary Git repository 和 local bare LFS remote, 覆盖 fixed-HEAD history、exact rename、LFS hit/miss、standalone Diff selection、Restore/Discard safety、index invariant、provider absence、startup Git capability gate 恰好一次、Pending/Unavailable UI fail-closed、Content Browser action execution gate 以及 asset lifecycle 中除 startup gate 外的 zero Git process. 测试需要 Git 和 Git LFS, 不连接 external server.
+测试使用 isolated temporary Git repository 和 local bare LFS remote, 覆盖 fixed-HEAD history、exact rename、LFS hit/miss、standalone Diff selection、Restore/Discard safety、index invariant、provider absence、startup Git capability gate 恰好一次、Pending/Unavailable UI fail-closed、Content Browser action execution gate 以及 asset lifecycle 中除 startup gate 外的 zero Git process. Changed Assets 专项还必须验证 refresh phase 从 status 持续到 current/HEAD/owner metadata 完成, phase 期间 Refresh/Revert disabled, package-header truth 不触发全局 Asset Registry refresh, activity-only update 保持 row identity, WorldDataLayers topology 继续遵循 Asset Registry/既有 owner-resolution 路径, 以及无 DirectoryWatcher/background polling. 测试需要 Git 和 Git LFS, 不连接 external server.
 
 ## 已知限制
 

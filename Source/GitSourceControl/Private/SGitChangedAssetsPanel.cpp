@@ -561,7 +561,8 @@ void SGitChangedAssetsPanel::Construct(const FArguments& InArgs)
 	FindOrAddOption(RevertableOptions, TEXT("Revertable"));
 	FindOrAddOption(RevertableOptions, TEXT("Blocked"));
 
-	ControllerChangedHandle = Controller->OnChanged().AddSP(SharedThis(this), &SGitChangedAssetsPanel::HandleControllerChanged);
+	ControllerRowsChangedHandle = Controller->OnRowsChanged().AddSP(SharedThis(this), &SGitChangedAssetsPanel::HandleControllerRowsChanged);
+	ControllerActivityChangedHandle = Controller->OnActivityChanged().AddSP(SharedThis(this), &SGitChangedAssetsPanel::HandleControllerActivityChanged);
 
 	ChildSlot
 	[
@@ -701,20 +702,37 @@ void SGitChangedAssetsPanel::Construct(const FArguments& InArgs)
 		]
 	];
 
-	HandleControllerChanged();
+	HandleControllerRowsChanged();
 }
 
 SGitChangedAssetsPanel::~SGitChangedAssetsPanel()
 {
-	if (Controller.IsValid() && ControllerChangedHandle.IsValid())
+	if (Controller.IsValid() && ControllerRowsChangedHandle.IsValid())
 	{
-		Controller->OnChanged().Remove(ControllerChangedHandle);
+		Controller->OnRowsChanged().Remove(ControllerRowsChangedHandle);
+	}
+	if (Controller.IsValid() && ControllerActivityChangedHandle.IsValid())
+	{
+		Controller->OnActivityChanged().Remove(ControllerActivityChangedHandle);
 	}
 }
 
-void SGitChangedAssetsPanel::HandleControllerChanged()
+void SGitChangedAssetsPanel::HandleControllerRowsChanged()
 {
 	RebuildItems();
+	RequestInitialRefreshIfAvailable();
+}
+
+void SGitChangedAssetsPanel::HandleControllerActivityChanged()
+{
+	// Progress and action-state transitions intentionally do not reconcile/filter/sort
+	// the virtualized row model. Dynamic row attributes render metadata only when rows change.
+	Invalidate(EInvalidateWidgetReason::Paint);
+	RequestInitialRefreshIfAvailable();
+}
+
+void SGitChangedAssetsPanel::RequestInitialRefreshIfAvailable()
+{
 	if (Controller.IsValid() && SGitChangedAssetsPanelPrivate::ShouldRequestInitialRefresh(bInitialRefreshRequested, IsStartupGitCapabilityAvailable()))
 	{
 		bInitialRefreshRequested = true;
@@ -1139,7 +1157,27 @@ FText SGitChangedAssetsPanel::GetStatusText() const
 	}
 	if (Controller->IsRefreshing())
 	{
-		return LOCTEXT("ChangedAssetsRefreshing", "Refreshing repository Git status...");
+		const int32 Completed = Controller->GetRefreshProgressCompleted();
+		const int32 Total = Controller->GetRefreshProgressTotal();
+		auto FormatProgress = [Completed, Total](const FText& InLabel)
+		{
+			return Total > 0
+				? FText::Format(LOCTEXT("ChangedAssetsRefreshProgress", "{0} ({1}/{2})..."), InLabel, FText::AsNumber(Completed), FText::AsNumber(Total))
+				: FText::Format(LOCTEXT("ChangedAssetsRefreshWorking", "{0}..."), InLabel);
+		};
+		switch (Controller->GetRefreshPhase())
+		{
+		case EGitChangedAssetsRefreshPhase::GitStatus:
+			return FormatProgress(LOCTEXT("ChangedAssetsRefreshingGitStatus", "Refreshing repository Git status"));
+		case EGitChangedAssetsRefreshPhase::CurrentMetadata:
+			return FormatProgress(LOCTEXT("ChangedAssetsRefreshingCurrentMetadata", "Reading current asset metadata"));
+		case EGitChangedAssetsRefreshPhase::HeadMetadata:
+			return FormatProgress(LOCTEXT("ChangedAssetsRefreshingHeadMetadata", "Reading HEAD asset metadata"));
+		case EGitChangedAssetsRefreshPhase::OwnerFallback:
+			return FormatProgress(LOCTEXT("ChangedAssetsRefreshingOwnerFallback", "Resolving owner levels"));
+		default:
+			return LOCTEXT("ChangedAssetsRefreshing", "Refreshing Git Changes...");
+		}
 	}
 	if (const FGitChangedAssetSnapshot* Snapshot = Controller->GetSnapshot())
 	{
