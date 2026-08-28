@@ -4,23 +4,88 @@
 #include "GitCatFileBatchReader.h"
 #include "GitSourceControlUtils.h"
 
+#include "AssetRegistry/ARFilter.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
 #include "Async/Async.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
+#include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "UObject/TopLevelAssetPath.h"
+#include "WorldPartition/WorldPartitionActorDesc.h"
 #include "WorldPartition/WorldPartitionActorDescUtils.h"
+#include "WorldPartition/DataLayer/WorldDataLayers.h"
 #include "WorldPartition/DataLayer/WorldDataLayersActorDesc.h"
 
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
 namespace GitChangedAssetsMetadataAutomationTestsPrivate
 {
+	struct FDataLayerMappingFixture
+	{
+		FString OwnerLevel;
+		FName Identifier;
+		FString FriendlyName;
+		FAssetData WorldDataLayersAssetData;
+	};
+
 	FString GetHeaderFallbackFixtureFilename()
 	{
 		return FPaths::Combine(FPaths::ProjectContentDir(), TEXT("B_LyraGameInstance.uasset"));
+	}
+
+	bool FindPrivateOrDeprecatedDataLayerFixture(FDataLayerMappingFixture& OutFixture)
+	{
+		FARFilter Filter;
+		Filter.ClassPaths.Add(AWorldDataLayers::StaticClass()->GetClassPathName());
+		Filter.bRecursiveClasses = true;
+		Filter.bRecursivePaths = true;
+		Filter.bIncludeOnlyOnDiskAssets = true;
+
+		TArray<FAssetData> WorldDataLayersAssets;
+		IAssetRegistry::GetChecked().GetAssets(Filter, WorldDataLayersAssets, false);
+		for (const FAssetData& AssetData : WorldDataLayersAssets)
+		{
+			if (!FWorldPartitionActorDescUtils::IsValidActorDescriptorFromAssetData(AssetData) ||
+				FWorldPartitionActorDescUtils::GetActorNativeClassFromAssetData(AssetData) != AWorldDataLayers::StaticClass())
+			{
+				continue;
+			}
+			const TUniquePtr<FWorldPartitionActorDesc> ActorDesc = FWorldPartitionActorDescUtils::GetActorDescriptorFromAssetData(AssetData);
+			if (!ActorDesc)
+			{
+				continue;
+			}
+			const FWorldDataLayersActorDesc& WorldDataLayersDesc = static_cast<const FWorldDataLayersActorDesc&>(*ActorDesc);
+			if (!WorldDataLayersDesc.IsValid())
+			{
+				continue;
+			}
+			const FString OwnerLevel = WorldDataLayersDesc.GetActorSoftPath().GetAssetPath().GetPackageName().ToString();
+			if (!FPackageName::IsValidLongPackageName(OwnerLevel, true))
+			{
+				continue;
+			}
+			for (const FDataLayerInstanceDesc& InstanceDesc : WorldDataLayersDesc.GetDataLayerInstances())
+			{
+				const FName Identifier = InstanceDesc.IsUsingAsset() ? InstanceDesc.GetAssetPath() : InstanceDesc.GetName();
+				const FString FriendlyName = InstanceDesc.GetShortName();
+				if (Identifier.IsNone() || FriendlyName.IsEmpty() || FriendlyName.Equals(TEXT("Unknown"), ESearchCase::CaseSensitive) ||
+					!GitChangedAssetsMetadataTesting::RequiresWorldDataLayersDescriptor(Identifier))
+				{
+					continue;
+				}
+				OutFixture.OwnerLevel = OwnerLevel;
+				OutFixture.Identifier = Identifier;
+				OutFixture.FriendlyName = FriendlyName;
+				OutFixture.WorldDataLayersAssetData = AssetData;
+				return true;
+			}
+		}
+		return false;
 	}
 
 }
@@ -656,6 +721,77 @@ bool FGitChangedAssetsDataLayerSourceCacheAutomationTest::RunTest(const FString&
 	CrossOwnerUnknownCache.Head.UnavailableWorldDataLayersRepositoryPaths.Add(CrossOwnerUnknownWdl.RepositoryRelativePath);
 	TestFalse(TEXT("Cross-owner WDL without a unique HEAD owner remains unavailable instead of defaulting to the current owner"),
 		GitChangedAssetsMetadataTesting::HasCompleteHeadWorldDataLayersMetadata(CrossOwnerUnknownCache));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetsDataLayerSourceStagesAutomationTest,
+	"Cthulhu.GitSourceControl.ChangedAssets.Metadata.DataLayerSourceStages",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitChangedAssetsDataLayerSourceStagesAutomationTest::RunTest(const FString& Parameters)
+{
+	static_cast<void>(Parameters);
+	GitChangedAssetsMetadataAutomationTestsPrivate::FDataLayerMappingFixture Fixture;
+	if (!TestTrue(TEXT("A private or deprecated WorldDataLayers fixture is available"),
+		GitChangedAssetsMetadataAutomationTestsPrivate::FindPrivateOrDeprecatedDataLayerFixture(Fixture)))
+	{
+		return false;
+	}
+
+	FGitChangedAssetSnapshot Snapshot;
+	Snapshot.RepositoryRoot = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	FGitChangedAssetDataLayerOwnerCache& OwnerCache = Snapshot.DataLayerOwnerCaches.FindOrAdd(Fixture.OwnerLevel);
+	OwnerCache.bWorldDataLayersIndexed = true;
+	FGitChangedAssetWorldDataLayersIndexEntry& WorldDataLayers = OwnerCache.WorldDataLayers.AddDefaulted_GetRef();
+	WorldDataLayers.AssetData = Fixture.WorldDataLayersAssetData;
+	WorldDataLayers.bHasCurrentAssetData = true;
+	auto AddActorEntry = [&Snapshot, &Fixture](const EGitChangedAssetDataLayerMappingSource Source)
+	{
+		FGitChangedAssetEntry& Entry = Snapshot.Entries.AddDefaulted_GetRef();
+		Entry.bHasActorDescriptorMetadata = true;
+		Entry.bOwnerLevelResolved = true;
+		Entry.OwnerLevel = Fixture.OwnerLevel;
+		Entry.DataLayerMappingSource = Source;
+		Entry.ActorDataLayerIdentifiers = { Fixture.Identifier };
+		Entry.ObjectPath = TEXT("/Game/TestMaps/StageFixture.StageFixture:PersistentLevel.Actor_UAID_StageFixture");
+		Entry.ActorObjectName = Source == EGitChangedAssetDataLayerMappingSource::Current ? TEXT("CurrentActor") : TEXT("HeadActor");
+		return Snapshot.Entries.Num() - 1;
+	};
+	const int32 CurrentEntryIndex = AddActorEntry(EGitChangedAssetDataLayerMappingSource::Current);
+	const int32 HeadEntryIndex = AddActorEntry(EGitChangedAssetDataLayerMappingSource::Head);
+
+	FGitChangedAssetsMetadataResolver::FinalizeCurrentMetadata(Snapshot);
+	TestEqual(TEXT("Current finalization resolves only the current actor's private or deprecated Data Layer name"),
+		Snapshot.Entries[CurrentEntryIndex].DisplayObjectPath, Fixture.FriendlyName + TEXT(".CurrentActor"));
+	TestTrue(TEXT("Current finalization leaves the HEAD actor display untouched until HEAD metadata finalization"),
+		Snapshot.Entries[HeadEntryIndex].DisplayObjectPath.IsEmpty());
+
+	FGitChangedAssetsMetadataResolver::FinalizeHeadOnlyMetadata(Snapshot);
+	TestEqual(TEXT("HEAD finalization resolves the same snapshot-local name only for the HEAD actor"),
+		Snapshot.Entries[HeadEntryIndex].DisplayObjectPath, Fixture.FriendlyName + TEXT(".HeadActor"));
+
+	FGitChangedAssetSnapshot UnavailableHeadSnapshot;
+	FGitChangedAssetDataLayerOwnerCache& UnavailableOwnerCache = UnavailableHeadSnapshot.DataLayerOwnerCaches.FindOrAdd(Fixture.OwnerLevel);
+	UnavailableOwnerCache.bWorldDataLayersIndexed = true;
+	UnavailableOwnerCache.Current.ResolvedNames.Add(Fixture.Identifier, Fixture.FriendlyName);
+	FGitChangedAssetWorldDataLayersIndexEntry& UnavailableWorldDataLayers = UnavailableOwnerCache.WorldDataLayers.AddDefaulted_GetRef();
+	UnavailableWorldDataLayers.RepositoryRelativePath = TEXT("Content/FixtureWorldDataLayers.uasset");
+	UnavailableWorldDataLayers.AssetData = Fixture.WorldDataLayersAssetData;
+	UnavailableWorldDataLayers.bHasCurrentAssetData = true;
+	UnavailableWorldDataLayers.bChangedRelativeToHead = true;
+	UnavailableOwnerCache.Head.UnavailableWorldDataLayersRepositoryPaths.Add(UnavailableWorldDataLayers.RepositoryRelativePath);
+	FGitChangedAssetEntry& UnavailableHeadEntry = UnavailableHeadSnapshot.Entries.AddDefaulted_GetRef();
+	UnavailableHeadEntry.bHasActorDescriptorMetadata = true;
+	UnavailableHeadEntry.bOwnerLevelResolved = true;
+	UnavailableHeadEntry.OwnerLevel = Fixture.OwnerLevel;
+	UnavailableHeadEntry.DataLayerMappingSource = EGitChangedAssetDataLayerMappingSource::Head;
+	UnavailableHeadEntry.ActorDataLayerIdentifiers = { Fixture.Identifier };
+	UnavailableHeadEntry.ObjectPath = TEXT("/Game/TestMaps/StageFixture.StageFixture:PersistentLevel.Actor_UAID_UnavailableHead");
+	UnavailableHeadEntry.ActorObjectName = TEXT("UnavailableHeadActor");
+	FGitChangedAssetsMetadataResolver::FinalizeHeadOnlyMetadata(UnavailableHeadSnapshot);
+	TestEqual(TEXT("Unavailable fixed-HEAD WDL metadata remains unresolved instead of leaking the current name"),
+		UnavailableHeadEntry.DisplayObjectPath,
+		GitChangedAssetsMetadataTesting::FriendlyDataLayerName(Fixture.Identifier.ToString()) + TEXT(".UnavailableHeadActor"));
 	return true;
 }
 

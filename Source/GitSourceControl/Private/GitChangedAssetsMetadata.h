@@ -76,14 +76,14 @@ public:
 	static int32 ApplyHeadOnlyMetadataRange(FGitChangedAssetSnapshot& InOutSnapshot,
 		const TArray<FGitChangedAssetHeadMetadataResult>& InResults, int32 InStartIndex, int32 InMaxCount);
 
-	/** 在所有 HEAD payload range 应用完毕后, 一次性完成 Data Layer resolve 和 revert eligibility。 */
+	/** 在所有 HEAD payload range 应用完毕后, 仅补充 owner topology、HEAD-source Data Layer mapping 和回退资格。 */
 	static void FinalizeHeadOnlyMetadata(FGitChangedAssetSnapshot& InOutSnapshot);
 
 	/** 在 Game Thread 同步应用全部 HEAD payload, 供非增量调用者和测试使用。 */
 	static void ApplyHeadOnlyMetadata(FGitChangedAssetSnapshot& InOutSnapshot, const TArray<FGitChangedAssetHeadMetadataResult>& InResults);
 
 	/**
-	 * 在 current/HEAD metadata 均已完成后, 为剩余 OFPA 行执行昂贵的 World root fallback.
+	 * 在 current/HEAD metadata 均已完成后, 为剩余 OFPA 行执行昂贵的 World root fallback, 并只补充新解析 owner 的对应 metadata source mapping.
 	 * 必须在 Game Thread 调用; 正常的 OptionalOuterPath fast path 不会进入这里.
 	 */
 	static void ResolveOutstandingOwnerFallback(FGitChangedAssetSnapshot& InOutSnapshot);

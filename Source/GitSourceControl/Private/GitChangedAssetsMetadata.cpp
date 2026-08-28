@@ -938,7 +938,7 @@ FGitChangedAssetDataLayerMappingCache& GetDataLayerMappingCache(FGitChangedAsset
 }
 
 void ResolveDataLayerMappingForOwner(FGitChangedAssetDataLayerOwnerCache& InOutOwnerCache,
-	const EGitChangedAssetDataLayerMappingSource InSource, const FOwnerDataLayerRequests& InRequests, const bool bForceRebuild)
+	const EGitChangedAssetDataLayerMappingSource InSource, const FOwnerDataLayerRequests& InRequests)
 {
 	FGitChangedAssetDataLayerMappingCache& MappingCache = GetDataLayerMappingCache(InOutOwnerCache, InSource);
 	TSet<FName> RequestedIdentifiers = InRequests.PrivateAssetPaths;
@@ -949,24 +949,24 @@ void ResolveDataLayerMappingForOwner(FGitChangedAssetDataLayerOwnerCache& InOutO
 	}
 
 	TSet<FName> IdentifiersToResolve;
-	if (bForceRebuild)
+	for (const FName Identifier : RequestedIdentifiers)
 	{
-		IdentifiersToResolve = RequestedIdentifiers;
-	}
-	else
-	{
-		for (const FName Identifier : RequestedIdentifiers)
+		if (!MappingCache.AttemptedIdentifiers.Contains(Identifier))
 		{
-			if (!MappingCache.AttemptedIdentifiers.Contains(Identifier))
-			{
-				IdentifiersToResolve.Add(Identifier);
-			}
+			IdentifiersToResolve.Add(Identifier);
 		}
 	}
 	if (IdentifiersToResolve.IsEmpty())
 	{
 		return;
 	}
+	if (InSource == EGitChangedAssetDataLayerMappingSource::Head && !HasCompleteHeadWorldDataLayersMetadata(InOutOwnerCache))
+	{
+		// Do not mark this source as attempted until every changed WDL descriptor has
+		// fixed-HEAD metadata. A later HEAD finalize must still be able to resolve it.
+		return;
+	}
+
 	FOwnerDataLayerRequests RequestsToResolve;
 	for (const FName Identifier : IdentifiersToResolve)
 	{
@@ -980,11 +980,6 @@ void ResolveDataLayerMappingForOwner(FGitChangedAssetDataLayerOwnerCache& InOutO
 		}
 	}
 	MappingCache.AttemptedIdentifiers.Append(IdentifiersToResolve);
-
-	if (InSource == EGitChangedAssetDataLayerMappingSource::Head && !HasCompleteHeadWorldDataLayersMetadata(InOutOwnerCache))
-	{
-		return;
-	}
 
 	for (const FGitChangedAssetWorldDataLayersIndexEntry& IndexEntry : InOutOwnerCache.WorldDataLayers)
 	{
@@ -1041,17 +1036,26 @@ void RebuildCachedDataLayerDisplays(FGitChangedAssetSnapshot& InOutSnapshot, con
 	}
 }
 
-void ResolvePrivateAndDeprecatedDataLayerNames(FGitChangedAssetSnapshot& InOutSnapshot, const bool bForceRebuild = false)
+void ResolvePrivateAndDeprecatedDataLayerNames(FGitChangedAssetSnapshot& InOutSnapshot,
+	const EGitChangedAssetDataLayerMappingSource InSource, const TSet<FString>* InOwnerLevelsToResolve = nullptr)
 {
 	TSet<FString> OwnerLevelsToIndex;
 	TMap<FString, FOwnerDataLayerRequests> RequestsByOwner;
 	for (const FGitChangedAssetEntry& Entry : InOutSnapshot.Entries)
 	{
-		if (Entry.bOwnerLevelResolved && !Entry.OwnerLevel.IsEmpty())
+		if (!Entry.bOwnerLevelResolved || Entry.OwnerLevel.IsEmpty())
 		{
+			continue;
+		}
+		if (InOwnerLevelsToResolve == nullptr || InOwnerLevelsToResolve->Contains(Entry.OwnerLevel))
+		{
+			// The initial Current finalization prepares known owner topology before the
+			// HEAD worker requests changed WDL descriptors. The mapping below remains
+			// source-specific in every phase.
 			OwnerLevelsToIndex.Add(Entry.OwnerLevel);
 		}
-		if (!Entry.bHasActorDescriptorMetadata || !Entry.bOwnerLevelResolved || Entry.OwnerLevel.IsEmpty())
+		if (!Entry.bHasActorDescriptorMetadata || Entry.DataLayerMappingSource != InSource ||
+			(InOwnerLevelsToResolve != nullptr && !InOwnerLevelsToResolve->Contains(Entry.OwnerLevel)))
 		{
 			continue;
 		}
@@ -1073,12 +1077,10 @@ void ResolvePrivateAndDeprecatedDataLayerNames(FGitChangedAssetSnapshot& InOutSn
 	{
 		if (!Pair.Value.IsEmpty())
 		{
-			ResolveDataLayerMappingForOwner(InOutSnapshot.DataLayerOwnerCaches.FindChecked(Pair.Key), EGitChangedAssetDataLayerMappingSource::Current, Pair.Value, bForceRebuild);
-			ResolveDataLayerMappingForOwner(InOutSnapshot.DataLayerOwnerCaches.FindChecked(Pair.Key), EGitChangedAssetDataLayerMappingSource::Head, Pair.Value, bForceRebuild);
+			ResolveDataLayerMappingForOwner(InOutSnapshot.DataLayerOwnerCaches.FindChecked(Pair.Key), InSource, Pair.Value);
 		}
 	}
-	RebuildCachedDataLayerDisplays(InOutSnapshot, EGitChangedAssetDataLayerMappingSource::Current);
-	RebuildCachedDataLayerDisplays(InOutSnapshot, EGitChangedAssetDataLayerMappingSource::Head);
+	RebuildCachedDataLayerDisplays(InOutSnapshot, InSource);
 }
 
 void FinalizeRevertEligibility(FGitChangedAssetEntry& InOutEntry)
@@ -1476,7 +1478,7 @@ void FGitChangedAssetsMetadataResolver::FinalizeCurrentMetadata(FGitChangedAsset
 			TryDeriveStandardExternalOwnerLevel(Entry);
 		}
 	}
-	ResolvePrivateAndDeprecatedDataLayerNames(InOutSnapshot);
+	ResolvePrivateAndDeprecatedDataLayerNames(InOutSnapshot, EGitChangedAssetDataLayerMappingSource::Current);
 	for (FGitChangedAssetEntry& Entry : InOutSnapshot.Entries)
 	{
 		FinalizeRevertEligibility(Entry);
@@ -1666,7 +1668,7 @@ void FGitChangedAssetsMetadataResolver::FinalizeHeadOnlyMetadata(FGitChangedAsse
 {
 	using namespace GitChangedAssetsMetadataPrivate;
 	check(IsInGameThread());
-	ResolvePrivateAndDeprecatedDataLayerNames(InOutSnapshot, true);
+	ResolvePrivateAndDeprecatedDataLayerNames(InOutSnapshot, EGitChangedAssetDataLayerMappingSource::Head);
 	for (FGitChangedAssetEntry& Entry : InOutSnapshot.Entries)
 	{
 		FinalizeRevertEligibility(Entry);
@@ -1685,15 +1687,46 @@ void FGitChangedAssetsMetadataResolver::ResolveOutstandingOwnerFallback(FGitChan
 	using namespace GitChangedAssetsMetadataPrivate;
 	check(IsInGameThread());
 
+	TArray<bool> OwnerWasResolved;
+	OwnerWasResolved.Reserve(InOutSnapshot.Entries.Num());
 	for (FGitChangedAssetEntry& Entry : InOutSnapshot.Entries)
 	{
+		OwnerWasResolved.Add(Entry.bOwnerLevelResolved);
 		if (!Entry.bOwnerLevelResolved)
 		{
-		TryDeriveStandardExternalOwnerLevel(Entry);
+			TryDeriveStandardExternalOwnerLevel(Entry);
 		}
 	}
 	ResolveExternalOwnersByWorldRoots(InOutSnapshot);
-	ResolvePrivateAndDeprecatedDataLayerNames(InOutSnapshot);
+
+	TSet<FString> NewlyResolvedCurrentOwners;
+	TSet<FString> NewlyResolvedHeadOwners;
+	for (int32 EntryIndex = 0; EntryIndex < InOutSnapshot.Entries.Num(); ++EntryIndex)
+	{
+		const FGitChangedAssetEntry& Entry = InOutSnapshot.Entries[EntryIndex];
+		if (OwnerWasResolved[EntryIndex] || !Entry.bOwnerLevelResolved || Entry.OwnerLevel.IsEmpty() || !Entry.bHasActorDescriptorMetadata)
+		{
+			continue;
+		}
+		if (Entry.DataLayerMappingSource == EGitChangedAssetDataLayerMappingSource::Current)
+		{
+			NewlyResolvedCurrentOwners.Add(Entry.OwnerLevel);
+		}
+		else if (Entry.DataLayerMappingSource == EGitChangedAssetDataLayerMappingSource::Head)
+		{
+			NewlyResolvedHeadOwners.Add(Entry.OwnerLevel);
+		}
+	}
+	if (!NewlyResolvedCurrentOwners.IsEmpty())
+	{
+		ResolvePrivateAndDeprecatedDataLayerNames(InOutSnapshot, EGitChangedAssetDataLayerMappingSource::Current,
+			&NewlyResolvedCurrentOwners);
+	}
+	if (!NewlyResolvedHeadOwners.IsEmpty())
+	{
+		ResolvePrivateAndDeprecatedDataLayerNames(InOutSnapshot, EGitChangedAssetDataLayerMappingSource::Head,
+			&NewlyResolvedHeadOwners);
+	}
 	for (FGitChangedAssetEntry& Entry : InOutSnapshot.Entries)
 	{
 		FinalizeRevertEligibility(Entry);
