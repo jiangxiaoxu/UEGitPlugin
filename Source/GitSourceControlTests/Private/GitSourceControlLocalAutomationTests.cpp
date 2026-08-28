@@ -381,173 +381,6 @@ bool FGitSourceControlHistoryAndBlobAutomationTest::RunTest(const FString& Param
 		&& TestEqual(TEXT("Delete-readd stops at the replacement lineage birth"), ReaddedHistory.Num(), 1);
 }
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlHistoryCacheAutomationTest, "Cthulhu.GitSourceControl.Local.HistoryCache", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitSourceControlHistoryCacheAutomationTest::RunTest(const FString& Parameters)
-{
-	static_cast<void>(Parameters);
-	using namespace GitSourceControlLocalAutomationTestsPrivate;
-	FGitTestFixture Fixture(*this);
-	if (!Fixture.Initialize()
-		|| !Fixture.WriteFile(TEXT("Content/Tracked.txt"), TEXT("tracked\n"))
-		|| !Fixture.WriteFile(TEXT("Content/Other.txt"), TEXT("other\n"))
-		|| !Fixture.CommitAll(TEXT("History cache fixture")))
-	{
-		return false;
-	}
-
-	const FString TrackedFilename = Fixture.AbsoluteFilename(TEXT("Content/Tracked.txt"));
-	const FString OtherFilename = Fixture.AbsoluteFilename(TEXT("Content/Other.txt"));
-	auto LoadCurrentPath = [this, &Fixture](const FString& Filename, FString& OutHead, TArray<FGitStandaloneHistoryTestEntry>& OutHistory)
-	{
-		bool bHeadChanged = false;
-		return LoadHistory(*this, Fixture, Filename, EGitLocalSourceControlHistoryMode::CurrentPath, OutHead, bHeadChanged, OutHistory)
-			&& TestFalse(TEXT("Stable cache fixture leaves HEAD unchanged"), bHeadChanged);
-	};
-
-	GitSourceControlUtils::Testing::ResetStandaloneHistoryCache();
-	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	FString FirstHead;
-	TArray<FGitStandaloneHistoryTestEntry> FirstHistory;
-	if (!LoadCurrentPath(TrackedFilename, FirstHead, FirstHistory))
-	{
-		return false;
-	}
-	const uint64 FirstMissLaunches = GitSourceControlUtils::Testing::GetGitProcessLaunchCount();
-	if (!TestTrue(TEXT("Initial history request launches Git"), FirstMissLaunches > 0))
-	{
-		return false;
-	}
-
-	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	FString CachedHead;
-	TArray<FGitStandaloneHistoryTestEntry> CachedHistory;
-	if (!LoadCurrentPath(TrackedFilename, CachedHead, CachedHistory))
-	{
-		return false;
-	}
-	const uint64 CacheHitLaunches = GitSourceControlUtils::Testing::GetGitProcessLaunchCount();
-	if (!TestTrue(TEXT("Same history key reuses the completed snapshot"), CacheHitLaunches < FirstMissLaunches)
-		|| !TestEqual(TEXT("Cache hit preserves the captured HEAD"), CachedHead, FirstHead)
-		|| !TestEqual(TEXT("Cache hit preserves history entry count"), CachedHistory.Num(), FirstHistory.Num()))
-	{
-		return false;
-	}
-
-	if (!Fixture.WriteFile(TEXT("Content/Tracked.txt"), TEXT("tracked after HEAD advance\n")) || !Fixture.CommitAll(TEXT("Advance history cache HEAD")))
-	{
-		return false;
-	}
-	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	FString AdvancedHead;
-	TArray<FGitStandaloneHistoryTestEntry> AdvancedHistory;
-	if (!LoadCurrentPath(TrackedFilename, AdvancedHead, AdvancedHistory))
-	{
-		return false;
-	}
-	if (!TestTrue(TEXT("HEAD advance bypasses the old completed snapshot"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() > CacheHitLaunches)
-		|| !TestFalse(TEXT("HEAD advance changes the cache key"), AdvancedHead.Equals(FirstHead, ESearchCase::CaseSensitive)))
-	{
-		return false;
-	}
-
-	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	FString ExactHead;
-	bool bExactHeadChanged = false;
-	TArray<FGitStandaloneHistoryTestEntry> ExactHistory;
-	if (!LoadHistory(*this, Fixture, TrackedFilename, EGitLocalSourceControlHistoryMode::ExactRenames, ExactHead, bExactHeadChanged, ExactHistory)
-		|| !TestTrue(TEXT("History mode remains part of the completed snapshot key"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() > CacheHitLaunches))
-	{
-		return false;
-	}
-
-	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	FString OtherHead;
-	TArray<FGitStandaloneHistoryTestEntry> OtherHistory;
-	if (!LoadCurrentPath(OtherFilename, OtherHead, OtherHistory)
-		|| !TestTrue(TEXT("Repository-relative path remains part of the completed snapshot key"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() > CacheHitLaunches))
-	{
-		return false;
-	}
-
-	const FString CloneDirectory = FPaths::Combine(FPaths::GetPath(Fixture.GetDirectory()), FString::Printf(TEXT("GitSourceControlHistoryCacheClone-%s"), *FGuid::NewGuid().ToString(EGuidFormats::Digits)));
-	ON_SCOPE_EXIT
-	{
-		IFileManager::Get().DeleteDirectory(*CloneDirectory, false, true);
-	};
-	if (!Fixture.RunGit(FString::Printf(TEXT("clone --no-local %s %s"), *QuoteGitArgument(Fixture.GetDirectory()), *QuoteGitArgument(CloneDirectory))))
-	{
-		return false;
-	}
-	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	FString CloneHead;
-	bool bCloneHeadChanged = false;
-	TArray<FGitStandaloneHistoryTestEntry> CloneHistory;
-	FString CloneError;
-	if (!TestTrue(TEXT("Clone repository history query succeeds"), GitSourceControlUtils::Testing::LoadStandaloneHistory(
-		Fixture.GetGitBinary(), CloneDirectory, FPaths::Combine(CloneDirectory, TEXT("Content/Tracked.txt")), EGitLocalSourceControlHistoryMode::CurrentPath,
-		CloneHead, bCloneHeadChanged, CloneHistory, CloneError))
-		|| !TestFalse(TEXT("Clone history leaves HEAD unchanged"), bCloneHeadChanged)
-		|| !TestTrue(TEXT("Repository root remains part of the completed snapshot key"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() > CacheHitLaunches))
-	{
-		if (!CloneError.IsEmpty())
-		{
-			AddError(CloneError);
-		}
-		return false;
-	}
-
-	GitSourceControlUtils::Testing::ResetStandaloneHistoryCache();
-	FString FailedHead;
-	bool bFailedHeadChanged = false;
-	TArray<FGitStandaloneHistoryTestEntry> FailedHistory;
-	FString FailedError;
-	TestFalse(TEXT("Outside-repository history request fails"), GitSourceControlUtils::Testing::LoadStandaloneHistory(
-		Fixture.GetGitBinary(), Fixture.GetDirectory(), FPaths::Combine(Fixture.GetDirectory(), TEXT(".."), TEXT("OutsideHistoryCache.txt")),
-		EGitLocalSourceControlHistoryMode::CurrentPath, FailedHead, bFailedHeadChanged, FailedHistory, FailedError));
-	TestEqual(TEXT("Failed history request does not enter the completed cache"), GitSourceControlUtils::Testing::GetStandaloneHistoryCacheEntryCount(), 0);
-
-	FString CancelledError;
-	TestFalse(TEXT("Cancelled history request fails"), GitSourceControlUtils::Testing::LoadStandaloneHistoryWithCancelledContext(
-		Fixture.GetGitBinary(), Fixture.GetDirectory(), TrackedFilename, EGitLocalSourceControlHistoryMode::CurrentPath, CancelledError));
-	TestEqual(TEXT("Cancelled history request does not enter the completed cache"), GitSourceControlUtils::Testing::GetStandaloneHistoryCacheEntryCount(), 0);
-
-	for (int32 Index = 0; Index < 33; ++Index)
-	{
-		if (!Fixture.WriteFile(FString::Printf(TEXT("Content/Eviction/%02d.txt"), Index), FString::Printf(TEXT("%d\n"), Index)))
-		{
-			return false;
-		}
-	}
-	if (!Fixture.CommitAll(TEXT("History cache eviction fixture")))
-	{
-		return false;
-	}
-	GitSourceControlUtils::Testing::ResetStandaloneHistoryCache();
-	for (int32 Index = 0; Index < 33; ++Index)
-	{
-		FString EvictionHead;
-		TArray<FGitStandaloneHistoryTestEntry> EvictionHistory;
-		if (!LoadCurrentPath(Fixture.AbsoluteFilename(FString::Printf(TEXT("Content/Eviction/%02d.txt"), Index)), EvictionHead, EvictionHistory))
-		{
-			return false;
-		}
-	}
-	if (!TestEqual(TEXT("Completed history cache applies its 32-entry LRU bound"), GitSourceControlUtils::Testing::GetStandaloneHistoryCacheEntryCount(), 32))
-	{
-		return false;
-	}
-	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	FString EvictedHead;
-	TArray<FGitStandaloneHistoryTestEntry> EvictedHistory;
-	if (!LoadCurrentPath(Fixture.AbsoluteFilename(TEXT("Content/Eviction/00.txt")), EvictedHead, EvictedHistory)
-		|| !TestTrue(TEXT("Least-recently-used history snapshot is rebuilt after eviction"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() > CacheHitLaunches))
-	{
-		return false;
-	}
-	return true;
-}
-
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlIntegrationHistoryDiffRestoreAutomationTest, "Cthulhu.GitSourceControl.Integration.HistoryDiffRestore", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
 
 bool FGitSourceControlIntegrationHistoryDiffRestoreAutomationTest::RunTest(const FString& Parameters)
@@ -635,19 +468,19 @@ bool FGitSourceControlIntegrationHistoryDiffRestoreAutomationTest::RunTest(const
 	TestTrue(TEXT("Per-asset provider info resolves the mounted fixture repository"), ProviderInfo.bAvailable);
 	TestTrue(TEXT("Per-asset provider info returns the nearest fixture repository"), FPaths::IsSamePath(ProviderInfo.RepositoryRoot, Fixture.GetDirectory()));
 	TestTrue(TEXT("Operation has no public manual Tick reflection method"), UGitLocalSourceControlOperation::StaticClass()->FindFunctionByName(TEXT("Tick")) == nullptr);
-	TestTrue(TEXT("The module startup operation pump remains registered while idle"), GitLocalSourceControl::Testing::HasOperationTicker());
+	TestFalse(TEXT("The operation ticker is absent while the manager is idle"), GitLocalSourceControl::Testing::HasOperationTicker());
 	GitLocalSourceControl::Testing::ResetDeferredCleanupLaunchCount();
 	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
 	UGitLocalSourceControlOperation* LocalHitFetch = UGitLocalSourceControlLibrary::StartFetchLfsRevision(AssetObjectPath, History[1].CommitId);
 	if (!TestNotNull(TEXT("A read-only LFS fetch returns an operation"), LocalHitFetch)) return false;
 	TestEqual(TEXT("A non-terminal operation is held by the module manager"), GitLocalSourceControl::Testing::GetManagedOperationCount(), 1);
-	TestTrue(TEXT("The fixed module operation pump remains registered while active"), GitLocalSourceControl::Testing::HasOperationTicker());
+	TestTrue(TEXT("A normal operation registers the operation ticker"), GitLocalSourceControl::Testing::HasOperationTicker());
 	TestFalse(TEXT("A successful read-only LFS fetch cannot arm destructive deferred cleanup"), LocalHitFetch->ScheduleDiscardTrackedAfterCompletion({ AssetObjectPath }));
 	if (!WaitForOperation(*this, LocalHitFetch, TEXT("StartFetchLfsRevision local cache hit"))) return false;
 	TestTrue(TEXT("StartFetchLfsRevision local cache hit succeeds"), LocalHitFetch->GetResult().bSucceeded);
 	TestEqual(TEXT("A successful read-only LFS fetch never launches deferred cleanup"), GitLocalSourceControl::Testing::GetDeferredCleanupLaunchCount(), 0);
 	TestEqual(TEXT("A terminal operation is released by the module manager"), GitLocalSourceControl::Testing::GetManagedOperationCount(), 0);
-	TestTrue(TEXT("The idle module operation pump remains registered"), GitLocalSourceControl::Testing::HasOperationTicker());
+	TestFalse(TEXT("The operation ticker is removed after all operations are terminal"), GitLocalSourceControl::Testing::HasOperationTicker());
 	UGitLocalSourceControlOperation* BlockedReadOnlyOperation = GitLocalSourceControl::Testing::StartBlockedReadOnlyOperationForTesting();
 	if (!TestNotNull(TEXT("A blocked read-only operation returns an operation"), BlockedReadOnlyOperation)) return false;
 	bool bBlockedReadOnlyOperationReleased = false;
@@ -842,11 +675,11 @@ bool FGitSourceControlIntegrationHistoryDiffRestoreAutomationTest::RunTest(const
 	if (!TestNotNull(TEXT("A successful parent returns an operation"), SuccessfulDeferredParent)
 		|| !TestTrue(TEXT("A successful parent accepts pre-armed deferred cleanup"), SuccessfulDeferredParent->ScheduleDiscardTrackedAfterCompletion({ AssetObjectPath }))
 		|| !TestEqual(TEXT("The shutdown-style drain starts with the managed parent operation"), GitLocalSourceControl::Testing::GetManagedOperationCount(), 1)
-		|| !TestTrue(TEXT("A shutdown-style drain removes the fixed ticker, drains parent and child, then restores the pump"), GitLocalSourceControl::Testing::DrainOperationsForTesting())) return false;
+		|| !TestTrue(TEXT("A shutdown-style drain completes the parent and deferred child"), GitLocalSourceControl::Testing::DrainOperationsForTesting())) return false;
 	TestTrue(TEXT("The shutdown-style drain terminalizes the successful parent"), SuccessfulDeferredParent->IsTerminal());
 	TestTrue(TEXT("The successful parent changes disk before scheduling cleanup"), SuccessfulDeferredParent->GetResult().bSucceeded);
 	TestEqual(TEXT("The shutdown-style drain releases parent and internal child from the manager"), GitLocalSourceControl::Testing::GetManagedOperationCount(), 0);
-	TestTrue(TEXT("The fixed ticker is registered again after the shutdown-style drain"), GitLocalSourceControl::Testing::HasOperationTicker());
+	TestFalse(TEXT("The shutdown-style drain leaves no operation ticker"), GitLocalSourceControl::Testing::HasOperationTicker());
 	TestEqual(TEXT("A successful parent starts its deferred cleanup exactly once"), GitLocalSourceControl::Testing::GetDeferredCleanupLaunchCount(), 1);
 	FString DeferredCleanupStatus;
 	if (!Fixture.RunGit(TEXT("status --porcelain -- Content/HistoryDiffFixture.uasset"), DeferredCleanupStatus)) return false;
@@ -866,7 +699,9 @@ bool FGitSourceControlIntegrationHistoryDiffRestoreAutomationTest::RunTest(const
 	GitLocalSourceControl::Testing::SetForcePreparedPackageReloadFailure(false);
 	TestFalse(TEXT("A post-mutation reload failure makes the parent fail"), ReloadFailureDeferredParent->GetResult().bSucceeded);
 	TestFalse(TEXT("A post-mutation reload failure is reported on the parent"), ReloadFailureDeferredParent->GetResult().bReloadSucceeded);
+	TestTrue(TEXT("The ticker remains active while the parent deferred child is pending"), GitLocalSourceControl::Testing::HasOperationTicker());
 	if (!WaitForManagedOperationsToSettle(*this, TEXT("A reload-failure parent and its cleanup"))) return false;
+	TestFalse(TEXT("The ticker is removed after the deferred child is terminal"), GitLocalSourceControl::Testing::HasOperationTicker());
 	TestEqual(TEXT("A reload-failure parent still starts deferred cleanup exactly once"), GitLocalSourceControl::Testing::GetDeferredCleanupLaunchCount(), 1);
 	FString ReloadFailureDeferredStatus;
 	if (!Fixture.RunGit(TEXT("status --porcelain -- Content/HistoryDiffFixture.uasset"), ReloadFailureDeferredStatus)) return false;
@@ -887,7 +722,6 @@ bool FGitSourceControlIntegrationHistoryDiffRestoreAutomationTest::RunTest(const
 	TestTrue(TEXT("A failed internal deferred cleanup reports its asset path"), DeferredCleanupDiagnostic.Contains(TEXT("/Invalid/DeferredCleanup.DeferredCleanup")));
 	TestTrue(TEXT("A failed internal deferred cleanup gives an actionable recovery instruction"), DeferredCleanupDiagnostic.Contains(TEXT("inspect these assets"), ESearchCase::IgnoreCase));
 	TestEqual(TEXT("A failed internal deferred cleanup is released by the manager"), GitLocalSourceControl::Testing::GetManagedOperationCount(), 0);
-	TestTrue(TEXT("A failed internal deferred cleanup leaves the fixed module pump registered"), GitLocalSourceControl::Testing::HasOperationTicker());
 
 	GitLocalSourceControl::Testing::SetForcePreparedPackageReloadFailure(true);
 	UGitLocalSourceControlOperation* ReloadFailure = UGitLocalSourceControlLibrary::StartDiscardTracked({ AssetObjectPath });

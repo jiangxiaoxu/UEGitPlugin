@@ -10,7 +10,6 @@
 #include "GitSourceControlRevision.h"
 #include "GitSourceControlStatusBarIntegration.h"
 #include "GitStandaloneLog.h"
-#include "GitStandaloneHistory.h"
 #include "GitSourceControlUtils.h"
 #include "SGitChangedAssetsPanel.h"
 #include "Async/Async.h"
@@ -112,7 +111,6 @@ void FGitSourceControlModule::ShutdownModule()
 	}
 	GitLocalSourceControl::ShutdownOperations();
 	GitSourceControlMenu.Unregister();
-	GitSourceControlUtils::ClearStandaloneHistoryCache();
 	if (UToolMenus::TryGet())
 	{
 		UToolMenus::UnRegisterStartupCallback(this);

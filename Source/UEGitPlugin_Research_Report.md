@@ -47,7 +47,7 @@ Changed Assets 在显式打开或 Refresh 时执行一次 `git status --porcelai
 
 ## Editor automation API
 
-AngelScript 通过 typed `GitLocalSourceControl` API 控制 legacy History/Diff/Restore/Discard 能力; 该 surface 不暴露给 Blueprint. `StartLoadHistory(AssetObjectPath, EGitLocalSourceControlHistoryMode)` 显式选择 `CurrentPath` 或 `ExactRenames`; LFS fetch 和 revision Restore 始终以 `ExactRenames` 解析 historical path. 该 public API 不提供 Changed Assets status refresh 或 untracked delete; Changed Assets tab 保持 private/providerless. operation 由 module-owned `FGCObject` registry 保活并由固定 module ticker 自动 pump, 不提供 public `Tick`; AS workflow 绑定 `OnProgress`/`OnCompleted`, 以 `Cancel`, `IsTerminal`, `GetPhase` 和 `GetResult` 控制及 readback. `OnCompleted` 只在 package reload/recovery 后派发一次. `GetProviderInfo(AssetObjectPath)` 按资产路径解析 nearest repository. 输入为 asset object path, 不暴露 raw Git argv.
+AngelScript 通过 typed `GitLocalSourceControl` API 控制 legacy History/Diff/Restore/Discard 能力; 该 surface 不暴露给 Blueprint. `StartLoadHistory(AssetObjectPath, EGitLocalSourceControlHistoryMode)` 显式选择 `CurrentPath` 或 `ExactRenames`; LFS fetch 和 revision Restore 始终以 `ExactRenames` 解析 historical path. 该 public API 不提供 Changed Assets status refresh 或 untracked delete; Changed Assets tab 保持 private/providerless. operation 由 module-owned `FGCObject` registry 保活并仅在存在 managed operation 时注册 ticker 自动 pump, 不提供 public `Tick`; AS workflow 绑定 `OnProgress`/`OnCompleted`, 以 `Cancel`, `IsTerminal`, `GetPhase` 和 `GetResult` 控制及 readback. `OnCompleted` 只在 package reload/recovery 后派发一次. `GetProviderInfo(AssetObjectPath)` 按资产路径解析 nearest repository. 输入为 asset object path, 不暴露 raw Git argv.
 
 ## 构建与测试入口
 
@@ -62,7 +62,7 @@ npm run test:unreal:automation -- Cthulhu.GitSourceControl.ChangedAssets.RevertT
 npm run as:diagnostics
 ```
 
-测试使用 isolated temporary Git repository 和 local bare LFS remote, 覆盖 fixed-HEAD history、exact rename、LFS hit/miss、standalone Diff selection、Restore/Discard safety、index invariant、provider absence、startup Git capability gate 恰好一次、Pending/Unavailable UI fail-closed、Content Browser action execution gate 以及 asset lifecycle 中除 startup gate 外的 zero Git process. AS operation manager 还必须覆盖 FGCObject 保活、固定 ticker 的 startup/shutdown 生命周期和 idle fast-return、无 public `Tick`、event-driven workflow、progress/completion 单次派发、cancel/terminal readback、reload/recovery completion 顺序以及 reload failure 的 `Failed`/partial-disk diagnostic. Changed Assets 专项还必须验证 refresh phase 从 status 持续到 current/HEAD/owner metadata 完成, phase 期间 Refresh/Revert disabled, package-header truth 不触发全局 Asset Registry refresh, activity-only update 保持 row identity, WorldDataLayers topology 继续遵循 Asset Registry/既有 owner-resolution 路径, 以及无 DirectoryWatcher/background polling. 测试需要 Git 和 Git LFS, 不连接 external server.
+测试使用 isolated temporary Git repository 和 local bare LFS remote, 覆盖 fixed-HEAD history、exact rename、LFS hit/miss、standalone Diff selection、Restore/Discard safety、index invariant、provider absence、startup Git capability gate 恰好一次、Pending/Unavailable UI fail-closed、Content Browser action execution gate 以及 asset lifecycle 中除 startup gate 外的 zero Git process. AS operation manager 还必须覆盖 FGCObject 保活、operation-driven ticker 的注册/terminal 后移除及 shutdown drain、无 public `Tick`、event-driven workflow、progress/completion 单次派发、cancel/terminal readback、reload/recovery completion 顺序以及 reload failure 的 `Failed`/partial-disk diagnostic. Changed Assets 专项还必须验证 refresh phase 从 status 持续到 current/HEAD/owner metadata 完成, phase 期间 Refresh/Revert disabled, package-header truth 不触发全局 Asset Registry refresh, activity-only update 保持 row identity, WorldDataLayers topology 继续遵循 Asset Registry/既有 owner-resolution 路径, 以及无 DirectoryWatcher/background polling. 测试需要 Git 和 Git LFS, 不连接 external server.
 
 ## 已知限制
 
@@ -73,7 +73,7 @@ npm run as:diagnostics
 - Git 缺失或低于 2.53.0 时 startup gate 为 `Unavailable`, 资产右键菜单仍保持可见但点击只显示诊断, 面板入口只显示诊断; 安装/升级后不重启不会重新探测.
 - Git LFS 缺失、低于 3.7.1 或瞬时检查失败时当前 LFS 操作失败且不缓存失败结果, 下一次显式 LFS 操作重试, 无需重启 Editor; 普通 Changed Assets 不受影响.
 - 插件不提供 precompiled binary, 构建需要项目 Unreal Editor target 和可用 C++ toolchain。
-- AngelScript operation 不提供 Blueprint 节点或 public `Tick`; `Task_GitAssetRestoreViaApi` 和 `Task_GitAssetHistoryPerformance` 两个 workflow 必须使用 event-driven progress/completion. ticker 固定保留到 module shutdown, idle 时不执行 operation work.
+- AngelScript operation 不提供 Blueprint 节点或 public `Tick`; `Task_GitAssetRestoreViaApi` 和 `Task_GitAssetHistoryPerformance` 两个 workflow 必须使用 event-driven progress/completion. ticker 仅在 managed operation 存在时注册, 全部 terminal 后移除.
 
 ## Attribution and license
 

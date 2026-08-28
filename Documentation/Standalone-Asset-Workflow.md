@@ -78,7 +78,7 @@ LFS 下载显示可取消进度。取消或失败不会进入 asset mutation。
 
 启动插件会执行一次异步 Git executable/version gate, 但不会执行 repository status. 浏览 Content Browser、create/move/copy/save/rename/delete asset 都不会执行额外 Git. 仅在 gate `Available` 后的显式操作才会创建异步 job; Git/LFS I/O 在 worker, Slate 和 asset/package 操作在 Game Thread. Git 安装或升级后需重启 Editor, 当前 session 不会自动重探.
 
-`GitLocalSourceControl` automation API 仅供 AngelScript 使用. `UGitLocalSourceControlOperation` 不暴露 Blueprint, 没有 public `Tick`; module-owned `FGCObject` registry 保活所有 non-terminal operation, module startup 注册的固定 ticker 自动 pump Game Thread, idle 时只快速返回. workflow 通过 `OnProgress` 观察 phase/progress, 通过 `OnCompleted` 收取终态; completion 在 package reload 或 recovery 完成后才发送且每个 operation 只发送一次. `Cancel`, `IsTerminal`, `GetPhase` 和 `GetResult` 用于控制和 readback. `GetProviderInfo(AssetObjectPath)` 按资产路径解析 nearest repository.
+`GitLocalSourceControl` automation API 仅供 AngelScript 使用. `UGitLocalSourceControlOperation` 不暴露 Blueprint, 没有 public `Tick`; module-owned `FGCObject` registry 保活所有 non-terminal operation, 仅在存在 managed operation 时注册 ticker 自动 pump Game Thread, 全部 operation terminal 后自动移除. module shutdown 会停止 ticker 并同步排空允许的 cleanup. workflow 通过 `OnProgress` 观察 phase/progress, 通过 `OnCompleted` 收取终态; completion 在 package reload 或 recovery 完成后才发送且每个 operation 只发送一次. `Cancel`, `IsTerminal`, `GetPhase` 和 `GetResult` 用于控制和 readback. `GetProviderInfo(AssetObjectPath)` 按资产路径解析 nearest repository.
 
 关闭 History window 会取消未完成的 read-only job。模块 shutdown 会取消并等待 read-only/network job; 已跨过 mutation commit point 的 Restore/Discard 必须完成或 rollback, 不能被中途取消。
 

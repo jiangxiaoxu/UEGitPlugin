@@ -2,7 +2,7 @@
 
 `GitSourceControl` 是 Unreal Editor 的 standalone local Git asset tool. 它不注册 Unreal `ISourceControlProvider`, 不维护 Content Browser 状态徽标, 也不参与 Engine asset lifecycle. 模块启动后会异步执行一次 Git executable 与版本门禁检查, 只验证 Git 是否可用且版本为 2.53.0 或更高, 不探测 repository 状态. Content Browser 资产右键菜单始终注册以保持 discoverability; 门禁为 `Pending` 或 `Unavailable` 时点击只显示可操作的诊断并禁止 Git 交互, `Available` 时才执行 Git action. Level Editor 状态栏和 Git Changes 面板在门禁未通过时同样禁止交互. 普通 create/move/copy/save/rename/delete 仍不执行 Git.
 
-面向自动化的 `GitLocalSourceControl` API 是 AngelScript-only surface. `UGitLocalSourceControlOperation` 不再暴露给 Blueprint, 不提供 public `Tick`; module-owned `FGCObject` registry 会保活所有 non-terminal operation, 并由 module startup 注册的固定 Game Thread ticker 自动 pump. idle 时 ticker 只快速返回, module shutdown 时移除. operation 通过 `OnProgress` 和 `OnCompleted` 通知, `Cancel` 与 phase/result readback 保持显式 API; completion 只在 package reload 或 recovery 完成后发出. `GetProviderInfo` 按 asset object path 解析 nearest repository, 不依赖全局 provider.
+面向自动化的 `GitLocalSourceControl` API 是 AngelScript-only surface. `UGitLocalSourceControlOperation` 不再暴露给 Blueprint, 不提供 public `Tick`; module-owned `FGCObject` registry 会保活所有 non-terminal operation, 并仅在存在 managed operation 时注册 Game Thread ticker 自动 pump. 全部 operation terminal 后 ticker 自动移除, module shutdown 会先停止 ticker 再同步排空允许的 cleanup. operation 通过 `OnProgress` 和 `OnCompleted` 通知, `Cancel` 与 phase/result readback 保持显式 API; completion 只在 package reload 或 recovery 完成后发出. `GetProviderInfo` 按 asset object path 解析 nearest repository, 不依赖全局 provider.
 
 ## 文档
 
@@ -25,7 +25,7 @@
 - Diff 失败或取消时立即清理临时导出; 成功打开的 Diff 导出保留到当前 Editor session 退出, 仅清理插件专用的 `Diff/UEGitPlugin/UEGit-Diff-*` 文件。
 - LFS object 优先使用本地 cache; miss 时只针对目标 commit/path fetch, remote 必须是 branch upstream 或唯一 remote。
 - Force Restore 会明确丢弃目标 `.uasset` 的 worktree、index 和 loaded in-memory changes, reset index path 到 `HEAD`, 原子写入 revision, 并在失败时 rollback。它没有 Undo。
-- Operation manager 在 module startup 后保持一个 idle fast-return ticker; package reload/recovery 后才广播 completion. reload 失败会进入 `Failed` phase, 同时报告已完成的磁盘 mutation 和需要人工检查的 partial-disk 状态。
+- Operation manager 只在存在 managed operation 时注册 ticker; package reload/recovery 后才广播 completion. reload 失败会进入 `Failed` phase, 同时报告已完成的磁盘 mutation 和需要人工检查的 partial-disk 状态。
 
 ## 外部 Git client 边界
 
@@ -43,7 +43,7 @@ npm run as:diagnostics
 
 发布前还需通过 Changed Assets refresh phase/progress、metadata truth、OFPA owner/DataLayer fallback、UI disabled gate 和无 watcher/polling 的 automation coverage, 并执行 `git diff --check`.
 
-还需验证 AS operation manager 的 FGCObject 保活、module startup/shutdown ticker 生命周期和 idle fast-return、无 public `Tick`、progress/completion 事件只广播一次、取消边界、reload/recovery 后 completion 以及 reload 失败时的 `Failed`/partial-disk diagnostic.
+还需验证 AS operation manager 的 FGCObject 保活、operation-driven ticker 注册/terminal 后移除及 shutdown drain、无 public `Tick`、progress/completion 事件只广播一次、取消边界、reload/recovery 后 completion 以及 reload 失败时的 `Failed`/partial-disk diagnostic.
 
 插件需要 Git 2.53.0 或更新版本. 使用 Git LFS 的项目还需要 Git LFS 3.7.1 或更新版本; LFS capability 只在首次确实需要 LFS object 的显式操作时 lazy 检查, 只缓存成功的 3.7.1+ 结果, 不阻塞普通 Git Changes. 缺失、版本过低或瞬时检查失败只使当前 LFS 动作失败, 下次显式 LFS 动作会重试, 无需重启 Editor. 插件不提供 Git、Git LFS 或预编译 binary.
 

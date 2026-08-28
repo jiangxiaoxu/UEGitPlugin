@@ -270,18 +270,3 @@ FString FGitLfsLocalObjectStore::MakeObjectCacheKey(const FGitLfsPointer& InPoin
 {
 	return InPointer.Oid.ToLower() + TEXT(":") + LexToString(InPointer.Size);
 }
-
-bool FGitLfsBatchVerificationContext::IsVerified(const FGitLfsPointer& InPointer) const
-{
-	return VerifiedObjectKeys.Contains(MakeObjectKey(InPointer));
-}
-
-void FGitLfsBatchVerificationContext::MarkVerified(const FGitLfsPointer& InPointer)
-{
-	VerifiedObjectKeys.Add(MakeObjectKey(InPointer));
-}
-
-FString FGitLfsBatchVerificationContext::MakeObjectKey(const FGitLfsPointer& InPointer)
-{
-	return InPointer.Oid.ToLower() + TEXT(":") + LexToString(InPointer.Size);
-}

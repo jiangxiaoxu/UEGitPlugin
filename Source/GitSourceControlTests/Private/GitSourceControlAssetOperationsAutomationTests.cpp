@@ -335,171 +335,25 @@ bool FGitSourceControlAssetDiscardLfsAutomationTest::RunTest(const FString& Para
 	TestTrue(TEXT("Discard LFS cache miss verifies downloaded object"), GitSourceControlUtils::VerifyLocalLfsObject(Fixture.GetGitBinary(), Fixture.GetRoot(), ObjectFilename, Oid, Size, VerifyError));
 	TestTrue(TEXT("Discard LFS cache miss restores HEAD content"), Fixture.ReadFile(TEXT("Content/Tracked.uasset"), Contents));
 	TestEqual(TEXT("Discard LFS cache miss content matches HEAD"), Contents, FString(TEXT("head LFS bytes\n")));
-	return TestCallbacks(*this, ConfirmCalls, PrepareCalls, ReloadCalls);
-}
+	if (!TestCallbacks(*this, ConfirmCalls, PrepareCalls, ReloadCalls)) return false;
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetDiscardLfsBatchAutomationTest, "Cthulhu.GitSourceControl.AssetOperations.DiscardLfsBatch", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitSourceControlAssetDiscardLfsBatchAutomationTest::RunTest(const FString& Parameters)
-{
-	static_cast<void>(Parameters);
-	using namespace GitSourceControlAssetOperations;
-	using namespace GitSourceControlAssetOperationsAutomationTestsPrivate;
-	FFixture Fixture(*this);
-	if (!Fixture.Initialize()) return false;
-	if (!IsGitLfsAvailable(Fixture.GetGitBinary()))
-	{
-		AddWarning(TEXT("Git LFS is unavailable; skipping DiscardLfsBatch."));
-		return true;
-	}
-	const FString FirstRelativeFilename = TEXT("Content/First.uasset");
-	const FString SecondRelativeFilename = TEXT("Content/Second.uasset");
-	const FString DistinctRelativeFilename = TEXT("Content/Distinct.uasset");
-	const FString SharedHeadContents = TEXT("shared head LFS bytes\n");
-	const FString DistinctHeadContents = TEXT("distinct head LFS bytes\n");
-	if (!Fixture.RunGit(TEXT("lfs install --local"))
-		|| !Fixture.RunGit(TEXT("lfs track \"Content/*.uasset\""))
-		|| !Fixture.WriteFile(TEXT(".gitignore"), TEXT("Origin.git/\n"))
-		|| !Fixture.WriteFile(FirstRelativeFilename, SharedHeadContents)
-		|| !Fixture.WriteFile(SecondRelativeFilename, SharedHeadContents)
-		|| !Fixture.WriteFile(DistinctRelativeFilename, DistinctHeadContents)
-		|| !Fixture.CommitAll(TEXT("Initial batch LFS tracked assets")))
-	{
-		return false;
-	}
-	const FString OriginDirectory = Fixture.AbsoluteFilename(TEXT("Origin.git"));
-	if (!Fixture.RunGit(FString::Printf(TEXT("init --bare %s"), *QuoteGitArgument(OriginDirectory)))
-		|| !Fixture.RunGit(FString::Printf(TEXT("remote add origin %s"), *QuoteGitArgument(OriginDirectory)))
-		|| !Fixture.RunGit(TEXT("push -u origin HEAD")))
-	{
-		return false;
-	}
-	FString FirstPointerText;
-	FString SecondPointerText;
-	FString DistinctPointerText;
-	if (!Fixture.RunGit(TEXT("show HEAD:Content/First.uasset"), FirstPointerText)
-		|| !Fixture.RunGit(TEXT("show HEAD:Content/Second.uasset"), SecondPointerText)
-		|| !Fixture.RunGit(TEXT("show HEAD:Content/Distinct.uasset"), DistinctPointerText))
-	{
-		return false;
-	}
-	FString SharedOid;
-	FString SecondOid;
-	FString DistinctOid;
-	int64 SharedSize = 0;
-	int64 SecondSize = 0;
-	int64 DistinctSize = 0;
-	if (!TestTrue(TEXT("First batch LFS pointer parses"), ParseLfsPointer(FirstPointerText, SharedOid, SharedSize))
-		|| !TestTrue(TEXT("Second batch LFS pointer parses"), ParseLfsPointer(SecondPointerText, SecondOid, SecondSize))
-		|| !TestTrue(TEXT("Distinct batch LFS pointer parses"), ParseLfsPointer(DistinctPointerText, DistinctOid, DistinctSize))
-		|| !TestTrue(TEXT("Two paths share one oid:size"), SharedOid.Equals(SecondOid, ESearchCase::CaseSensitive) && SharedSize == SecondSize)
-		|| !TestFalse(TEXT("A distinct payload retains a separate oid:size"), SharedOid.Equals(DistinctOid, ESearchCase::CaseSensitive) && SharedSize == DistinctSize))
-	{
-		return false;
-	}
-	const FString SharedObjectFilename = FPaths::Combine(Fixture.GetRoot(), TEXT(".git/lfs/objects"), SharedOid.Left(2), SharedOid.Mid(2, 2), SharedOid);
-	const FString DistinctObjectFilename = FPaths::Combine(Fixture.GetRoot(), TEXT(".git/lfs/objects"), DistinctOid.Left(2), DistinctOid.Mid(2, 2), DistinctOid);
-	FString VerifyError;
-	if (!TestTrue(TEXT("Shared LFS object exists before batch operations"), IFileManager::Get().FileExists(*SharedObjectFilename))
-		|| !TestTrue(TEXT("Distinct LFS object exists before batch operations"), IFileManager::Get().FileExists(*DistinctObjectFilename))
-		|| !TestTrue(TEXT("Shared LFS object verifies before batch operations"), GitSourceControlUtils::VerifyLocalLfsObject(Fixture.GetGitBinary(), Fixture.GetRoot(), SharedObjectFilename, SharedOid, SharedSize, VerifyError))
-		|| !TestTrue(TEXT("Distinct LFS object verifies before batch operations"), GitSourceControlUtils::VerifyLocalLfsObject(Fixture.GetGitBinary(), Fixture.GetRoot(), DistinctObjectFilename, DistinctOid, DistinctSize, VerifyError)))
-	{
-		AddError(VerifyError);
-		return false;
-	}
-	FGitSourceControlAssetOperations Operations(Fixture.GetGitBinary(), Fixture.GetRoot());
-	const FString FirstFilename = Fixture.AbsoluteFilename(FirstRelativeFilename);
-	const FString SecondFilename = Fixture.AbsoluteFilename(SecondRelativeFilename);
-	const FString DistinctFilename = Fixture.AbsoluteFilename(DistinctRelativeFilename);
-	auto WriteDirty = [&Fixture](const FString& InRelativeFilename, const FString& InContents)
-	{
-		return Fixture.WriteFile(InRelativeFilename, InContents);
-	};
-	auto Discard = [&Operations](const TArray<FString>& InFiles, int32& OutConfirmCalls, int32& OutPrepareCalls, int32& OutReloadCalls, FGitAssetOperationResult& OutResult)
-	{
-		return Operations.DiscardTrackedFiles(InFiles, MakeAcceptingCallbacks(OutConfirmCalls, OutPrepareCalls, OutReloadCalls), OutResult);
-	};
-
-	if (!WriteDirty(FirstRelativeFilename, TEXT("shared local hit first dirty\n")) || !WriteDirty(SecondRelativeFilename, TEXT("shared local hit second dirty\n"))) return false;
-	int32 ConfirmCalls = 0;
-	int32 PrepareCalls = 0;
-	int32 ReloadCalls = 0;
-	FGitAssetOperationResult Result;
-	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	if (!TestTrue(TEXT("Same-oid standalone Discard local hit succeeds"), Discard({ FirstFilename, SecondFilename }, ConfirmCalls, PrepareCalls, ReloadCalls, Result)))
-	{
-		AddError(FString::Join(Result.Errors, TEXT("\n")));
-		return false;
-	}
-	if (!TestEqual(TEXT("Same-oid local hit verifies once"), GitSourceControlUtils::Testing::GetGitLfsVerifyLaunchCount(), static_cast<uint64>(1))
-		|| !TestEqual(TEXT("Same-oid local hit fetches zero times"), GitSourceControlUtils::Testing::GetGitLfsFetchLaunchCount(), static_cast<uint64>(0))
-		|| !TestCallbacks(*this, ConfirmCalls, PrepareCalls, ReloadCalls)) return false;
-	FString Contents;
-	if (!TestTrue(TEXT("First same-oid local hit restores HEAD content"), Fixture.ReadFile(FirstRelativeFilename, Contents)) || !TestEqual(TEXT("First same-oid local hit bytes"), Contents, SharedHeadContents)
-		|| !TestTrue(TEXT("Second same-oid local hit restores HEAD content"), Fixture.ReadFile(SecondRelativeFilename, Contents)) || !TestEqual(TEXT("Second same-oid local hit bytes"), Contents, SharedHeadContents)) return false;
-
-	if (!TestTrue(TEXT("Remove shared LFS object before same-oid batch miss"), IFileManager::Get().Delete(*SharedObjectFilename, false, true, true))
-		|| !WriteDirty(FirstRelativeFilename, TEXT("shared local miss first dirty\n")) || !WriteDirty(SecondRelativeFilename, TEXT("shared local miss second dirty\n"))) return false;
-	ConfirmCalls = 0;
-	PrepareCalls = 0;
-	ReloadCalls = 0;
-	Result = FGitAssetOperationResult();
-	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	if (!TestTrue(TEXT("Same-oid standalone Discard local miss succeeds"), Discard({ FirstFilename, SecondFilename }, ConfirmCalls, PrepareCalls, ReloadCalls, Result)))
-	{
-		AddError(FString::Join(Result.Errors, TEXT("\n")));
-		return false;
-	}
-	if (!TestEqual(TEXT("Same-oid local miss fetches once"), GitSourceControlUtils::Testing::GetGitLfsFetchLaunchCount(), static_cast<uint64>(1))
-		|| !TestEqual(TEXT("Same-oid local miss verifies once after fetch"), GitSourceControlUtils::Testing::GetGitLfsVerifyLaunchCount(), static_cast<uint64>(1))
-		|| !TestCallbacks(*this, ConfirmCalls, PrepareCalls, ReloadCalls)) return false;
-
-	if (!WriteDirty(FirstRelativeFilename, TEXT("different oid first dirty\n")) || !WriteDirty(DistinctRelativeFilename, TEXT("different oid second dirty\n"))) return false;
-	ConfirmCalls = 0;
-	PrepareCalls = 0;
-	ReloadCalls = 0;
-	Result = FGitAssetOperationResult();
-	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	if (!TestTrue(TEXT("Different-oid standalone Discard succeeds"), Discard({ FirstFilename, DistinctFilename }, ConfirmCalls, PrepareCalls, ReloadCalls, Result)))
-	{
-		AddError(FString::Join(Result.Errors, TEXT("\n")));
-		return false;
-	}
-	if (!TestEqual(TEXT("Different oid:size values verify independently"), GitSourceControlUtils::Testing::GetGitLfsVerifyLaunchCount(), static_cast<uint64>(2))
-		|| !TestEqual(TEXT("Different local oid:size values do not fetch"), GitSourceControlUtils::Testing::GetGitLfsFetchLaunchCount(), static_cast<uint64>(0))
-		|| !TestCallbacks(*this, ConfirmCalls, PrepareCalls, ReloadCalls)) return false;
-
-	if (!TestTrue(TEXT("Remove shared object before failed retry fixture"), IFileManager::Get().Delete(*SharedObjectFilename, false, true, true))
+	// A real LFS fetch failure must stop before Editor preparation or any mutation.
+	if (!TestTrue(TEXT("Discard LFS failure removes the cached object"), IFileManager::Get().Delete(*ObjectFilename, false, true, true))
 		|| !Fixture.RunGit(FString::Printf(TEXT("remote set-url origin %s"), *QuoteGitArgument(Fixture.AbsoluteFilename(TEXT("MissingOrigin.git")))))
-		|| !WriteDirty(FirstRelativeFilename, TEXT("failure retry first dirty\n")) || !WriteDirty(SecondRelativeFilename, TEXT("failure retry second dirty\n"))) return false;
+		|| !Fixture.WriteFile(TEXT("Content/Tracked.uasset"), TEXT("staged LFS failure bytes\n"))
+		|| !Fixture.RunGit(TEXT("add -- Content/Tracked.uasset"))
+		|| !Fixture.WriteFile(TEXT("Content/Tracked.uasset"), TEXT("unstaged LFS failure bytes\n"))) return false;
 	ConfirmCalls = 0;
 	PrepareCalls = 0;
 	ReloadCalls = 0;
 	Result = FGitAssetOperationResult();
 	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	TestFalse(TEXT("Missing same-oid LFS object blocks Discard before mutation"), Discard({ FirstFilename, SecondFilename }, ConfirmCalls, PrepareCalls, ReloadCalls, Result));
-	if (!TestEqual(TEXT("Failed same-oid batch tries one fetch"), GitSourceControlUtils::Testing::GetGitLfsFetchLaunchCount(), static_cast<uint64>(1))
-		|| !TestEqual(TEXT("Failed same-oid batch never reaches SHA verification"), GitSourceControlUtils::Testing::GetGitLfsVerifyLaunchCount(), static_cast<uint64>(0))
-		|| !TestEqual(TEXT("Failed LFS preflight confirms once"), ConfirmCalls, 1)
-		|| !TestEqual(TEXT("Failed LFS preflight never prepares mutation"), PrepareCalls, 0)
-		|| !TestEqual(TEXT("Failed LFS preflight never reloads packages"), ReloadCalls, 0)
-		|| !TestTrue(TEXT("Failed LFS preflight leaves the first dirty bytes intact"), Fixture.ReadFile(FirstRelativeFilename, Contents))
-		|| !TestEqual(TEXT("Failed LFS preflight preserves first dirty bytes"), Contents, FString(TEXT("failure retry first dirty\n")))) return false;
-	if (!Fixture.RunGit(FString::Printf(TEXT("remote set-url origin %s"), *QuoteGitArgument(OriginDirectory)))) return false;
-	ConfirmCalls = 0;
-	PrepareCalls = 0;
-	ReloadCalls = 0;
-	Result = FGitAssetOperationResult();
-	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	if (!TestTrue(TEXT("A later same-oid operation retries after failed preflight"), Discard({ FirstFilename, SecondFilename }, ConfirmCalls, PrepareCalls, ReloadCalls, Result)))
-	{
-		AddError(FString::Join(Result.Errors, TEXT("\n")));
-		return false;
-	}
-	return TestEqual(TEXT("Retry after failed preflight fetches once"), GitSourceControlUtils::Testing::GetGitLfsFetchLaunchCount(), static_cast<uint64>(1))
-		&& TestEqual(TEXT("Retry after failed preflight verifies once"), GitSourceControlUtils::Testing::GetGitLfsVerifyLaunchCount(), static_cast<uint64>(1))
-		&& TestCallbacks(*this, ConfirmCalls, PrepareCalls, ReloadCalls);
+	TestFalse(TEXT("Discard LFS fetch failure stops before mutation"), Operations.DiscardTrackedFiles({ Filename }, MakeAcceptingCallbacks(ConfirmCalls, PrepareCalls, ReloadCalls), Result));
+	TestTrue(TEXT("Discard LFS fetch failure reports an error"), !Result.Errors.IsEmpty());
+	TestEqual(TEXT("Discard LFS fetch failure never prepares mutation"), PrepareCalls, 0);
+	TestEqual(TEXT("Discard LFS fetch failure never reloads packages"), ReloadCalls, 0);
+	TestTrue(TEXT("Discard LFS fetch failure preserves worktree bytes"), Fixture.ReadFile(TEXT("Content/Tracked.uasset"), Contents));
+	return TestEqual(TEXT("Discard LFS fetch failure keeps dirty worktree unchanged"), Contents, FString(TEXT("unstaged LFS failure bytes\n")));
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlAssetHistoryRestoreAutomationTest, "Cthulhu.GitSourceControl.AssetOperations.HistoryRestore", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)

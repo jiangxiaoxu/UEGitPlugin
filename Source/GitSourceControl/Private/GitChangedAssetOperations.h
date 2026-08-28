@@ -10,47 +10,8 @@
 class UPackage;
 class UWorld;
 
-	namespace GitChangedAssetOperations
-	{
-	/** Revert 的私有诊断数据. 不属于 UI 或脚本结果契约. */
-	struct FGitChangedAssetRevertTelemetry
-	{
-		int32 SelectedEntryCount = 0;
-		int32 PlannedFileCount = 0;
-		int32 UniqueLfsObjectCount = 0;
-		int32 LfsPointerReadCount = 0;
-		int32 LfsPointerCount = 0;
-		int32 LfsVerifyCount = 0;
-		int32 LfsFetchCount = 0;
-		int32 GitHeadCheckCount = 0;
-		int32 GitStatusCheckCount = 0;
-		int32 GitIndexSnapshotCount = 0;
-		int32 GitBlobReadCount = 0;
-		int32 GitRestoreBatchCount = 0;
-		int32 GitResetBatchCount = 0;
-		int32 GitIndexRollbackCount = 0;
-		int64 FingerprintBytes = 0;
-		int64 BackupBytes = 0;
-		double PreflightSeconds = 0.0;
-		double ConfirmationSeconds = 0.0;
-		double LfsSeconds = 0.0;
-		double PrepareSeconds = 0.0;
-		double LoaderResetSeconds = 0.0;
-		double DiskMutationSeconds = 0.0;
-		double EditorFinalizeSeconds = 0.0;
-		double AssetRegistrySeconds = 0.0;
-		double BrowserRefreshSeconds = 0.0;
-		double PostRefreshStartSeconds = 0.0;
-		double PostRefreshStatusSeconds = 0.0;
-		double PostRefreshMetadataSeconds = 0.0;
-		double PostRefreshTotalSeconds = 0.0;
-		bool bDiskMutationSucceeded = false;
-		bool bEditorReloadSucceeded = true;
-		bool bCancelled = false;
-		bool bPostRefreshAttempted = false;
-		bool bPostRefreshSucceeded = false;
-	};
-
+namespace GitChangedAssetOperations
+{
 	enum class EGitChangedAssetMutationOutcome : uint8
 	{
 		/** No selected .uasset or index entry was modified. */
@@ -96,9 +57,6 @@ class UWorld;
 	 */
 	struct FGitChangedAssetRevertCallbacks
 	{
-		/** Controller-owned private trace context. GameThread callbacks are synchronous with the worker. */
-		TSharedPtr<FGitChangedAssetRevertTelemetry, ESPMode::ThreadSafe> Telemetry;
-
 		/** 在等待 shared repository transaction guard 时响应 shutdown cancellation. */
 		TFunction<bool()> IsCancellationRequested;
 

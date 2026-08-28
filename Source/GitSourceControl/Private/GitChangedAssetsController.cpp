@@ -330,31 +330,6 @@ namespace GitChangedAssetsControllerPrivate
 		}
 		return Result.Errors.IsEmpty() ? TEXT("Revert failed without a diagnostic.") : FString::Join(Result.Errors, TEXT("\n"));
 	}
-
-	void EmitRevertTelemetry(const TSharedPtr<GitChangedAssetOperations::FGitChangedAssetRevertTelemetry, ESPMode::ThreadSafe>& InTelemetry)
-	{
-		if (!InTelemetry.IsValid())
-		{
-			return;
-		}
-
-		const TCHAR* const Terminal = !InTelemetry->bDiskMutationSucceeded
-			? (InTelemetry->bCancelled ? TEXT("cancelled") : TEXT("disk_failed"))
-			: !InTelemetry->bEditorReloadSucceeded
-				? (InTelemetry->bPostRefreshAttempted && !InTelemetry->bPostRefreshSucceeded ? TEXT("reload_and_refresh_failed") : TEXT("reload_failed"))
-				: InTelemetry->bPostRefreshAttempted && !InTelemetry->bPostRefreshSucceeded ? TEXT("post_refresh_failed") : TEXT("completed");
-
-		UE_LOG(LogGitStandalone, Verbose, TEXT("Changed Assets Revert timing: terminal=%s selected=%d planned=%d uniqueLfsOids=%d lfsPointerReads=%d lfsPointers=%d lfsVerifies=%d lfsFetches=%d fingerprintBytes=%lld backupBytes=%lld gitHeadChecks=%d gitStatusChecks=%d gitIndexSnapshots=%d gitBlobReads=%d gitRestoreBatches=%d gitResetBatches=%d gitIndexRollbacks=%d diskMutation=%d editorReload=%d postRefreshAttempted=%d postRefreshSucceeded=%d preflight=%.3fs confirm=%.3fs lfs=%.3fs prepare=%.3fs loaderReset=%.3fs diskMutationTime=%.3fs editorFinalize=%.3fs assetRegistry=%.3fs browserRefresh=%.3fs postRefreshStatus=%.3fs postRefreshMetadata=%.3fs postRefreshTotal=%.3fs"),
-			Terminal, InTelemetry->SelectedEntryCount, InTelemetry->PlannedFileCount, InTelemetry->UniqueLfsObjectCount,
-			InTelemetry->LfsPointerReadCount, InTelemetry->LfsPointerCount, InTelemetry->LfsVerifyCount, InTelemetry->LfsFetchCount,
-			InTelemetry->FingerprintBytes, InTelemetry->BackupBytes, InTelemetry->GitHeadCheckCount, InTelemetry->GitStatusCheckCount,
-			InTelemetry->GitIndexSnapshotCount, InTelemetry->GitBlobReadCount, InTelemetry->GitRestoreBatchCount, InTelemetry->GitResetBatchCount,
-			InTelemetry->GitIndexRollbackCount, InTelemetry->bDiskMutationSucceeded, InTelemetry->bEditorReloadSucceeded,
-			InTelemetry->bPostRefreshAttempted, InTelemetry->bPostRefreshSucceeded, InTelemetry->PreflightSeconds, InTelemetry->ConfirmationSeconds,
-			InTelemetry->LfsSeconds, InTelemetry->PrepareSeconds, InTelemetry->LoaderResetSeconds, InTelemetry->DiskMutationSeconds,
-			InTelemetry->EditorFinalizeSeconds, InTelemetry->AssetRegistrySeconds, InTelemetry->BrowserRefreshSeconds,
-			InTelemetry->PostRefreshStatusSeconds, InTelemetry->PostRefreshMetadataSeconds, InTelemetry->PostRefreshTotalSeconds);
-	}
 }
 
 FGitChangedAssetsController::FGitChangedAssetsController()
@@ -437,7 +412,6 @@ void FGitChangedAssetsController::Shutdown()
 	{
 		return;
 	}
-	EmitPendingRevertTelemetry(false);
 	ClearPendingRefreshWork();
 	++Generation;
 	WorkerState->StopAccepting();
@@ -547,8 +521,6 @@ void FGitChangedAssetsController::RevertToHead(TArray<FGitChangedAssetEntry> Ent
 	const TSharedRef<GitChangedAssetsControllerPrivate::FGameThreadDispatcher, ESPMode::ThreadSafe> Dispatcher = GameThreadDispatcher.ToSharedRef();
 	const TSharedRef<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe> CancellationContext =
 		MakeShared<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>();
-	const TSharedRef<GitChangedAssetOperations::FGitChangedAssetRevertTelemetry, ESPMode::ThreadSafe> RevertTelemetry =
-		MakeShared<GitChangedAssetOperations::FGitChangedAssetRevertTelemetry, ESPMode::ThreadSafe>();
 	if (!RevertWorkerState->TryBegin(CancellationContext, true))
 	{
 		bReverting = false;
@@ -558,14 +530,13 @@ void FGitChangedAssetsController::RevertToHead(TArray<FGitChangedAssetEntry> Ent
 	}
 	ActivityChangedDelegate.Broadcast();
 
-	Async(EAsyncExecution::ThreadPool, [WeakController, GitBinary, RepositoryRoot, PinnedHead, Entries = MoveTemp(Entries), RevertWorkerState, Dispatcher, CancellationContext, RevertTelemetry]() mutable
+	Async(EAsyncExecution::ThreadPool, [WeakController, GitBinary, RepositoryRoot, PinnedHead, Entries = MoveTemp(Entries), RevertWorkerState, Dispatcher, CancellationContext]() mutable
 	{
 		GitChangedAssetsControllerPrivate::FScopedWorker Worker(RevertWorkerState, CancellationContext);
 		GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(CancellationContext);
 		const TSharedRef<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe> Lifecycle =
 			MakeShared<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe>();
 		GitChangedAssetOperations::FGitChangedAssetRevertCallbacks Callbacks;
-		Callbacks.Telemetry = RevertTelemetry;
 		Callbacks.IsCancellationRequested = [CancellationContext]()
 		{
 			return CancellationContext->IsCancellationRequested();
@@ -601,20 +572,19 @@ void FGitChangedAssetsController::RevertToHead(TArray<FGitChangedAssetEntry> Ent
 				return bReadyToCommit;
 			});
 		};
-		Callbacks.FinalizeEditor = [Lifecycle, Dispatcher, RevertTelemetry](const TArray<FGitChangedAssetEntry>& CallbackEntries, const TArray<FString>& AffectedFiles,
+		Callbacks.FinalizeEditor = [Lifecycle, Dispatcher](const TArray<FGitChangedAssetEntry>& CallbackEntries, const TArray<FString>& AffectedFiles,
 			const GitChangedAssetOperations::EGitChangedAssetMutationOutcome Outcome, FString& OutError)
 		{
-			return GitChangedAssetsControllerPrivate::InvokeOnGameThreadAndWait(Dispatcher, [Lifecycle, RevertTelemetry, &CallbackEntries, &AffectedFiles, Outcome, &OutError]()
+			return GitChangedAssetsControllerPrivate::InvokeOnGameThreadAndWait(Dispatcher, [Lifecycle, &CallbackEntries, &AffectedFiles, Outcome, &OutError]()
 			{
 				const bool bFinished = Lifecycle->Finish(CallbackEntries, AffectedFiles, Outcome, OutError);
 				if (Outcome == GitChangedAssetOperations::EGitChangedAssetMutationOutcome::Succeeded)
 				{
 					const double AssetRegistryStartSeconds = FPlatformTime::Seconds();
 					IAssetRegistry::GetChecked().ScanModifiedAssetFiles(AffectedFiles);
-					RevertTelemetry->AssetRegistrySeconds += FPlatformTime::Seconds() - AssetRegistryStartSeconds;
-					const double BrowserRefreshStartSeconds = FPlatformTime::Seconds();
+					UE_LOG(LogGitStandalone, Log, TEXT("Changed Assets Revert Asset Registry refresh: files=%d elapsed=%.3fs"),
+						AffectedFiles.Num(), FPlatformTime::Seconds() - AssetRegistryStartSeconds);
 					FEditorDelegates::RefreshAllBrowsers.Broadcast();
-					RevertTelemetry->BrowserRefreshSeconds += FPlatformTime::Seconds() - BrowserRefreshStartSeconds;
 				}
 				return bFinished;
 			});
@@ -624,14 +594,12 @@ void FGitChangedAssetsController::RevertToHead(TArray<FGitChangedAssetEntry> Ent
 		const bool bSucceeded = GitChangedAssetOperations::FGitChangedAssetOperations(GitBinary, RepositoryRoot)
 			.RevertToHead(PinnedHead, Entries, Callbacks, Result);
 		const bool bEditorReloadSucceeded = Result.bReloadSucceeded;
-		const bool bCancelled = Result.bCancelled;
 		FString ResultMessage = GitChangedAssetsControllerPrivate::MakeRevertResultMessage(Result);
-		GitChangedAssetsControllerPrivate::InvokeOnGameThreadAndWait(Dispatcher, [WeakController, bSucceeded, bEditorReloadSucceeded, bCancelled,
-			ResultMessage = MoveTemp(ResultMessage), RevertTelemetry]() mutable
+		GitChangedAssetsControllerPrivate::InvokeOnGameThreadAndWait(Dispatcher, [WeakController, bSucceeded, bEditorReloadSucceeded, ResultMessage = MoveTemp(ResultMessage)]() mutable
 		{
 			if (const TSharedPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> Controller = WeakController.Pin())
 			{
-				Controller->CompleteRevert(bSucceeded, bEditorReloadSucceeded, bCancelled, MoveTemp(ResultMessage), RevertTelemetry);
+				Controller->CompleteRevert(bSucceeded, bEditorReloadSucceeded, MoveTemp(ResultMessage));
 			}
 			return true;
 		});
@@ -661,16 +629,20 @@ void FGitChangedAssetsController::CompleteRefresh(const uint64 CompletedGenerati
 	bPreserveLastErrorForRefresh = false;
 	if (!CompletedSnapshot.IsValid())
 	{
-		if (PendingRevertTelemetry.IsValid() && PendingRevertTelemetry->PostRefreshStartSeconds > 0.0)
+		if (PostRevertStatusRefreshStartSeconds > 0.0)
 		{
-			PendingRevertTelemetry->PostRefreshStatusSeconds = FPlatformTime::Seconds() - PendingRevertTelemetry->PostRefreshStartSeconds;
+			UE_LOG(LogGitStandalone, Warning, TEXT("Changed Assets Revert full Git status refresh failed after %.3fs"),
+				FPlatformTime::Seconds() - PostRevertStatusRefreshStartSeconds);
+			PostRevertStatusRefreshStartSeconds = 0.0;
 		}
 		FailRefresh(CompletedGeneration, Error.IsEmpty() ? TEXT("Git Changes refresh failed without a diagnostic.") : MoveTemp(Error));
 		return;
 	}
-	if (PendingRevertTelemetry.IsValid() && PendingRevertTelemetry->PostRefreshStartSeconds > 0.0)
+	if (PostRevertStatusRefreshStartSeconds > 0.0)
 	{
-		PendingRevertTelemetry->PostRefreshStatusSeconds = FPlatformTime::Seconds() - PendingRevertTelemetry->PostRefreshStartSeconds;
+		UE_LOG(LogGitStandalone, Log, TEXT("Changed Assets Revert full Git status refresh: entries=%d elapsed=%.3fs"),
+			CompletedSnapshot->Entries.Num(), FPlatformTime::Seconds() - PostRevertStatusRefreshStartSeconds);
+		PostRevertStatusRefreshStartSeconds = 0.0;
 	}
 
 	if (!bPreserveLastError)
@@ -996,7 +968,6 @@ void FGitChangedAssetsController::FinishRefresh(const uint64 CompletedGeneration
 	}
 	SetRefreshActivity(EGitChangedAssetsRefreshPhase::Idle, 0, 0);
 	RowsChangedDelegate.Broadcast();
-	EmitPendingRevertTelemetry(true);
 }
 
 void FGitChangedAssetsController::FailRefresh(const uint64 CompletedGeneration, FString Error)
@@ -1011,27 +982,6 @@ void FGitChangedAssetsController::FailRefresh(const uint64 CompletedGeneration, 
 	bPreserveLastErrorForRefresh = false;
 	LastError = Error.IsEmpty() ? TEXT("Git Changes refresh failed without a diagnostic.") : MoveTemp(Error);
 	SetRefreshActivity(EGitChangedAssetsRefreshPhase::Idle, 0, 0);
-	EmitPendingRevertTelemetry(false);
-}
-
-void FGitChangedAssetsController::EmitPendingRevertTelemetry(const bool bPostRefreshSucceeded)
-{
-	if (!PendingRevertTelemetry.IsValid())
-	{
-		return;
-	}
-
-	const TSharedPtr<GitChangedAssetOperations::FGitChangedAssetRevertTelemetry, ESPMode::ThreadSafe> Telemetry = MoveTemp(PendingRevertTelemetry);
-	if (Telemetry->PostRefreshStartSeconds > 0.0)
-	{
-		const double NowSeconds = FPlatformTime::Seconds();
-		Telemetry->PostRefreshTotalSeconds = NowSeconds - Telemetry->PostRefreshStartSeconds;
-		Telemetry->PostRefreshMetadataSeconds = Telemetry->PostRefreshStatusSeconds > 0.0
-			? FMath::Max(0.0, Telemetry->PostRefreshTotalSeconds - Telemetry->PostRefreshStatusSeconds)
-			: 0.0;
-	}
-	Telemetry->bPostRefreshSucceeded = bPostRefreshSucceeded;
-	GitChangedAssetsControllerPrivate::EmitRevertTelemetry(Telemetry);
 }
 
 void FGitChangedAssetsController::ClearPendingRefreshWork()
@@ -1098,19 +1048,11 @@ bool FGitChangedAssetsController::ConfirmRevert(const TArray<FGitChangedAssetEnt
 	return true;
 }
 
-void FGitChangedAssetsController::CompleteRevert(const bool bDiskMutationSucceeded, const bool bEditorReloadSucceeded, const bool bCancelled, FString ResultMessage,
-	TSharedPtr<GitChangedAssetOperations::FGitChangedAssetRevertTelemetry, ESPMode::ThreadSafe> RevertTelemetry)
+void FGitChangedAssetsController::CompleteRevert(const bool bDiskMutationSucceeded, const bool bEditorReloadSucceeded, FString ResultMessage)
 {
 	check(IsInGameThread());
-	if (RevertTelemetry.IsValid())
-	{
-		RevertTelemetry->bDiskMutationSucceeded = bDiskMutationSucceeded;
-		RevertTelemetry->bEditorReloadSucceeded = bEditorReloadSucceeded;
-		RevertTelemetry->bCancelled = bCancelled;
-	}
 	if (bShuttingDown.Load())
 	{
-		GitChangedAssetsControllerPrivate::EmitRevertTelemetry(RevertTelemetry);
 		return;
 	}
 	bReverting = false;
@@ -1118,26 +1060,21 @@ void FGitChangedAssetsController::CompleteRevert(const bool bDiskMutationSucceed
 	{
 		LastError = MoveTemp(ResultMessage);
 		ActivityChangedDelegate.Broadcast();
-		GitChangedAssetsControllerPrivate::EmitRevertTelemetry(RevertTelemetry);
 		return;
-	}
-	PendingRevertTelemetry = MoveTemp(RevertTelemetry);
-	if (PendingRevertTelemetry.IsValid())
-	{
-		PendingRevertTelemetry->bPostRefreshAttempted = true;
-		PendingRevertTelemetry->PostRefreshStartSeconds = FPlatformTime::Seconds();
 	}
 
 	if (!bEditorReloadSucceeded)
 	{
 		LastError = MoveTemp(ResultMessage);
 		ActivityChangedDelegate.Broadcast();
+		PostRevertStatusRefreshStartSeconds = FPlatformTime::Seconds();
 		Refresh(false);
 		return;
 	}
 
 	LastError.Empty();
 	ActivityChangedDelegate.Broadcast();
+	PostRevertStatusRefreshStartSeconds = FPlatformTime::Seconds();
 	Refresh();
 }
 
