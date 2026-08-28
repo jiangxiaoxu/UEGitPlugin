@@ -19,7 +19,9 @@
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
+#include "PackageTools.h"
 #include "UObject/Package.h"
+#include "UObject/SavePackage.h"
 #include "UObject/UObjectGlobals.h"
 
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
@@ -156,6 +158,75 @@ namespace GitChangedAssetOperationsAutomationTestsPrivate
 		{
 			GitChangedAssetOperations::FGitChangedAssetRevertLifecycle::SetCurrentEditorWorldForTesting(nullptr);
 		}
+	};
+
+	class FScopedPackageCleanup final
+	{
+	public:
+		explicit FScopedPackageCleanup(FAutomationTestBase& InTest)
+			: Test(InTest)
+		{
+		}
+
+		~FScopedPackageCleanup()
+		{
+			TArray<UPackage*> LivePackages;
+			LivePackages.Reserve(Packages.Num());
+			for (const TWeakObjectPtr<UPackage>& WeakPackage : Packages)
+			{
+				if (UPackage* Package = WeakPackage.Get())
+				{
+					Package->SetDirtyFlag(false);
+					LivePackages.Add(Package);
+				}
+			}
+			if (!LivePackages.IsEmpty())
+			{
+				FText UnloadError;
+				if (!UPackageTools::UnloadPackages(LivePackages, UnloadError, true) && !UnloadError.IsEmpty())
+				{
+					Test.AddError(FString::Printf(TEXT("Could not clean up Changed Assets map fixture packages: %s"), *UnloadError.ToString()));
+				}
+			}
+		}
+
+		void TrackPackage(UPackage* InPackage)
+		{
+			if (InPackage != nullptr)
+			{
+				Packages.AddUnique(TWeakObjectPtr<UPackage>(InPackage));
+			}
+		}
+
+		bool SaveMap(UWorld* InWorld)
+		{
+			if (InWorld == nullptr)
+			{
+				Test.AddError(TEXT("Could not save a null Changed Assets map fixture world."));
+				return false;
+			}
+			UPackage* const Package = InWorld->GetOutermost();
+			TrackPackage(Package);
+			if (Package == nullptr)
+			{
+				Test.AddError(TEXT("Could not save a Changed Assets map fixture without a package."));
+				return false;
+			}
+			const FString Filename = FPackageName::LongPackageNameToFilename(Package->GetName(), FPackageName::GetMapPackageExtension());
+			FSavePackageArgs SaveArgs;
+			SaveArgs.SaveFlags = SAVE_NoError;
+			if (!Test.TestTrue(FString::Printf(TEXT("Saves valid Changed Assets owner map fixture %s"), *Package->GetName()),
+				UPackage::SavePackage(Package, InWorld, *Filename, SaveArgs)))
+			{
+				return false;
+			}
+			Package->SetDirtyFlag(false);
+			return Test.TestTrue(FString::Printf(TEXT("Writes valid Changed Assets owner map fixture %s"), *Package->GetName()), FPaths::FileExists(Filename));
+		}
+
+	private:
+		FAutomationTestBase& Test;
+		TArray<TWeakObjectPtr<UPackage>> Packages;
 	};
 
 	FGitChangedAssetEntry MakeEntry(const FFixture& InFixture, const FString& InRelativeFilename, const EGitChangedAssetState InState)
@@ -900,18 +971,20 @@ bool FGitChangedAssetOfpaReloadBatchLifecycleAutomationTest::RunTest(const FStri
 	const FString MountRoot = FString::Printf(TEXT("/GitChangedAssetsBatch_%s/"), *FGuid::NewGuid().ToString(EGuidFormats::Digits));
 	FPackageName::RegisterMountPoint(MountRoot, ContentDirectory);
 	ON_SCOPE_EXIT { FPackageName::UnRegisterMountPoint(MountRoot, ContentDirectory); };
+	FScopedPackageCleanup PackageCleanup(*this);
 
-	auto CreateExternalActorEntry = [this, &MountRoot](const FString& InOwnerSuffix, const FString& InExternalSuffix,
+	auto CreateExternalActorEntry = [this, &MountRoot, &PackageCleanup](const FString& InOwnerSuffix, const FString& InExternalSuffix,
 		UPackage*& OutOwnerPackage, UWorld*& OutOwnerWorld) -> TOptional<FGitChangedAssetEntry>
 	{
 		const FString OwnerPackageName = MountRoot + InOwnerSuffix;
 		if (OutOwnerPackage == nullptr || OutOwnerWorld == nullptr)
 		{
 			OutOwnerPackage = CreatePackage(*OwnerPackageName);
+			PackageCleanup.TrackPackage(OutOwnerPackage);
 			OutOwnerWorld = OutOwnerPackage != nullptr
 				? UWorld::CreateWorld(EWorldType::Editor, false, FName(*FString::Printf(TEXT("BatchOwner_%s"), *InOwnerSuffix)), OutOwnerPackage)
 				: nullptr;
-			if (OutOwnerPackage == nullptr || OutOwnerWorld == nullptr)
+			if (OutOwnerPackage == nullptr || OutOwnerWorld == nullptr || !PackageCleanup.SaveMap(OutOwnerWorld))
 			{
 				AddError(FString::Printf(TEXT("Could not create an isolated OFPA owner world: %s"), *OwnerPackageName));
 				return {};
@@ -925,6 +998,7 @@ bool FGitChangedAssetOfpaReloadBatchLifecycleAutomationTest::RunTest(const FStri
 		}
 		const FString ExternalPackageName = ExternalActorPaths[0] + TEXT("/A/B/") + InExternalSuffix;
 		UPackage* const ExternalPackage = CreatePackage(*ExternalPackageName);
+		PackageCleanup.TrackPackage(ExternalPackage);
 		AActor* const ExternalActor = ExternalPackage != nullptr
 			? NewObject<AActor>(OutOwnerWorld->PersistentLevel, FName(*FString::Printf(TEXT("BatchActor_%s"), *InExternalSuffix)), RF_Public | RF_Standalone)
 			: nullptr;
@@ -955,6 +1029,7 @@ bool FGitChangedAssetOfpaReloadBatchLifecycleAutomationTest::RunTest(const FStri
 	};
 
 	UPackage* CurrentWorldPackage = CreatePackage(*(MountRoot + TEXT("Current")));
+	PackageCleanup.TrackPackage(CurrentWorldPackage);
 	UWorld* const CurrentWorld = CurrentWorldPackage != nullptr
 		? UWorld::CreateWorld(EWorldType::Editor, false, FName(*FString::Printf(TEXT("BatchCurrent_%s"), *FGuid::NewGuid().ToString(EGuidFormats::Digits))), CurrentWorldPackage)
 		: nullptr;

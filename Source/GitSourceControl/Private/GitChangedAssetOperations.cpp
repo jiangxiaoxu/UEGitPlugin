@@ -1517,39 +1517,6 @@ namespace GitChangedAssetOperations
 			return true;
 		}
 
-#if WITH_DEV_AUTOMATION_TESTS
-		TArray<UPackage*> ValidPackagesToReload;
-		ValidPackagesToReload.Reserve(PackagesToReload.Num());
-		for (const TWeakObjectPtr<UPackage>& WeakPackage : PackagesToReload)
-		{
-			if (UPackage* Package = WeakPackage.Get())
-			{
-				ValidPackagesToReload.Add(Package);
-			}
-		}
-		if (!ValidPackagesToReload.IsEmpty() && GitChangedAssetOperationsPrivate::ReloadPackagesForTesting)
-		{
-			TArray<UPackage*> WorldPackages;
-			TArray<UPackage*> NonWorldPackages;
-			for (UPackage* Package : ValidPackagesToReload)
-			{
-				if (UWorld::FindWorldInPackage(Package) != nullptr)
-				{
-					WorldPackages.Add(Package);
-				}
-				else
-				{
-					NonWorldPackages.Add(Package);
-				}
-			}
-			auto ReloadGroup = [&OutError](const TArray<UPackage*>& Packages) -> bool
-			{
-				return Packages.IsEmpty() || GitChangedAssetOperationsPrivate::ReloadPackagesForTesting(Packages, OutError);
-			};
-			return ReloadGroup(NonWorldPackages) && ReloadGroup(WorldPackages);
-		}
-#endif
-
 		TArray<UPackage*> ExistingPackages;
 		TArray<UPackage*> MissingPackages;
 		for (const TWeakObjectPtr<UPackage>& WeakPackage : PackagesToReload)
@@ -1600,6 +1567,12 @@ namespace GitChangedAssetOperations
 			{
 				return true;
 			}
+#if WITH_DEV_AUTOMATION_TESTS
+			if (GitChangedAssetOperationsPrivate::ReloadPackagesForTesting)
+			{
+				return GitChangedAssetOperationsPrivate::ReloadPackagesForTesting(Packages, OutError);
+			}
+#endif
 			FText ReloadError;
 			const bool bReloaded = UPackageTools::ReloadPackages(Packages, ReloadError, EReloadPackagesInteractionMode::AssumePositive);
 			if (!ReloadError.IsEmpty())
