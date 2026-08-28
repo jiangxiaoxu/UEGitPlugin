@@ -1410,6 +1410,11 @@ bool ResolveStandaloneRepositoryForFile(const FString& InFilename, FString& OutG
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
+namespace GitSourceControlHistoryPrivate
+{
+	int32 GetCompletedHistoryCacheEntryCount();
+}
+
 namespace Testing
 {
 	void ResetGitProcessLaunchCount()
@@ -1456,6 +1461,16 @@ void ResetVerifiedGitBinaryCache()
 		GitSourceControlUtilsPrivate::StartupGitCapability = InCapability;
 	}
 
+	void ResetStandaloneHistoryCache()
+	{
+		ClearStandaloneHistoryCache();
+	}
+
+	int32 GetStandaloneHistoryCacheEntryCount()
+	{
+		return GitSourceControlHistoryPrivate::GetCompletedHistoryCacheEntryCount();
+	}
+
 	bool LoadStandaloneHistory(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InFilename,
 		const EGitLocalSourceControlHistoryMode InMode, FString& OutCapturedHead, bool& bOutHeadChanged,
 		TArray<FGitStandaloneHistoryTestEntry>& OutHistory, FString& OutError)
@@ -1480,6 +1495,22 @@ void ResetVerifiedGitBinaryCache()
 			Entry.Action = Revision->Action;
 		}
 		return true;
+	}
+
+	bool LoadStandaloneHistoryWithCancelledContext(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InFilename,
+		const EGitLocalSourceControlHistoryMode InMode, FString& OutError)
+	{
+		OutError.Reset();
+		const TSharedRef<FGitOperationCancellationContext, ESPMode::ThreadSafe> Cancellation = MakeShared<FGitOperationCancellationContext, ESPMode::ThreadSafe>();
+		Cancellation->Cancel();
+		FGitOperationCancellationScope CancellationScope(Cancellation);
+		FString CapturedHead;
+		bool bHeadChanged = false;
+		TArray<FString> Errors;
+		TGitSourceControlHistory History;
+		const bool bSucceeded = RunGetHistory(InGitBinary, InRepositoryRoot, InFilename, false, InMode, CapturedHead, bHeadChanged, Errors, History);
+		OutError = FString::Join(Errors, TEXT("\n"));
+		return bSucceeded;
 	}
 
 	TSharedPtr<FGitSourceControlRevision, ESPMode::ThreadSafe> MakeStandaloneRevision(const FString& InGitBinary, const FString& InRepositoryRoot,
@@ -2992,6 +3023,212 @@ static bool ParseMachineHistory(const TArray<uint8>& InOutput, const FString& In
 namespace GitSourceControlHistoryPrivate
 {
 constexpr int32 MaxHistoryEntries = 250;
+constexpr int32 MaxCompletedHistoryCacheEntries = 32;
+constexpr uint64 MaxCompletedHistoryCacheBytes = 8ull * 1024ull * 1024ull;
+
+struct FHistoryCacheKey
+{
+	FString GitBinary;
+	FString RepositoryRoot;
+	FString RelativePath;
+	EGitLocalSourceControlHistoryMode Mode = EGitLocalSourceControlHistoryMode::CurrentPath;
+	FString Head;
+
+	bool operator==(const FHistoryCacheKey& Other) const
+	{
+		return GitBinary == Other.GitBinary
+			&& RepositoryRoot == Other.RepositoryRoot
+			&& RelativePath == Other.RelativePath
+			&& Mode == Other.Mode
+			&& Head == Other.Head;
+	}
+
+	friend uint32 GetTypeHash(const FHistoryCacheKey& Key)
+	{
+		uint32 Result = GetTypeHash(Key.GitBinary);
+		Result = HashCombine(Result, GetTypeHash(Key.RepositoryRoot));
+		Result = HashCombine(Result, GetTypeHash(Key.RelativePath));
+		Result = HashCombine(Result, GetTypeHash(static_cast<uint8>(Key.Mode)));
+		return HashCombine(Result, GetTypeHash(Key.Head));
+	}
+};
+
+struct FHistoryRevisionSnapshot
+{
+	FString LocalFilename;
+	FString Filename;
+	FString CommitId;
+	FString ShortCommitId;
+	int32 CommitIdNumber = 0;
+	int32 RevisionNumber = 0;
+	FString FileHash;
+	FString Description;
+	FString UserName;
+	FString Action;
+	FDateTime Date;
+	int32 FileSize = 0;
+};
+
+struct FHistoryCacheEntry
+{
+	TArray<FHistoryRevisionSnapshot> Revisions;
+	uint64 EstimatedBytes = 0;
+	uint64 LastAccess = 0;
+};
+
+FCriticalSection CompletedHistoryCacheLock;
+TMap<FHistoryCacheKey, FHistoryCacheEntry> CompletedHistoryCache;
+uint64 CompletedHistoryCacheBytes = 0;
+uint64 CompletedHistoryCacheAccessSerial = 0;
+
+uint64 EstimateStringBytes(const FString& Value)
+{
+	return static_cast<uint64>(Value.GetAllocatedSize()) * sizeof(TCHAR);
+}
+
+uint64 EstimateSnapshotBytes(const TArray<FHistoryRevisionSnapshot>& Snapshots)
+{
+	uint64 Result = static_cast<uint64>(Snapshots.GetAllocatedSize());
+	for (const FHistoryRevisionSnapshot& Snapshot : Snapshots)
+	{
+		Result += EstimateStringBytes(Snapshot.LocalFilename);
+		Result += EstimateStringBytes(Snapshot.Filename);
+		Result += EstimateStringBytes(Snapshot.CommitId);
+		Result += EstimateStringBytes(Snapshot.ShortCommitId);
+		Result += EstimateStringBytes(Snapshot.FileHash);
+		Result += EstimateStringBytes(Snapshot.Description);
+		Result += EstimateStringBytes(Snapshot.UserName);
+		Result += EstimateStringBytes(Snapshot.Action);
+	}
+	return Result;
+}
+
+FHistoryRevisionSnapshot MakeSnapshot(const FGitSourceControlRevision& Revision)
+{
+	FHistoryRevisionSnapshot Snapshot;
+	Snapshot.LocalFilename = Revision.LocalFilename;
+	Snapshot.Filename = Revision.Filename;
+	Snapshot.CommitId = Revision.CommitId;
+	Snapshot.ShortCommitId = Revision.ShortCommitId;
+	Snapshot.CommitIdNumber = Revision.CommitIdNumber;
+	Snapshot.RevisionNumber = Revision.RevisionNumber;
+	Snapshot.FileHash = Revision.FileHash;
+	Snapshot.Description = Revision.Description;
+	Snapshot.UserName = Revision.UserName;
+	Snapshot.Action = Revision.Action;
+	Snapshot.Date = Revision.Date;
+	Snapshot.FileSize = Revision.FileSize;
+	return Snapshot;
+}
+
+void MakeSnapshots(const TGitSourceControlHistory& History, TArray<FHistoryRevisionSnapshot>& OutSnapshots)
+{
+	OutSnapshots.Reset(History.Num());
+	for (const TSharedRef<FGitSourceControlRevision, ESPMode::ThreadSafe>& Revision : History)
+	{
+		OutSnapshots.Add(MakeSnapshot(*Revision));
+	}
+}
+
+void MakeFreshHistory(const TArray<FHistoryRevisionSnapshot>& Snapshots, const FString& InGitBinary, const FString& InRepositoryRoot,
+	TGitSourceControlHistory& OutHistory)
+{
+	OutHistory.Reset(Snapshots.Num());
+	for (const FHistoryRevisionSnapshot& Snapshot : Snapshots)
+	{
+		TSharedRef<FGitSourceControlRevision, ESPMode::ThreadSafe> Revision = MakeShared<FGitSourceControlRevision, ESPMode::ThreadSafe>();
+		Revision->LocalFilename = Snapshot.LocalFilename;
+		Revision->Filename = Snapshot.Filename;
+		Revision->CommitId = Snapshot.CommitId;
+		Revision->ShortCommitId = Snapshot.ShortCommitId;
+		Revision->CommitIdNumber = Snapshot.CommitIdNumber;
+		Revision->RevisionNumber = Snapshot.RevisionNumber;
+		Revision->FileHash = Snapshot.FileHash;
+		Revision->Description = Snapshot.Description;
+		Revision->UserName = Snapshot.UserName;
+		Revision->Action = Snapshot.Action;
+		Revision->Date = Snapshot.Date;
+		Revision->FileSize = Snapshot.FileSize;
+		Revision->GitBinary = InGitBinary;
+		Revision->RepositoryRoot = InRepositoryRoot;
+		OutHistory.Add(MoveTemp(Revision));
+	}
+}
+
+bool TryLoadCompletedHistory(const FHistoryCacheKey& Key, TArray<FHistoryRevisionSnapshot>& OutSnapshots)
+{
+	FScopeLock Lock(&CompletedHistoryCacheLock);
+	FHistoryCacheEntry* Entry = CompletedHistoryCache.Find(Key);
+	if (Entry == nullptr)
+	{
+		return false;
+	}
+	Entry->LastAccess = ++CompletedHistoryCacheAccessSerial;
+	OutSnapshots = Entry->Revisions;
+	return true;
+}
+
+void EvictCompletedHistoryIfNeeded()
+{
+	while (CompletedHistoryCache.Num() > MaxCompletedHistoryCacheEntries || CompletedHistoryCacheBytes > MaxCompletedHistoryCacheBytes)
+	{
+		FHistoryCacheKey LeastRecentlyUsedKey;
+		uint64 LeastRecentlyUsedAccess = MAX_uint64;
+		bool bFoundLeastRecentlyUsedEntry = false;
+		for (const TPair<FHistoryCacheKey, FHistoryCacheEntry>& Pair : CompletedHistoryCache)
+		{
+			if (Pair.Value.LastAccess < LeastRecentlyUsedAccess)
+			{
+				LeastRecentlyUsedAccess = Pair.Value.LastAccess;
+				LeastRecentlyUsedKey = Pair.Key;
+				bFoundLeastRecentlyUsedEntry = true;
+			}
+		}
+		if (!bFoundLeastRecentlyUsedEntry)
+		{
+			break;
+		}
+		const FHistoryCacheEntry* Entry = CompletedHistoryCache.Find(LeastRecentlyUsedKey);
+		check(Entry != nullptr);
+		CompletedHistoryCacheBytes -= Entry->EstimatedBytes;
+		CompletedHistoryCache.Remove(LeastRecentlyUsedKey);
+	}
+}
+
+void StoreCompletedHistory(FHistoryCacheKey Key, TArray<FHistoryRevisionSnapshot> Snapshots)
+{
+	const uint64 EstimatedBytes = EstimateSnapshotBytes(Snapshots);
+	if (EstimatedBytes > MaxCompletedHistoryCacheBytes)
+	{
+		return;
+	}
+
+	FScopeLock Lock(&CompletedHistoryCacheLock);
+	if (const FHistoryCacheEntry* ExistingEntry = CompletedHistoryCache.Find(Key))
+	{
+		CompletedHistoryCacheBytes -= ExistingEntry->EstimatedBytes;
+	}
+	FHistoryCacheEntry& Entry = CompletedHistoryCache.FindOrAdd(MoveTemp(Key));
+	Entry.Revisions = MoveTemp(Snapshots);
+	Entry.EstimatedBytes = EstimatedBytes;
+	Entry.LastAccess = ++CompletedHistoryCacheAccessSerial;
+	CompletedHistoryCacheBytes += EstimatedBytes;
+	EvictCompletedHistoryIfNeeded();
+}
+
+void ClearCompletedHistoryCache()
+{
+	FScopeLock Lock(&CompletedHistoryCacheLock);
+	CompletedHistoryCache.Reset();
+	CompletedHistoryCacheBytes = 0;
+	CompletedHistoryCacheAccessSerial = 0;
+}
+
+int32 GetCompletedHistoryCacheEntryCount()
+{
+	FScopeLock Lock(&CompletedHistoryCacheLock);
+	return CompletedHistoryCache.Num();
+}
 
 bool ResolveHead(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutHead, TArray<FString>& OutErrorMessages)
 {
@@ -3155,6 +3392,41 @@ bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepository
 	{
 		return false;
 	}
+	const GitSourceControlHistoryPrivate::FHistoryCacheKey CacheKey{
+		NormalizeGitBinaryPath(InPathToGitBinary),
+		NormalizeRepositoryKey(RepositoryRoot),
+		RelativeFile,
+		InMode,
+		OutCapturedHead,
+	};
+	TArray<GitSourceControlHistoryPrivate::FHistoryRevisionSnapshot> CachedSnapshots;
+	if (GitSourceControlHistoryPrivate::TryLoadCompletedHistory(CacheKey, CachedSnapshots))
+	{
+		if (IsGitOperationCancelled())
+		{
+			OutErrorMessages.Add(TEXT("Git history request cancelled."));
+			return false;
+		}
+		GitSourceControlHistoryPrivate::MakeFreshHistory(CachedSnapshots, InPathToGitBinary, RepositoryRoot, OutHistory);
+		TArray<FString> HeadCheckErrors;
+		FString HeadAtCompletion;
+		const bool bCompletedHeadResolved = GitSourceControlHistoryPrivate::ResolveHead(InPathToGitBinary, RepositoryRoot, HeadAtCompletion, HeadCheckErrors);
+		if (IsGitOperationCancelled())
+		{
+			OutHistory.Reset();
+			OutErrorMessages.Append(HeadCheckErrors);
+			if (OutErrorMessages.IsEmpty())
+			{
+				OutErrorMessages.Add(TEXT("Git history request cancelled."));
+			}
+			return false;
+		}
+		if (bCompletedHeadResolved)
+		{
+			bOutHeadChanged = !HeadAtCompletion.Equals(OutCapturedHead, ESearchCase::IgnoreCase);
+		}
+		return true;
+	}
 
 	FString SegmentStart = OutCapturedHead;
 	FString SegmentPath = RelativeFile;
@@ -3211,11 +3483,33 @@ bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepository
 
 	TArray<FString> HeadCheckErrors;
 	FString HeadAtCompletion;
-	if (GitSourceControlHistoryPrivate::ResolveHead(InPathToGitBinary, RepositoryRoot, HeadAtCompletion, HeadCheckErrors))
+	const bool bCompletedHeadResolved = GitSourceControlHistoryPrivate::ResolveHead(InPathToGitBinary, RepositoryRoot, HeadAtCompletion, HeadCheckErrors);
+	if (IsGitOperationCancelled())
+	{
+		OutHistory.Reset();
+		OutErrorMessages.Append(HeadCheckErrors);
+		if (OutErrorMessages.IsEmpty())
+		{
+			OutErrorMessages.Add(TEXT("Git history request cancelled."));
+		}
+		return false;
+	}
+	if (bCompletedHeadResolved)
 	{
 		bOutHeadChanged = !HeadAtCompletion.Equals(OutCapturedHead, ESearchCase::IgnoreCase);
 	}
+	if (bCompletedHeadResolved && !bOutHeadChanged)
+	{
+		TArray<GitSourceControlHistoryPrivate::FHistoryRevisionSnapshot> Snapshots;
+		GitSourceControlHistoryPrivate::MakeSnapshots(OutHistory, Snapshots);
+		GitSourceControlHistoryPrivate::StoreCompletedHistory(CacheKey, MoveTemp(Snapshots));
+	}
 	return true;
+}
+
+void ClearStandaloneHistoryCache()
+{
+	GitSourceControlHistoryPrivate::ClearCompletedHistoryCache();
 }
 
 TArray<FString> RelativeFilenames(const TArray<FString>& InFileNames, const FString& InRelativeTo)

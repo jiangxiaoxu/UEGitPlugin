@@ -381,6 +381,173 @@ bool FGitSourceControlHistoryAndBlobAutomationTest::RunTest(const FString& Param
 		&& TestEqual(TEXT("Delete-readd stops at the replacement lineage birth"), ReaddedHistory.Num(), 1);
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlHistoryCacheAutomationTest, "Cthulhu.GitSourceControl.Local.HistoryCache", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlHistoryCacheAutomationTest::RunTest(const FString& Parameters)
+{
+	static_cast<void>(Parameters);
+	using namespace GitSourceControlLocalAutomationTestsPrivate;
+	FGitTestFixture Fixture(*this);
+	if (!Fixture.Initialize()
+		|| !Fixture.WriteFile(TEXT("Content/Tracked.txt"), TEXT("tracked\n"))
+		|| !Fixture.WriteFile(TEXT("Content/Other.txt"), TEXT("other\n"))
+		|| !Fixture.CommitAll(TEXT("History cache fixture")))
+	{
+		return false;
+	}
+
+	const FString TrackedFilename = Fixture.AbsoluteFilename(TEXT("Content/Tracked.txt"));
+	const FString OtherFilename = Fixture.AbsoluteFilename(TEXT("Content/Other.txt"));
+	auto LoadCurrentPath = [this, &Fixture](const FString& Filename, FString& OutHead, TArray<FGitStandaloneHistoryTestEntry>& OutHistory)
+	{
+		bool bHeadChanged = false;
+		return LoadHistory(*this, Fixture, Filename, EGitLocalSourceControlHistoryMode::CurrentPath, OutHead, bHeadChanged, OutHistory)
+			&& TestFalse(TEXT("Stable cache fixture leaves HEAD unchanged"), bHeadChanged);
+	};
+
+	GitSourceControlUtils::Testing::ResetStandaloneHistoryCache();
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	FString FirstHead;
+	TArray<FGitStandaloneHistoryTestEntry> FirstHistory;
+	if (!LoadCurrentPath(TrackedFilename, FirstHead, FirstHistory))
+	{
+		return false;
+	}
+	const uint64 FirstMissLaunches = GitSourceControlUtils::Testing::GetGitProcessLaunchCount();
+	if (!TestTrue(TEXT("Initial history request launches Git"), FirstMissLaunches > 0))
+	{
+		return false;
+	}
+
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	FString CachedHead;
+	TArray<FGitStandaloneHistoryTestEntry> CachedHistory;
+	if (!LoadCurrentPath(TrackedFilename, CachedHead, CachedHistory))
+	{
+		return false;
+	}
+	const uint64 CacheHitLaunches = GitSourceControlUtils::Testing::GetGitProcessLaunchCount();
+	if (!TestTrue(TEXT("Same history key reuses the completed snapshot"), CacheHitLaunches < FirstMissLaunches)
+		|| !TestEqual(TEXT("Cache hit preserves the captured HEAD"), CachedHead, FirstHead)
+		|| !TestEqual(TEXT("Cache hit preserves history entry count"), CachedHistory.Num(), FirstHistory.Num()))
+	{
+		return false;
+	}
+
+	if (!Fixture.WriteFile(TEXT("Content/Tracked.txt"), TEXT("tracked after HEAD advance\n")) || !Fixture.CommitAll(TEXT("Advance history cache HEAD")))
+	{
+		return false;
+	}
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	FString AdvancedHead;
+	TArray<FGitStandaloneHistoryTestEntry> AdvancedHistory;
+	if (!LoadCurrentPath(TrackedFilename, AdvancedHead, AdvancedHistory))
+	{
+		return false;
+	}
+	if (!TestTrue(TEXT("HEAD advance bypasses the old completed snapshot"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() > CacheHitLaunches)
+		|| !TestFalse(TEXT("HEAD advance changes the cache key"), AdvancedHead.Equals(FirstHead, ESearchCase::CaseSensitive)))
+	{
+		return false;
+	}
+
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	FString ExactHead;
+	bool bExactHeadChanged = false;
+	TArray<FGitStandaloneHistoryTestEntry> ExactHistory;
+	if (!LoadHistory(*this, Fixture, TrackedFilename, EGitLocalSourceControlHistoryMode::ExactRenames, ExactHead, bExactHeadChanged, ExactHistory)
+		|| !TestTrue(TEXT("History mode remains part of the completed snapshot key"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() > CacheHitLaunches))
+	{
+		return false;
+	}
+
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	FString OtherHead;
+	TArray<FGitStandaloneHistoryTestEntry> OtherHistory;
+	if (!LoadCurrentPath(OtherFilename, OtherHead, OtherHistory)
+		|| !TestTrue(TEXT("Repository-relative path remains part of the completed snapshot key"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() > CacheHitLaunches))
+	{
+		return false;
+	}
+
+	const FString CloneDirectory = FPaths::Combine(FPaths::GetPath(Fixture.GetDirectory()), FString::Printf(TEXT("GitSourceControlHistoryCacheClone-%s"), *FGuid::NewGuid().ToString(EGuidFormats::Digits)));
+	ON_SCOPE_EXIT
+	{
+		IFileManager::Get().DeleteDirectory(*CloneDirectory, false, true);
+	};
+	if (!Fixture.RunGit(FString::Printf(TEXT("clone --no-local %s %s"), *QuoteGitArgument(Fixture.GetDirectory()), *QuoteGitArgument(CloneDirectory))))
+	{
+		return false;
+	}
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	FString CloneHead;
+	bool bCloneHeadChanged = false;
+	TArray<FGitStandaloneHistoryTestEntry> CloneHistory;
+	FString CloneError;
+	if (!TestTrue(TEXT("Clone repository history query succeeds"), GitSourceControlUtils::Testing::LoadStandaloneHistory(
+		Fixture.GetGitBinary(), CloneDirectory, FPaths::Combine(CloneDirectory, TEXT("Content/Tracked.txt")), EGitLocalSourceControlHistoryMode::CurrentPath,
+		CloneHead, bCloneHeadChanged, CloneHistory, CloneError))
+		|| !TestFalse(TEXT("Clone history leaves HEAD unchanged"), bCloneHeadChanged)
+		|| !TestTrue(TEXT("Repository root remains part of the completed snapshot key"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() > CacheHitLaunches))
+	{
+		if (!CloneError.IsEmpty())
+		{
+			AddError(CloneError);
+		}
+		return false;
+	}
+
+	GitSourceControlUtils::Testing::ResetStandaloneHistoryCache();
+	FString FailedHead;
+	bool bFailedHeadChanged = false;
+	TArray<FGitStandaloneHistoryTestEntry> FailedHistory;
+	FString FailedError;
+	TestFalse(TEXT("Outside-repository history request fails"), GitSourceControlUtils::Testing::LoadStandaloneHistory(
+		Fixture.GetGitBinary(), Fixture.GetDirectory(), FPaths::Combine(Fixture.GetDirectory(), TEXT(".."), TEXT("OutsideHistoryCache.txt")),
+		EGitLocalSourceControlHistoryMode::CurrentPath, FailedHead, bFailedHeadChanged, FailedHistory, FailedError));
+	TestEqual(TEXT("Failed history request does not enter the completed cache"), GitSourceControlUtils::Testing::GetStandaloneHistoryCacheEntryCount(), 0);
+
+	FString CancelledError;
+	TestFalse(TEXT("Cancelled history request fails"), GitSourceControlUtils::Testing::LoadStandaloneHistoryWithCancelledContext(
+		Fixture.GetGitBinary(), Fixture.GetDirectory(), TrackedFilename, EGitLocalSourceControlHistoryMode::CurrentPath, CancelledError));
+	TestEqual(TEXT("Cancelled history request does not enter the completed cache"), GitSourceControlUtils::Testing::GetStandaloneHistoryCacheEntryCount(), 0);
+
+	for (int32 Index = 0; Index < 33; ++Index)
+	{
+		if (!Fixture.WriteFile(FString::Printf(TEXT("Content/Eviction/%02d.txt"), Index), FString::Printf(TEXT("%d\n"), Index)))
+		{
+			return false;
+		}
+	}
+	if (!Fixture.CommitAll(TEXT("History cache eviction fixture")))
+	{
+		return false;
+	}
+	GitSourceControlUtils::Testing::ResetStandaloneHistoryCache();
+	for (int32 Index = 0; Index < 33; ++Index)
+	{
+		FString EvictionHead;
+		TArray<FGitStandaloneHistoryTestEntry> EvictionHistory;
+		if (!LoadCurrentPath(Fixture.AbsoluteFilename(FString::Printf(TEXT("Content/Eviction/%02d.txt"), Index)), EvictionHead, EvictionHistory))
+		{
+			return false;
+		}
+	}
+	if (!TestEqual(TEXT("Completed history cache applies its 32-entry LRU bound"), GitSourceControlUtils::Testing::GetStandaloneHistoryCacheEntryCount(), 32))
+	{
+		return false;
+	}
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	FString EvictedHead;
+	TArray<FGitStandaloneHistoryTestEntry> EvictedHistory;
+	if (!LoadCurrentPath(Fixture.AbsoluteFilename(TEXT("Content/Eviction/00.txt")), EvictedHead, EvictedHistory)
+		|| !TestTrue(TEXT("Least-recently-used history snapshot is rebuilt after eviction"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount() > CacheHitLaunches))
+	{
+		return false;
+	}
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlIntegrationHistoryDiffRestoreAutomationTest, "Cthulhu.GitSourceControl.Integration.HistoryDiffRestore", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
 
 bool FGitSourceControlIntegrationHistoryDiffRestoreAutomationTest::RunTest(const FString& Parameters)

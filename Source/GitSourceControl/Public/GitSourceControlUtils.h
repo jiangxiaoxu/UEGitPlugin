@@ -270,8 +270,12 @@ GITSOURCECONTROL_API bool DumpRevisionBlobToFile(const FString& InPathToGitBinar
 		GITSOURCECONTROL_API void CaptureGitProcessLaunchCountAtModuleStartup();
 		GITSOURCECONTROL_API uint32 GetStartupGitCapabilityProbeCount();
 		GITSOURCECONTROL_API void SetStartupGitCapabilityForTesting(const FGitStartupCapability& InCapability);
+		GITSOURCECONTROL_API void ResetStandaloneHistoryCache();
+		GITSOURCECONTROL_API int32 GetStandaloneHistoryCacheEntryCount();
 		GITSOURCECONTROL_API bool LoadStandaloneHistory(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InFilename,
 			EGitLocalSourceControlHistoryMode InMode, FString& OutCapturedHead, bool& bOutHeadChanged, TArray<FGitStandaloneHistoryTestEntry>& OutHistory, FString& OutError);
+		GITSOURCECONTROL_API bool LoadStandaloneHistoryWithCancelledContext(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InFilename,
+			EGitLocalSourceControlHistoryMode InMode, FString& OutError);
 		GITSOURCECONTROL_API bool ExportStandaloneRevisionForDiff(const FString& InGitBinary, const FString& InRepositoryRoot,
 			const FString& InLocalFilename, const FString& InCommitId, const FString& InHistoricalPath, FString& OutTempFilename);
 		GITSOURCECONTROL_API UPackage* LoadStandaloneRevisionPackageForDiff(const FString& InGitBinary, const FString& InRepositoryRoot,

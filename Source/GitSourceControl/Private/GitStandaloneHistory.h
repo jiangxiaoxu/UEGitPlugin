@@ -9,4 +9,7 @@ namespace GitSourceControlUtils
 {
 	bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InFile, bool bMergeConflict,
 		EGitLocalSourceControlHistoryMode InMode, FString& OutCapturedHead, bool& bOutHeadChanged, TArray<FString>& OutErrorMessages, TGitSourceControlHistory& OutHistory);
+
+	/** Release the process-local completed history snapshots during module shutdown. */
+	void ClearStandaloneHistoryCache();
 }
