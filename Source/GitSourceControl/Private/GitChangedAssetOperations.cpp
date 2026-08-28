@@ -427,6 +427,7 @@ namespace GitChangedAssetOperationsPrivate
 	bool EnsureHeadLfsObjectsAvailable(FGitLfsLocalObjectStore& InObjectStore, const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InPinnedHead,
 		const TArray<FString>& InRestoreFiles, FString& OutError, FRevertTelemetry* const InTelemetry = nullptr)
 	{
+		FGitLfsBatchVerificationContext VerificationContext;
 		TSet<FString> UniqueLfsObjectKeys;
 		for (const FString& Filename : InRestoreFiles)
 		{
@@ -464,6 +465,10 @@ namespace GitChangedAssetOperationsPrivate
 				UniqueLfsObjectKeys.Add(Pointer.Oid + TEXT(":") + LexToString(Pointer.Size));
 				InTelemetry->UniqueLfsObjectCount = UniqueLfsObjectKeys.Num();
 			}
+			if (VerificationContext.IsVerified(Pointer))
+			{
+				continue;
+			}
 			FString ObjectFilename;
 			EGitLfsLocalObjectLookupResult LookupResult = InObjectStore.FindObject(Pointer, ObjectFilename, OutError);
 			if (LookupResult == EGitLfsLocalObjectLookupResult::Error)
@@ -478,6 +483,7 @@ namespace GitChangedAssetOperationsPrivate
 				}
 				if (GitSourceControlUtils::VerifyLocalLfsObject(InGitBinary, InRepositoryRoot, ObjectFilename, Pointer.Oid, Pointer.Size, OutError))
 				{
+					VerificationContext.MarkVerified(Pointer);
 					continue;
 				}
 			}
@@ -507,6 +513,7 @@ namespace GitChangedAssetOperationsPrivate
 			{
 				return false;
 			}
+			VerificationContext.MarkVerified(Pointer);
 		}
 		return true;
 	}

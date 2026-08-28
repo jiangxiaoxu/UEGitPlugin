@@ -59,3 +59,19 @@ private:
 	/** Empty value is a known local miss. */
 	TMap<FString, FString> ObjectLookupCache;
 };
+
+/**
+ * 仅记录当前 operation 内已完成解析和 SHA 验证的 payload. 不缓存 miss 或失败,
+ * 后续 operation 必须在自己的固定 revision 和路径校验后重新尝试.
+ */
+class FGitLfsBatchVerificationContext final
+{
+public:
+	bool IsVerified(const FGitLfsPointer& InPointer) const;
+	void MarkVerified(const FGitLfsPointer& InPointer);
+
+private:
+	static FString MakeObjectKey(const FGitLfsPointer& InPointer);
+
+	TSet<FString> VerifiedObjectKeys;
+};

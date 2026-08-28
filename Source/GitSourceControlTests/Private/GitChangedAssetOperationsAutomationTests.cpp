@@ -248,6 +248,35 @@ namespace GitChangedAssetOperationsAutomationTestsPrivate
 		}
 		return true;
 	}
+
+	bool IsGitLfsAvailable(const FString& InGitBinary)
+	{
+		int32 ReturnCode = INDEX_NONE;
+		FString StandardOutput;
+		FString StandardError;
+		FPlatformProcess::ExecProcess(*InGitBinary, TEXT("lfs version"), &ReturnCode, &StandardOutput, &StandardError);
+		return ReturnCode == 0;
+	}
+
+	bool ParseLfsPointer(const FString& InPointer, FString& OutOid, int64& OutSize)
+	{
+		OutOid.Reset();
+		OutSize = 0;
+		TArray<FString> Lines;
+		InPointer.ParseIntoArrayLines(Lines, false);
+		for (const FString& Line : Lines)
+		{
+			if (Line.StartsWith(TEXT("oid sha256:"), ESearchCase::CaseSensitive))
+			{
+				OutOid = Line.Mid(11).TrimStartAndEnd();
+			}
+			else if (Line.StartsWith(TEXT("size "), ESearchCase::CaseSensitive))
+			{
+				OutSize = FCString::Atoi64(*Line.Mid(5).TrimStartAndEnd());
+			}
+		}
+		return OutOid.Len() == 64 && OutSize >= 0;
+	}
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetRevertToHeadAutomationTest, "Cthulhu.GitSourceControl.ChangedAssets.RevertToHead", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
@@ -486,6 +515,109 @@ bool FGitChangedAssetMixedLfsPreflightAutomationTest::RunTest(const FString& Par
 	TestTrue(TEXT("LFS pointer path remains unmodified on preflight failure"), Fixture.ReadFile(TEXT("Content/99LfsPointer.uasset"), Contents));
 	TestEqual(TEXT("LFS pointer path retains its dirty bytes"), Contents, FString(TEXT("dirty fake LFS bytes\n")));
 	return TestTrue(TEXT("Mixed LFS preflight reports a recoverable LFS failure"), !Result.Errors.IsEmpty() && Result.Errors[0].Contains(TEXT("LFS"), ESearchCase::IgnoreCase));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetRevertLfsBatchAutomationTest, "Cthulhu.GitSourceControl.ChangedAssets.RevertLfsBatch", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitChangedAssetRevertLfsBatchAutomationTest::RunTest(const FString& Parameters)
+{
+	static_cast<void>(Parameters);
+	using namespace GitChangedAssetOperations;
+	using namespace GitChangedAssetOperationsAutomationTestsPrivate;
+	FFixture Fixture(*this);
+	if (!Fixture.Initialize()) return false;
+	if (!IsGitLfsAvailable(Fixture.GetGitBinary()))
+	{
+		AddWarning(TEXT("Git LFS is unavailable; skipping RevertLfsBatch."));
+		return true;
+	}
+	const FString FirstRelativeFilename = TEXT("Content/First.uasset");
+	const FString SecondRelativeFilename = TEXT("Content/Second.uasset");
+	const FString HeadContents = TEXT("Changed Assets shared LFS head bytes\n");
+	if (!Fixture.RunGit(TEXT("lfs install --local"))
+		|| !Fixture.RunGit(TEXT("lfs track \"Content/*.uasset\""))
+		|| !Fixture.WriteFile(TEXT(".gitignore"), TEXT("Origin.git/\n"))
+		|| !Fixture.WriteFile(FirstRelativeFilename, HeadContents)
+		|| !Fixture.WriteFile(SecondRelativeFilename, HeadContents)
+		|| !Fixture.CommitAll(TEXT("Changed Assets batch LFS fixture")))
+	{
+		return false;
+	}
+	const FString OriginDirectory = Fixture.AbsoluteFilename(TEXT("Origin.git"));
+	if (!Fixture.RunGit(FString::Printf(TEXT("init --bare %s"), *QuoteGitArgument(OriginDirectory)))
+		|| !Fixture.RunGit(FString::Printf(TEXT("remote add origin %s"), *QuoteGitArgument(OriginDirectory)))
+		|| !Fixture.RunGit(TEXT("push -u origin HEAD")))
+	{
+		return false;
+	}
+	FString PinnedHead;
+	FString FirstPointerText;
+	FString SecondPointerText;
+	if (!Fixture.RunGit(TEXT("rev-parse HEAD"), PinnedHead)
+		|| !Fixture.RunGit(TEXT("show HEAD:Content/First.uasset"), FirstPointerText)
+		|| !Fixture.RunGit(TEXT("show HEAD:Content/Second.uasset"), SecondPointerText)) return false;
+	PinnedHead.TrimStartAndEndInline();
+	FString FirstOid;
+	FString SecondOid;
+	int64 FirstSize = 0;
+	int64 SecondSize = 0;
+	if (!TestTrue(TEXT("Changed Assets first LFS pointer parses"), ParseLfsPointer(FirstPointerText, FirstOid, FirstSize))
+		|| !TestTrue(TEXT("Changed Assets second LFS pointer parses"), ParseLfsPointer(SecondPointerText, SecondOid, SecondSize))
+		|| !TestTrue(TEXT("Changed Assets batch paths share one oid:size"), FirstOid.Equals(SecondOid, ESearchCase::CaseSensitive) && FirstSize == SecondSize)) return false;
+	const FString ObjectFilename = FPaths::Combine(Fixture.GetRoot(), TEXT(".git/lfs/objects"), FirstOid.Left(2), FirstOid.Mid(2, 2), FirstOid);
+	FString VerifyError;
+	if (!TestTrue(TEXT("Changed Assets batch local object verifies"), GitSourceControlUtils::VerifyLocalLfsObject(Fixture.GetGitBinary(), Fixture.GetRoot(), ObjectFilename, FirstOid, FirstSize, VerifyError)))
+	{
+		AddError(VerifyError);
+		return false;
+	}
+	auto WriteDirtyPair = [&Fixture, &FirstRelativeFilename, &SecondRelativeFilename](const FString& InFirstContents, const FString& InSecondContents)
+	{
+		return Fixture.WriteFile(FirstRelativeFilename, InFirstContents) && Fixture.WriteFile(SecondRelativeFilename, InSecondContents);
+	};
+	if (!WriteDirtyPair(TEXT("Changed Assets local hit first dirty\n"), TEXT("Changed Assets local hit second dirty\n"))) return false;
+	TArray<FGitChangedAssetEntry> Entries;
+	if (!CaptureRevertEntries(*this, Fixture, PinnedHead, Entries)) return false;
+	int32 ConfirmCalls = 0;
+	int32 PrepareCalls = 0;
+	int32 BeginMutationCalls = 0;
+	int32 FinalizeCalls = 0;
+	FGitChangedAssetRevertResult Result;
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	if (!TestTrue(TEXT("Changed Assets same-oid batch local hit succeeds"), FGitChangedAssetOperations(Fixture.GetGitBinary(), Fixture.GetRoot()).RevertToHead(
+		PinnedHead, Entries, MakeCallbacks(ConfirmCalls, PrepareCalls, BeginMutationCalls, FinalizeCalls), Result)))
+	{
+		AddError(FString::Join(Result.Errors, TEXT("\n")));
+		return false;
+	}
+	if (!TestEqual(TEXT("Changed Assets same-oid local hit verifies once"), GitSourceControlUtils::Testing::GetGitLfsVerifyLaunchCount(), static_cast<uint64>(1))
+		|| !TestEqual(TEXT("Changed Assets same-oid local hit fetches zero times"), GitSourceControlUtils::Testing::GetGitLfsFetchLaunchCount(), static_cast<uint64>(0))
+		|| !TestEqual(TEXT("Changed Assets same-oid local hit confirms once"), ConfirmCalls, 1)
+		|| !TestEqual(TEXT("Changed Assets same-oid local hit prepares once"), PrepareCalls, 1)
+		|| !TestEqual(TEXT("Changed Assets same-oid local hit enters mutation once"), BeginMutationCalls, 1)
+		|| !TestEqual(TEXT("Changed Assets same-oid local hit finalizes once"), FinalizeCalls, 1)) return false;
+	if (!TestTrue(TEXT("Remove Changed Assets shared LFS object before batch miss"), IFileManager::Get().Delete(*ObjectFilename, false, true, true))
+		|| !WriteDirtyPair(TEXT("Changed Assets local miss first dirty\n"), TEXT("Changed Assets local miss second dirty\n"))) return false;
+	Entries.Reset();
+	if (!CaptureRevertEntries(*this, Fixture, PinnedHead, Entries)) return false;
+	ConfirmCalls = 0;
+	PrepareCalls = 0;
+	BeginMutationCalls = 0;
+	FinalizeCalls = 0;
+	Result = FGitChangedAssetRevertResult();
+	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
+	if (!TestTrue(TEXT("Changed Assets same-oid batch local miss succeeds"), FGitChangedAssetOperations(Fixture.GetGitBinary(), Fixture.GetRoot()).RevertToHead(
+		PinnedHead, Entries, MakeCallbacks(ConfirmCalls, PrepareCalls, BeginMutationCalls, FinalizeCalls), Result)))
+	{
+		AddError(FString::Join(Result.Errors, TEXT("\n")));
+		return false;
+	}
+	return TestEqual(TEXT("Changed Assets same-oid local miss fetches once"), GitSourceControlUtils::Testing::GetGitLfsFetchLaunchCount(), static_cast<uint64>(1))
+		&& TestEqual(TEXT("Changed Assets same-oid local miss verifies once"), GitSourceControlUtils::Testing::GetGitLfsVerifyLaunchCount(), static_cast<uint64>(1))
+		&& TestEqual(TEXT("Changed Assets same-oid local miss confirms once"), ConfirmCalls, 1)
+		&& TestEqual(TEXT("Changed Assets same-oid local miss prepares once"), PrepareCalls, 1)
+		&& TestEqual(TEXT("Changed Assets same-oid local miss enters mutation once"), BeginMutationCalls, 1)
+		&& TestEqual(TEXT("Changed Assets same-oid local miss finalizes once"), FinalizeCalls, 1);
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetEmptyLifecycleClosureAutomationTest, "Cthulhu.GitSourceControl.ChangedAssets.EmptyLifecycleClosure", EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)

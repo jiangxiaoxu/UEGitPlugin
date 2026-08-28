@@ -266,6 +266,7 @@ GITSOURCECONTROL_API bool DumpRevisionBlobToFile(const FString& InPathToGitBinar
 		GITSOURCECONTROL_API void ResetVerifiedGitBinaryCache();
 		GITSOURCECONTROL_API uint64 GetGitProcessLaunchCount();
 		GITSOURCECONTROL_API uint64 GetGitLfsFetchLaunchCount();
+		GITSOURCECONTROL_API uint64 GetGitLfsVerifyLaunchCount();
 		GITSOURCECONTROL_API uint64 GetGitProcessLaunchCountAtModuleStartup();
 		GITSOURCECONTROL_API void CaptureGitProcessLaunchCountAtModuleStartup();
 		GITSOURCECONTROL_API uint32 GetStartupGitCapabilityProbeCount();

@@ -172,8 +172,8 @@ namespace GitSourceControlAssetOperationsPrivate
 		return true;
 	}
 
-	bool MaterializeLocalLfsObject(FGitLfsLocalObjectStore& InObjectStore, const FString& GitBinary, const FString& RepositoryRoot, const FString& PointerFilename,
-		const FString& OutputFilename, bool& bOutNeedsFetch, FString& OutError)
+	bool MaterializeLocalLfsObject(FGitLfsLocalObjectStore& InObjectStore, FGitLfsBatchVerificationContext& InVerificationContext,
+		const FString& GitBinary, const FString& RepositoryRoot, const FString& PointerFilename, const FString& OutputFilename, bool& bOutNeedsFetch, FString& OutError)
 	{
 		bOutNeedsFetch = false;
 		FGitLfsPointer Pointer;
@@ -195,11 +195,16 @@ namespace GitSourceControlAssetOperationsPrivate
 			OutError = FString::Printf(TEXT("Git LFS object %s is not available locally."), *Pointer.Oid);
 			return false;
 		}
-		if (LookupResult != EGitLfsLocalObjectLookupResult::Found ||
+		if (LookupResult != EGitLfsLocalObjectLookupResult::Found)
+		{
+			return false;
+		}
+		if (!InVerificationContext.IsVerified(Pointer) &&
 			!GitSourceControlUtils::VerifyLocalLfsObject(GitBinary, RepositoryRoot, ObjectFilename, Pointer.Oid, Pointer.Size, OutError))
 		{
 			return false;
 		}
+		InVerificationContext.MarkVerified(Pointer);
 		if (IFileManager::Get().Copy(*OutputFilename, *ObjectFilename, true, true) != COPY_OK || IFileManager::Get().FileSize(*OutputFilename) != Pointer.Size)
 		{
 			IFileManager::Get().Delete(*OutputFilename, false, true, true);
@@ -229,8 +234,8 @@ namespace GitSourceControlAssetOperationsPrivate
 		return true;
 	}
 
-	bool EnsureHeadBlobAvailable(FGitLfsLocalObjectStore& InObjectStore, const FString& GitBinary, const FString& RepositoryRoot, const FString& HeadCommitId,
-		const FString& AbsoluteFilename, FString& OutError)
+	bool EnsureHeadBlobAvailable(FGitLfsLocalObjectStore& InObjectStore, FGitLfsBatchVerificationContext& InVerificationContext,
+		const FString& GitBinary, const FString& RepositoryRoot, const FString& HeadCommitId, const FString& AbsoluteFilename, FString& OutError)
 	{
 		FString RelativePath = AbsoluteFilename;
 		if (!MakeRepositoryRelativePath(RepositoryRoot, RelativePath))
@@ -246,7 +251,7 @@ namespace GitSourceControlAssetOperationsPrivate
 		if (GitSourceControlUtils::DumpRevisionBlobToFile(GitBinary, RepositoryRoot, HeadCommitId + TEXT(":") + RelativePath, TemporaryPointerFilename, OutError))
 		{
 			bool bNeedsFetch = false;
-			bSuccess = MaterializeLocalLfsObject(InObjectStore, GitBinary, RepositoryRoot, TemporaryPointerFilename, MaterializedFilename, bNeedsFetch, OutError);
+			bSuccess = MaterializeLocalLfsObject(InObjectStore, InVerificationContext, GitBinary, RepositoryRoot, TemporaryPointerFilename, MaterializedFilename, bNeedsFetch, OutError);
 			if (!bSuccess && bNeedsFetch && GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, RepositoryRoot, HeadCommitId, RelativePath, OutError))
 			{
 				FGitLfsPointer Pointer;
@@ -255,7 +260,7 @@ namespace GitSourceControlAssetOperationsPrivate
 					InObjectStore.InvalidateCachedObject(Pointer);
 				}
 				bNeedsFetch = false;
-				bSuccess = MaterializeLocalLfsObject(InObjectStore, GitBinary, RepositoryRoot, TemporaryPointerFilename, MaterializedFilename, bNeedsFetch, OutError);
+				bSuccess = MaterializeLocalLfsObject(InObjectStore, InVerificationContext, GitBinary, RepositoryRoot, TemporaryPointerFilename, MaterializedFilename, bNeedsFetch, OutError);
 			}
 		}
 		IFileManager::Get().Delete(*TemporaryPointerFilename, false, true, true);
@@ -586,6 +591,17 @@ namespace GitSourceControlAssetOperations
 		{
 			return false;
 		}
+		// LFS availability 属于 preflight: lookup、fetch 或 SHA 验证失败时不得触及已加载 package 或 loader.
+		FGitLfsLocalObjectStore LfsObjectStore(GitBinary, RepositoryRoot);
+		FGitLfsBatchVerificationContext LfsVerificationContext;
+		for (const FString& Filename : RestoreFiles)
+		{
+			if (!GitSourceControlAssetOperationsPrivate::EnsureHeadBlobAvailable(LfsObjectStore, LfsVerificationContext, GitBinary, RepositoryRoot, HeadCommitId, Filename, Error))
+			{
+				OutResult.AddError(Error.IsEmpty() ? TEXT("Could not validate the HEAD package topology before discard.") : Error);
+				return false;
+			}
+		}
 		const bool bPrepareCallbackInstalled = static_cast<bool>(Callbacks.PrepareForMutation);
 		if (!PrepareForMutation(Files, Callbacks, OutResult))
 		{
@@ -612,16 +628,6 @@ namespace GitSourceControlAssetOperations
 			OutResult.AddError(CommitPointError);
 			ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
 			return false;
-		}
-		FGitLfsLocalObjectStore LfsObjectStore(GitBinary, RepositoryRoot);
-		for (const FString& Filename : RestoreFiles)
-		{
-			if (!GitSourceControlAssetOperationsPrivate::EnsureHeadBlobAvailable(LfsObjectStore, GitBinary, RepositoryRoot, HeadCommitId, Filename, Error))
-			{
-				OutResult.AddError(Error.IsEmpty() ? TEXT("Could not validate the HEAD package topology before discard.") : Error);
-				ReloadPackagesAfterPreparation(Files, Callbacks, OutResult);
-				return false;
-			}
 		}
 		TArray<GitSourceControlAssetOperationsPrivate::FFileBackup> Backups;
 		if (!GitSourceControlAssetOperationsPrivate::CreateBackups(Files, Backups, Error))
@@ -755,9 +761,10 @@ namespace GitSourceControlAssetOperations
 		}
 		const FString MaterializedFilename = TemporaryFilename + TEXT(".lfs");
 		FGitLfsLocalObjectStore LfsObjectStore(GitBinary, RepositoryRoot);
+		FGitLfsBatchVerificationContext LfsVerificationContext;
 		bool bNeedsLfsFetch = false;
 		bool bMaterialized = GitSourceControlAssetOperationsPrivate::MaterializeLocalLfsObject(
-			LfsObjectStore, GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsLfsFetch, Error);
+			LfsObjectStore, LfsVerificationContext, GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsLfsFetch, Error);
 		if (!bMaterialized && bNeedsLfsFetch &&
 			GitSourceControlUtils::FetchLfsContentForRevision(GitBinary, RepositoryRoot, ResolvedCommitId, HistoricalPath, Error))
 		{
@@ -767,7 +774,7 @@ namespace GitSourceControlAssetOperations
 				LfsObjectStore.InvalidateCachedObject(Pointer);
 			}
 			bMaterialized = GitSourceControlAssetOperationsPrivate::MaterializeLocalLfsObject(
-				LfsObjectStore, GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsLfsFetch, Error);
+				LfsObjectStore, LfsVerificationContext, GitBinary, RepositoryRoot, TemporaryFilename, MaterializedFilename, bNeedsLfsFetch, Error);
 		}
 		if (!bMaterialized)
 		{

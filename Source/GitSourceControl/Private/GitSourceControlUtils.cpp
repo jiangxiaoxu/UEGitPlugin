@@ -140,6 +140,7 @@ constexpr int32 MinimumGitLfsPatchVersion = 1;
 #if WITH_DEV_AUTOMATION_TESTS
 TAtomic<uint64> GitProcessLaunchCount = 0;
 TAtomic<uint64> GitLfsFetchLaunchCount = 0;
+TAtomic<uint64> GitLfsVerifyLaunchCount = 0;
 TAtomic<uint64> GitProcessLaunchCountAtModuleStartup = MAX_uint64;
 #endif
 
@@ -1421,6 +1422,7 @@ namespace Testing
 	{
 		GitSourceControlUtilsPrivate::GitProcessLaunchCount.Store(0);
 		GitSourceControlUtilsPrivate::GitLfsFetchLaunchCount.Store(0);
+		GitSourceControlUtilsPrivate::GitLfsVerifyLaunchCount.Store(0);
 	}
 
 void ResetVerifiedGitBinaryCache()
@@ -1438,6 +1440,11 @@ void ResetVerifiedGitBinaryCache()
 	uint64 GetGitLfsFetchLaunchCount()
 	{
 		return GitSourceControlUtilsPrivate::GitLfsFetchLaunchCount.Load();
+	}
+
+	uint64 GetGitLfsVerifyLaunchCount()
+	{
+		return GitSourceControlUtilsPrivate::GitLfsVerifyLaunchCount.Load();
 	}
 
 	uint64 GetGitProcessLaunchCountAtModuleStartup()
@@ -1572,6 +1579,9 @@ bool VerifyLocalLfsObject(const FString& InPathToGitBinary, const FString& InRep
 	FString Arguments = TEXT("lfs");
 	AppendGitArgument(Arguments, TEXT("pointer"));
 	AppendGitArgument(Arguments, TEXT("--file=") + InObjectFilename);
+#if WITH_DEV_AUTOMATION_TESTS
+	++GitSourceControlUtilsPrivate::GitLfsVerifyLaunchCount;
+#endif
 	const FGitProcessResult ProcessResult = ExecuteGitProcessOffGameThread(InPathToGitBinary, InRepositoryRoot, Arguments);
 	if (ProcessResult.bCancelled)
 	{
