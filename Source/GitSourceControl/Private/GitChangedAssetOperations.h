@@ -93,6 +93,9 @@ namespace GitChangedAssetOperations
 #if WITH_DEV_AUTOMATION_TESTS
 		/** Test-only override for constructing an isolated Editor-world lifecycle fixture. */
 		static void SetCurrentEditorWorldForTesting(UWorld* InWorld);
+		/** Test-only replacement for observing the final package reload batch without invoking PackageTools. */
+		using FReloadPackagesForTesting = TFunction<bool(const TArray<UPackage*>& InPackages, FString& OutError)>;
+		static void SetReloadPackagesForTesting(FReloadPackagesForTesting InReloadPackages);
 #endif
 
 	private:

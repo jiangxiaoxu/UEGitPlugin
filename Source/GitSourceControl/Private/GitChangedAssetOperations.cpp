@@ -40,6 +40,7 @@ namespace GitChangedAssetOperationsPrivate
 {
 #if WITH_DEV_AUTOMATION_TESTS
 	TWeakObjectPtr<UWorld> CurrentEditorWorldOverrideForTesting;
+	GitChangedAssetOperations::FGitChangedAssetRevertLifecycle::FReloadPackagesForTesting ReloadPackagesForTesting;
 #endif
 
 	UWorld* GetCurrentEditorWorld()
@@ -1340,6 +1341,12 @@ namespace GitChangedAssetOperations
 		check(IsInGameThread());
 		GitChangedAssetOperationsPrivate::CurrentEditorWorldOverrideForTesting = InWorld;
 	}
+
+	void FGitChangedAssetRevertLifecycle::SetReloadPackagesForTesting(FReloadPackagesForTesting InReloadPackages)
+	{
+		check(IsInGameThread());
+		GitChangedAssetOperationsPrivate::ReloadPackagesForTesting = MoveTemp(InReloadPackages);
+	}
 #endif
 
 	bool FGitChangedAssetRevertLifecycle::BuildPreview(const TArray<FGitChangedAssetEntry>& InEntries, FGitChangedAssetRevertPreview& OutPreview, FString& OutError)
@@ -1560,6 +1567,12 @@ namespace GitChangedAssetOperations
 			{
 				return true;
 			}
+#if WITH_DEV_AUTOMATION_TESTS
+			if (GitChangedAssetOperationsPrivate::ReloadPackagesForTesting)
+			{
+				return GitChangedAssetOperationsPrivate::ReloadPackagesForTesting(Packages, OutError);
+			}
+#endif
 			FText ReloadError;
 			const bool bReloaded = UPackageTools::ReloadPackages(Packages, ReloadError, EReloadPackagesInteractionMode::AssumePositive);
 			if (!ReloadError.IsEmpty())

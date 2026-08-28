@@ -10,6 +10,7 @@
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformTime.h"
 #include "HAL/PlatformProcess.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/AutomationTest.h"
@@ -17,6 +18,7 @@
 #include "Misc/Guid.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
 
@@ -517,6 +519,15 @@ bool FGitChangedAssetInactiveOfpaLifecycleAutomationTest::RunTest(const FString&
 	using namespace GitChangedAssetOperationsAutomationTestsPrivate;
 	FFixture Fixture(*this);
 	if (!Fixture.Initialize()) return false;
+	for (int32 EntryIndex = 0; EntryIndex < 100; ++EntryIndex)
+	{
+		if (!Fixture.WriteFile(FString::Printf(TEXT("Content/__ExternalActors__/Map/A/B/INACTIVE_%d.uasset"), EntryIndex),
+			FString::Printf(TEXT("head inactive OFPA %d\n"), EntryIndex))) return false;
+	}
+	if (!Fixture.CommitAll(TEXT("Inactive OFPA batch lifecycle fixture"))) return false;
+	FString PinnedHead;
+	if (!Fixture.RunGit(TEXT("rev-parse HEAD"), PinnedHead)) return false;
+	PinnedHead.TrimStartAndEndInline();
 
 	const FString TestId = FGuid::NewGuid().ToString(EGuidFormats::Digits);
 	const FString DestinationOwnerLevel = FString::Printf(TEXT("/Temp/GitChangedAssetsInactiveDestination_%s"), *TestId);
@@ -528,7 +539,7 @@ bool FGitChangedAssetInactiveOfpaLifecycleAutomationTest::RunTest(const FString&
 	InactiveDestinationOwnerPackage->SetDirtyFlag(false);
 	InactiveSourceOwnerPackage->SetDirtyFlag(false);
 
-	FGitChangedAssetEntry Entry = MakeEntry(Fixture, TEXT("Content/__ExternalActors__/Map/A/B/INACTIVE.uasset"), EGitChangedAssetState::Modified);
+	FGitChangedAssetEntry Entry = MakeEntry(Fixture, TEXT("Content/__ExternalActors__/Map/A/B/INACTIVE_0.uasset"), EGitChangedAssetState::Modified);
 	Entry.PackageKind = EGitChangedAssetPackageKind::ExternalActor;
 	Entry.OwnerLevel = DestinationOwnerLevel;
 	Entry.bOwnerLevelResolved = true;
@@ -536,6 +547,152 @@ bool FGitChangedAssetInactiveOfpaLifecycleAutomationTest::RunTest(const FString&
 	FString Error;
 	if (!TestTrue(TEXT("A clean inactive OFPA owner takes the disk-only lifecycle path"), FGitChangedAssetRevertLifecycle::BuildPreview({ Entry }, Preview, Error))) return false;
 	TestTrue(TEXT("The disk-only OFPA path does not reload an inactive owner map"), Preview.OwnerMapsToReload.IsEmpty());
+	int32 ReloadBatchCalls = 0;
+	FGitChangedAssetRevertLifecycle::SetReloadPackagesForTesting([&ReloadBatchCalls](const TArray<UPackage*>&, FString&)
+	{
+		++ReloadBatchCalls;
+		return true;
+	});
+	ON_SCOPE_EXIT { FGitChangedAssetRevertLifecycle::SetReloadPackagesForTesting({}); };
+	struct FWarmTiming
+	{
+		double TotalMilliseconds = 0.0;
+		double ConfirmMilliseconds = 0.0;
+		double PrepareMilliseconds = 0.0;
+		double BeginMutationMilliseconds = 0.0;
+		double FinalizeMilliseconds = 0.0;
+	};
+	auto RevertInactiveBatch = [this, &Fixture, &PinnedHead, &DestinationOwnerLevel, &ReloadBatchCalls](const int32 InEntryCount, FWarmTiming& OutTiming) -> bool
+	{
+		OutTiming = FWarmTiming();
+		for (int32 EntryIndex = 0; EntryIndex < InEntryCount; ++EntryIndex)
+		{
+			if (!Fixture.WriteFile(FString::Printf(TEXT("Content/__ExternalActors__/Map/A/B/INACTIVE_%d.uasset"), EntryIndex),
+				FString::Printf(TEXT("dirty inactive OFPA %d\n"), EntryIndex))) return false;
+		}
+		TArray<FGitChangedAssetEntry> BatchEntries;
+		if (!CaptureRevertEntries(*this, Fixture, PinnedHead, BatchEntries)) return false;
+		if (!TestEqual(FString::Printf(TEXT("The %d-asset inactive OFPA fixture captures exactly its dirty selection"), InEntryCount), BatchEntries.Num(), InEntryCount)) return false;
+		for (FGitChangedAssetEntry& BatchEntry : BatchEntries)
+		{
+			BatchEntry.PackageKind = EGitChangedAssetPackageKind::ExternalActor;
+			BatchEntry.OwnerLevel = DestinationOwnerLevel;
+			BatchEntry.bOwnerLevelResolved = true;
+		}
+
+		FGitChangedAssetRevertLifecycle Lifecycle;
+		int32 ConfirmCalls = 0;
+		int32 PrepareCalls = 0;
+		int32 BeginMutationCalls = 0;
+		int32 FinalizeCalls = 0;
+		FGitChangedAssetRevertCallbacks Callbacks;
+		Callbacks.Confirm = [&Lifecycle, &ConfirmCalls, &OutTiming](const TArray<FGitChangedAssetEntry>& InEntries, FString& OutError)
+		{
+			++ConfirmCalls;
+			const double StartSeconds = FPlatformTime::Seconds();
+			const bool bSucceeded = Lifecycle.RecordConfirmedClosure(InEntries, OutError);
+			OutTiming.ConfirmMilliseconds += (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
+			return bSucceeded;
+		};
+		Callbacks.PrepareForMutation = [&Lifecycle, &PrepareCalls, &OutTiming](const TArray<FGitChangedAssetEntry>& InEntries, FString& OutError)
+		{
+			++PrepareCalls;
+			const double StartSeconds = FPlatformTime::Seconds();
+			const bool bSucceeded = Lifecycle.Prepare(InEntries, OutError);
+			OutTiming.PrepareMilliseconds += (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
+			return bSucceeded;
+		};
+		Callbacks.BeginMutation = [&Lifecycle, &BeginMutationCalls, &OutTiming](const TArray<FGitChangedAssetEntry>& InEntries, FString& OutError)
+		{
+			++BeginMutationCalls;
+			const double StartSeconds = FPlatformTime::Seconds();
+			const bool bSucceeded = Lifecycle.BeginMutation(InEntries, OutError);
+			OutTiming.BeginMutationMilliseconds += (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
+			return bSucceeded;
+		};
+		Callbacks.FinalizeEditor = [&Lifecycle, &FinalizeCalls, &OutTiming](const TArray<FGitChangedAssetEntry>& InEntries, const TArray<FString>& InAffectedFiles,
+			const EGitChangedAssetMutationOutcome InOutcome, FString& OutError)
+		{
+			++FinalizeCalls;
+			const double StartSeconds = FPlatformTime::Seconds();
+			const bool bSucceeded = Lifecycle.Finish(InEntries, InAffectedFiles, InOutcome, OutError);
+			OutTiming.FinalizeMilliseconds += (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
+			return bSucceeded;
+		};
+		ReloadBatchCalls = 0;
+		FGitChangedAssetRevertResult Result;
+		const double TotalStartSeconds = FPlatformTime::Seconds();
+		if (!TestTrue(FString::Printf(TEXT("The %d-asset inactive OFPA Revert succeeds"), InEntryCount),
+			FGitChangedAssetOperations(Fixture.GetGitBinary(), Fixture.GetRoot()).RevertToHead(PinnedHead, BatchEntries, Callbacks, Result)))
+		{
+			OutTiming.TotalMilliseconds = (FPlatformTime::Seconds() - TotalStartSeconds) * 1000.0;
+			AddError(FString::Join(Result.Errors, TEXT("\n")));
+			return false;
+		}
+		OutTiming.TotalMilliseconds = (FPlatformTime::Seconds() - TotalStartSeconds) * 1000.0;
+		if (!TestTrue(FString::Printf(TEXT("The %d-asset inactive OFPA Revert reports disk success"), InEntryCount), Result.bSucceeded)
+			|| !TestTrue(FString::Printf(TEXT("The %d-asset inactive OFPA Revert reports Editor finalization success"), InEntryCount), Result.bReloadSucceeded)
+			|| !TestEqual(FString::Printf(TEXT("The %d-asset inactive OFPA Revert confirms once"), InEntryCount), ConfirmCalls, 1)
+			|| !TestEqual(FString::Printf(TEXT("The %d-asset inactive OFPA Revert prepares once"), InEntryCount), PrepareCalls, 1)
+			|| !TestEqual(FString::Printf(TEXT("The %d-asset inactive OFPA Revert enters the mutation point once"), InEntryCount), BeginMutationCalls, 1)
+			|| !TestEqual(FString::Printf(TEXT("The %d-asset inactive OFPA Revert finalizes once"), InEntryCount), FinalizeCalls, 1)
+			|| !TestEqual(FString::Printf(TEXT("The %d-asset inactive OFPA Revert invokes no package reload batch"), InEntryCount), ReloadBatchCalls, 0)) return false;
+
+		for (int32 EntryIndex = 0; EntryIndex < InEntryCount; ++EntryIndex)
+		{
+			FString Contents;
+			if (!TestTrue(FString::Printf(TEXT("The %d-asset inactive OFPA Revert restores worktree file %d"), InEntryCount, EntryIndex),
+				Fixture.ReadFile(FString::Printf(TEXT("Content/__ExternalActors__/Map/A/B/INACTIVE_%d.uasset"), EntryIndex), Contents))) return false;
+			if (!TestEqual(FString::Printf(TEXT("The %d-asset inactive OFPA Revert restores HEAD bytes for file %d"), InEntryCount, EntryIndex),
+				Contents, FString::Printf(TEXT("head inactive OFPA %d\n"), EntryIndex))) return false;
+		}
+		FString Status;
+		if (!Fixture.RunGit(TEXT("status --porcelain=v2"), Status)) return false;
+		Status.TrimStartAndEndInline();
+		if (!TestTrue(FString::Printf(TEXT("The %d-asset inactive OFPA Revert restores worktree and index"), InEntryCount), Status.IsEmpty())) return false;
+		FGitChangedAssetSnapshot CleanSnapshot;
+		FString SnapshotError;
+		if (!TestTrue(FString::Printf(TEXT("The %d-asset inactive OFPA Revert recaptures Changed Assets status"), InEntryCount),
+			FGitChangedAssetsStatus::CaptureSnapshot(Fixture.GetGitBinary(), Fixture.GetRoot(), 1, CleanSnapshot, SnapshotError)))
+		{
+			AddError(SnapshotError);
+			return false;
+		}
+		return TestTrue(FString::Printf(TEXT("The %d-asset inactive OFPA Revert leaves an empty Changed Assets snapshot"), InEntryCount), CleanSnapshot.Entries.IsEmpty());
+	};
+	for (const int32 EntryCount : { 1, 10, 100 })
+	{
+		TArray<double> TotalMilliseconds;
+		TArray<double> ConfirmMilliseconds;
+		TArray<double> PrepareMilliseconds;
+		TArray<double> BeginMutationMilliseconds;
+		TArray<double> FinalizeMilliseconds;
+		TotalMilliseconds.Reserve(3);
+		ConfirmMilliseconds.Reserve(3);
+		PrepareMilliseconds.Reserve(3);
+		BeginMutationMilliseconds.Reserve(3);
+		FinalizeMilliseconds.Reserve(3);
+		for (int32 Iteration = 1; Iteration <= 3; ++Iteration)
+		{
+			FWarmTiming Timing;
+			if (!RevertInactiveBatch(EntryCount, Timing)) return false;
+			AddInfo(FString::Printf(TEXT("OFPA_WARM_TIMING n=%d iteration=%d total_ms=%.3f confirm_ms=%.3f prepare_ms=%.3f begin_mutation_ms=%.3f finalize_ms=%.3f"),
+				EntryCount, Iteration, Timing.TotalMilliseconds, Timing.ConfirmMilliseconds, Timing.PrepareMilliseconds,
+				Timing.BeginMutationMilliseconds, Timing.FinalizeMilliseconds));
+			TotalMilliseconds.Add(Timing.TotalMilliseconds);
+			ConfirmMilliseconds.Add(Timing.ConfirmMilliseconds);
+			PrepareMilliseconds.Add(Timing.PrepareMilliseconds);
+			BeginMutationMilliseconds.Add(Timing.BeginMutationMilliseconds);
+			FinalizeMilliseconds.Add(Timing.FinalizeMilliseconds);
+		}
+		TotalMilliseconds.Sort();
+		ConfirmMilliseconds.Sort();
+		PrepareMilliseconds.Sort();
+		BeginMutationMilliseconds.Sort();
+		FinalizeMilliseconds.Sort();
+		AddInfo(FString::Printf(TEXT("OFPA_WARM_TIMING_MEDIAN n=%d repeats=3 total_ms=%.3f confirm_ms=%.3f prepare_ms=%.3f begin_mutation_ms=%.3f finalize_ms=%.3f"),
+			EntryCount, TotalMilliseconds[1], ConfirmMilliseconds[1], PrepareMilliseconds[1], BeginMutationMilliseconds[1], FinalizeMilliseconds[1]));
+	}
 
 	FGitChangedAssetEntry RenameEntry = Entry;
 	RenameEntry.State = EGitChangedAssetState::Renamed;
@@ -727,6 +884,135 @@ bool FGitChangedAssetDirectEditorWorldOfpaAutomationTest::RunTest(const FString&
 		FGitChangedAssetRevertLifecycle::BuildPreview({ Entry }, Preview, Error))) return false;
 	if (!TestEqual(TEXT("The direct OFPA has one owner world reload target"), Preview.OwnerMapsToReload.Num(), 1)) return false;
 	return TestEqual(TEXT("The direct OFPA reloads its metadata-matching owner world package"), Preview.OwnerMapsToReload[0], DirectOwnerPackage->GetName());
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetOfpaReloadBatchLifecycleAutomationTest, "Cthulhu.GitSourceControl.ChangedAssets.OfpaReloadBatchLifecycle", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitChangedAssetOfpaReloadBatchLifecycleAutomationTest::RunTest(const FString& Parameters)
+{
+	static_cast<void>(Parameters);
+	using namespace GitChangedAssetOperations;
+	using namespace GitChangedAssetOperationsAutomationTestsPrivate;
+	FFixture Fixture(*this);
+	if (!Fixture.Initialize()) return false;
+	const FString ContentDirectory = FPaths::Combine(Fixture.GetRoot(), TEXT("Content"));
+	if (!TestTrue(TEXT("Creates an isolated mounted content directory"), IFileManager::Get().MakeDirectory(*ContentDirectory, true))) return false;
+	const FString MountRoot = FString::Printf(TEXT("/GitChangedAssetsBatch_%s/"), *FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	FPackageName::RegisterMountPoint(MountRoot, ContentDirectory);
+	ON_SCOPE_EXIT { FPackageName::UnRegisterMountPoint(MountRoot, ContentDirectory); };
+
+	auto CreateExternalActorEntry = [this, &MountRoot](const FString& InOwnerSuffix, const FString& InExternalSuffix,
+		UPackage*& OutOwnerPackage, UWorld*& OutOwnerWorld) -> TOptional<FGitChangedAssetEntry>
+	{
+		const FString OwnerPackageName = MountRoot + InOwnerSuffix;
+		if (OutOwnerPackage == nullptr || OutOwnerWorld == nullptr)
+		{
+			const FString OwnerFilename = FPackageName::LongPackageNameToFilename(OwnerPackageName, FPackageName::GetMapPackageExtension());
+			if (!IFileManager::Get().MakeDirectory(*FPaths::GetPath(OwnerFilename), true)
+				|| !FFileHelper::SaveStringToFile(TEXT("Changed Assets OFPA batch lifecycle fixture\n"), *OwnerFilename, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+			{
+				AddError(FString::Printf(TEXT("Could not create a mounted owner map fixture: %s"), *OwnerFilename));
+				return {};
+			}
+			OutOwnerPackage = CreatePackage(*OwnerPackageName);
+			OutOwnerWorld = OutOwnerPackage != nullptr
+				? UWorld::CreateWorld(EWorldType::Editor, false, FName(*FString::Printf(TEXT("BatchOwner_%s"), *InOwnerSuffix)), OutOwnerPackage)
+				: nullptr;
+			if (OutOwnerPackage == nullptr || OutOwnerWorld == nullptr)
+			{
+				AddError(FString::Printf(TEXT("Could not create an isolated OFPA owner world: %s"), *OwnerPackageName));
+				return {};
+			}
+		}
+		const TArray<FString> ExternalActorPaths = ULevel::GetExternalActorsPaths(OwnerPackageName);
+		if (ExternalActorPaths.IsEmpty())
+		{
+			AddError(FString::Printf(TEXT("Could not derive an external actor path for: %s"), *OwnerPackageName));
+			return {};
+		}
+		const FString ExternalPackageName = ExternalActorPaths[0] + TEXT("/A/B/") + InExternalSuffix;
+		UPackage* const ExternalPackage = CreatePackage(*ExternalPackageName);
+		AActor* const ExternalActor = ExternalPackage != nullptr
+			? NewObject<AActor>(OutOwnerWorld->PersistentLevel, FName(*FString::Printf(TEXT("BatchActor_%s"), *InExternalSuffix)), RF_Public | RF_Standalone)
+			: nullptr;
+		if (ExternalPackage == nullptr || ExternalActor == nullptr)
+		{
+			AddError(FString::Printf(TEXT("Could not create an isolated OFPA external package: %s"), *ExternalPackageName));
+			return {};
+		}
+		OutOwnerWorld->PersistentLevel->Actors.Add(ExternalActor);
+		ExternalActor->SetPackageExternal(true, false, ExternalPackage);
+		ExternalPackage->SetDirtyFlag(false);
+		OutOwnerPackage->SetDirtyFlag(false);
+
+		FGitChangedAssetEntry Entry;
+		Entry.RepositoryRelativePath = FString::Printf(TEXT("Content/__ExternalActors__/Batch/%s.uasset"), *InExternalSuffix);
+		Entry.AbsoluteFilename = FPackageName::LongPackageNameToFilename(ExternalPackageName, FPackageName::GetAssetPackageExtension());
+		Entry.PackageName = ExternalPackageName;
+		Entry.OwnerLevel = OwnerPackageName;
+		Entry.State = EGitChangedAssetState::Modified;
+		Entry.PackageKind = EGitChangedAssetPackageKind::ExternalActor;
+		Entry.bBaseRevertEligible = true;
+		Entry.bCanRevert = true;
+		Entry.bMetadataResolved = true;
+		Entry.bOwnerLevelResolved = true;
+		Entry.IndexStatus = TEXT('M');
+		Entry.WorktreeStatus = TEXT('M');
+		return Entry;
+	};
+
+	UPackage* CurrentWorldPackage = CreatePackage(*(MountRoot + TEXT("Current")));
+	UWorld* const CurrentWorld = CurrentWorldPackage != nullptr
+		? UWorld::CreateWorld(EWorldType::Editor, false, FName(*FString::Printf(TEXT("BatchCurrent_%s"), *FGuid::NewGuid().ToString(EGuidFormats::Digits))), CurrentWorldPackage)
+		: nullptr;
+	UPackage* OwnerAPackage = nullptr;
+	UWorld* OwnerAWorld = nullptr;
+	UPackage* OwnerBPackage = nullptr;
+	UWorld* OwnerBWorld = nullptr;
+	TOptional<FGitChangedAssetEntry> OwnerAFirst = CreateExternalActorEntry(TEXT("OwnerA"), TEXT("OwnerAFirst"), OwnerAPackage, OwnerAWorld);
+	TOptional<FGitChangedAssetEntry> OwnerASecond = CreateExternalActorEntry(TEXT("OwnerA"), TEXT("OwnerASecond"), OwnerAPackage, OwnerAWorld);
+	TOptional<FGitChangedAssetEntry> OwnerB = CreateExternalActorEntry(TEXT("OwnerB"), TEXT("OwnerB"), OwnerBPackage, OwnerBWorld);
+	if (!TestNotNull(TEXT("Creates an isolated current Editor world"), CurrentWorld)
+		|| !TestNotNull(TEXT("Creates the first OFPA owner world"), OwnerAWorld)
+		|| !TestNotNull(TEXT("Creates the second OFPA owner world"), OwnerBWorld)
+		|| !TestTrue(TEXT("Creates two external entries for one owner and one for another"), OwnerAFirst.IsSet() && OwnerASecond.IsSet() && OwnerB.IsSet())) return false;
+	CurrentWorldPackage->SetDirtyFlag(false);
+	OwnerAPackage->SetDirtyFlag(false);
+	OwnerBPackage->SetDirtyFlag(false);
+
+	const TArray<FGitChangedAssetEntry> Entries = { OwnerAFirst.GetValue(), OwnerASecond.GetValue(), OwnerB.GetValue() };
+	FScopedCurrentEditorWorldOverride CurrentWorldOverride(CurrentWorld);
+	FGitChangedAssetRevertPreview Preview;
+	FString Error;
+	if (!TestTrue(TEXT("Multiple OFPA owners build a reload closure"), FGitChangedAssetRevertLifecycle::BuildPreview(Entries, Preview, Error))) return false;
+	if (!TestEqual(TEXT("Two OFPA owners produce two unique owner packages"), Preview.OwnerMapsToReload.Num(), 2)) return false;
+	TestTrue(TEXT("The shared owner appears once in the lifecycle closure"), Preview.OwnerMapsToReload.Contains(OwnerAPackage->GetName()));
+	TestTrue(TEXT("The second owner appears in the lifecycle closure"), Preview.OwnerMapsToReload.Contains(OwnerBPackage->GetName()));
+
+	TArray<TArray<FString>> ReloadBatches;
+	FGitChangedAssetRevertLifecycle::SetReloadPackagesForTesting([&ReloadBatches](const TArray<UPackage*>& InPackages, FString&)
+	{
+		TArray<FString> PackageNames;
+		for (UPackage* Package : InPackages)
+		{
+			if (Package != nullptr)
+			{
+				PackageNames.Add(Package->GetName());
+			}
+		}
+		ReloadBatches.Add(MoveTemp(PackageNames));
+		return true;
+	});
+	ON_SCOPE_EXIT { FGitChangedAssetRevertLifecycle::SetReloadPackagesForTesting({}); };
+	FGitChangedAssetRevertLifecycle Lifecycle;
+	if (!TestTrue(TEXT("The OFPA batch closure can be recorded"), Lifecycle.RecordConfirmedClosure(Entries, Error))) return false;
+	if (!TestTrue(TEXT("The OFPA batch closure prepares unique owner packages"), Lifecycle.Prepare(Entries, Error))) return false;
+	if (!TestTrue(TEXT("The OFPA batch closure finalizes through the reload boundary"),
+		Lifecycle.Finish(Entries, {}, EGitChangedAssetMutationOutcome::Succeeded, Error))) return false;
+	if (!TestEqual(TEXT("All OFPA owner worlds are submitted through one ReloadPackages batch"), ReloadBatches.Num(), 1)) return false;
+	if (!TestEqual(TEXT("The ReloadPackages batch contains two unique owner maps"), ReloadBatches[0].Num(), 2)) return false;
+	TestTrue(TEXT("The ReloadPackages batch contains the shared owner once"), ReloadBatches[0].Contains(OwnerAPackage->GetName()));
+	return TestTrue(TEXT("The ReloadPackages batch contains the second owner"), ReloadBatches[0].Contains(OwnerBPackage->GetName()));
 }
 
 #endif
