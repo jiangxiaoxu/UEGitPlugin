@@ -414,8 +414,9 @@ namespace SGitStandaloneHistoryWindowPrivate
 						[
 							SNew(SButton)
 							.Text(LOCTEXT("StandaloneHistoryRestore", "Restore Selected..."))
-							.Visibility(this, &SGitStandaloneHistoryWindow::GetSingleRevisionActionVisibility)
+							.Visibility(EVisibility::Visible)
 							.IsEnabled(this, &SGitStandaloneHistoryWindow::CanRestoreSelectedRevision)
+							.ToolTipText(this, &SGitStandaloneHistoryWindow::GetRestoreTooltip)
 							.OnClicked(this, &SGitStandaloneHistoryWindow::OnRestoreSelected)
 						]
 					]
@@ -588,6 +589,36 @@ namespace SGitStandaloneHistoryWindowPrivate
 		bool CanDiffAgainstPrevious() const { return MakePreviousDiffRequest(Revisions, GetSingleSelectedRevision()).IsSet(); }
 		bool CanDiffSelectedRevisions() const { return MakeSelectedRevisionDiffRequest(Revisions, GetSelectedRevisions()).IsSet(); }
 		bool CanRestoreSelectedRevision() const { return IsSupportedCurrentAsset() && HasCurrentHistoricalPath(GetSingleSelectedRevision()); }
+		FText GetRestoreTooltip() const
+		{
+			const TArray<FRevisionPtr> SelectedRevisions = GetSelectedRevisions();
+			if (SelectedRevisions.IsEmpty())
+			{
+				return LOCTEXT("StandaloneHistoryRestoreNoSelection", "Select one history revision to restore.");
+			}
+			if (SelectedRevisions.Num() != 1)
+			{
+				return LOCTEXT("StandaloneHistoryRestoreSingleSelection", "Select exactly one history revision to restore.");
+			}
+			if (!IsSupportedCurrentAsset())
+			{
+				return LOCTEXT("StandaloneHistoryRestoreUnsupportedAsset", "Restore is available only for .uasset assets.");
+			}
+
+			const FRevisionPtr& Revision = SelectedRevisions[0];
+			if (!HasRevisionBlob(Revision))
+			{
+				return LOCTEXT("StandaloneHistoryRestoreMissingBlob", "The selected revision has no recoverable blob; deleted revisions cannot be restored.");
+			}
+			if (!HasCurrentHistoricalPath(Revision))
+			{
+				return FText::Format(
+					LOCTEXT("StandaloneHistoryRestoreHistoricalPathMismatch", "Restore is unavailable because the historical path '{0}' differs from the current path '{1}'. Case-only renames are treated as different paths."),
+					FText::FromString(Revision->Filename), FText::FromString(Filename));
+			}
+
+			return LOCTEXT("StandaloneHistoryRestoreAvailable", "Force restore this revision to the workspace, reset its Git index entry to HEAD, and reload the affected package.");
+		}
 		EVisibility GetSingleRevisionActionVisibility() const { return CanDiffAgainstWorkspace() ? EVisibility::Visible : EVisibility::Collapsed; }
 		EVisibility GetPreviousRevisionActionVisibility() const { return CanDiffAgainstPrevious() ? EVisibility::Visible : EVisibility::Collapsed; }
 		EVisibility GetTwoRevisionActionVisibility() const { return CanDiffSelectedRevisions() ? EVisibility::Visible : EVisibility::Collapsed; }
@@ -680,6 +711,13 @@ namespace SGitStandaloneHistoryWindowPrivate
 
 		void TrackActiveDiff(const FGitStandaloneHistoryDiffCancellationPtr& CancellationContext)
 		{
+			for (int32 Index = ActiveDiffCancellationContexts.Num() - 1; Index >= 0; --Index)
+			{
+				if (!ActiveDiffCancellationContexts[Index].IsValid())
+				{
+					ActiveDiffCancellationContexts.RemoveAtSwap(Index);
+				}
+			}
 			if (CancellationContext.IsValid())
 			{
 				ActiveDiffCancellationContexts.Add(CancellationContext);
