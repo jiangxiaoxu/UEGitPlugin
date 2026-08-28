@@ -38,6 +38,8 @@
 
 namespace GitChangedAssetOperationsPrivate
 {
+	using FRevertTelemetry = GitChangedAssetOperations::FGitChangedAssetRevertTelemetry;
+
 #if WITH_DEV_AUTOMATION_TESTS
 	TWeakObjectPtr<UWorld> CurrentEditorWorldOverrideForTesting;
 	GitChangedAssetOperations::FGitChangedAssetRevertLifecycle::FReloadPackagesForTesting ReloadPackagesForTesting;
@@ -159,11 +161,16 @@ namespace GitChangedAssetOperationsPrivate
 		return true;
 	}
 
-	bool ReadHeadCommitId(const FString& InGitBinary, const FString& InRepositoryRoot, FString& OutCommitId, FString& OutError)
+	bool ReadHeadCommitId(const FString& InGitBinary, const FString& InRepositoryRoot, FString& OutCommitId, FString& OutError,
+		FRevertTelemetry* const InTelemetry = nullptr)
 	{
 		OutCommitId.Reset();
 		OutError.Reset();
 		FString Output;
+		if (InTelemetry != nullptr)
+		{
+			++InTelemetry->GitHeadCheckCount;
+		}
 		if (!GitSourceControlUtils::RunCommandInternalRaw(TEXT("rev-parse"), InGitBinary, InRepositoryRoot,
 			{ TEXT("--verify"), TEXT("HEAD") }, {}, Output, OutError))
 		{
@@ -183,10 +190,11 @@ namespace GitChangedAssetOperationsPrivate
 		return true;
 	}
 
-	bool VerifyPinnedHead(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InPinnedHead, FString& OutError)
+	bool VerifyPinnedHead(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InPinnedHead, FString& OutError,
+		FRevertTelemetry* const InTelemetry = nullptr)
 	{
 		FString CurrentHead;
-		if (!ReadHeadCommitId(InGitBinary, InRepositoryRoot, CurrentHead, OutError))
+		if (!ReadHeadCommitId(InGitBinary, InRepositoryRoot, CurrentHead, OutError, InTelemetry))
 		{
 			return false;
 		}
@@ -198,7 +206,7 @@ namespace GitChangedAssetOperationsPrivate
 		return true;
 	}
 
-	FFileFingerprint CaptureFingerprint(const FString& InFilename)
+	FFileFingerprint CaptureFingerprint(const FString& InFilename, FRevertTelemetry* const InTelemetry = nullptr)
 	{
 		FFileFingerprint Result;
 		Result.bExists = IFileManager::Get().FileExists(*InFilename);
@@ -214,6 +222,10 @@ namespace GitChangedAssetOperationsPrivate
 			Result.bHashValid = false;
 			return Result;
 		}
+		if (InTelemetry != nullptr)
+		{
+			InTelemetry->FingerprintBytes += Data.Num();
+		}
 		FSHA1 Sha;
 		Sha.Update(Data.GetData(), Data.Num());
 		Sha.Final();
@@ -223,7 +235,8 @@ namespace GitChangedAssetOperationsPrivate
 		return Result;
 	}
 
-	bool CreateBackups(const TArray<FString>& InFiles, TArray<FFileBackup>& OutBackups, FString& OutError)
+	bool CreateBackups(const TArray<FString>& InFiles, TArray<FFileBackup>& OutBackups, FString& OutError,
+		FRevertTelemetry* const InTelemetry = nullptr)
 	{
 		OutBackups.Reset();
 		for (const FString& Filename : InFiles)
@@ -241,6 +254,10 @@ namespace GitChangedAssetOperationsPrivate
 			{
 				OutError = FString::Printf(TEXT("Could not create a safety backup for '%s'. Existing safety backups were preserved."), *Filename);
 				return false;
+			}
+			if (InTelemetry != nullptr)
+			{
+				InTelemetry->BackupBytes += FMath::Max<int64>(0, IFileManager::Get().FileSize(*Filename));
 			}
 		}
 		return true;
@@ -310,9 +327,13 @@ namespace GitChangedAssetOperationsPrivate
 	}
 
 	bool ValidateCurrentStatus(const FString& InGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InExactPaths,
-		const TArray<FGitChangedAssetEntry>& InEntries, FString& OutError)
+		const TArray<FGitChangedAssetEntry>& InEntries, FString& OutError, FRevertTelemetry* const InTelemetry = nullptr)
 	{
 		TArray<uint8> StatusOutput;
+		if (InTelemetry != nullptr)
+		{
+			++InTelemetry->GitStatusCheckCount;
+		}
 		if (!GitSourceControlUtils::RunPathsStatusPorcelainV2(InGitBinary, InRepositoryRoot, InExactPaths, StatusOutput, OutError))
 		{
 			return false;
@@ -404,8 +425,9 @@ namespace GitChangedAssetOperationsPrivate
 	}
 
 	bool EnsureHeadLfsObjectsAvailable(FGitLfsLocalObjectStore& InObjectStore, const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InPinnedHead,
-		const TArray<FString>& InRestoreFiles, FString& OutError)
+		const TArray<FString>& InRestoreFiles, FString& OutError, FRevertTelemetry* const InTelemetry = nullptr)
 	{
+		TSet<FString> UniqueLfsObjectKeys;
 		for (const FString& Filename : InRestoreFiles)
 		{
 			FString Absolute;
@@ -416,6 +438,11 @@ namespace GitChangedAssetOperationsPrivate
 			}
 			const FString PointerFilename = FPaths::CreateTempFilename(FPlatformProcess::UserTempDir(), TEXT("git-changed-assets-lfs-"), TEXT(".tmp"));
 			ON_SCOPE_EXIT { IFileManager::Get().Delete(*PointerFilename, false, true, true); };
+			if (InTelemetry != nullptr)
+			{
+				++InTelemetry->LfsPointerReadCount;
+				++InTelemetry->GitBlobReadCount;
+			}
 			if (!GitSourceControlUtils::DumpRevisionBlobToFile(InGitBinary, InRepositoryRoot, InPinnedHead + TEXT(":") + Relative, PointerFilename, OutError))
 			{
 				return false;
@@ -431,20 +458,36 @@ namespace GitChangedAssetOperationsPrivate
 			{
 				continue;
 			}
+			if (InTelemetry != nullptr)
+			{
+				++InTelemetry->LfsPointerCount;
+				UniqueLfsObjectKeys.Add(Pointer.Oid + TEXT(":") + LexToString(Pointer.Size));
+				InTelemetry->UniqueLfsObjectCount = UniqueLfsObjectKeys.Num();
+			}
 			FString ObjectFilename;
 			EGitLfsLocalObjectLookupResult LookupResult = InObjectStore.FindObject(Pointer, ObjectFilename, OutError);
 			if (LookupResult == EGitLfsLocalObjectLookupResult::Error)
 			{
 				return false;
 			}
-			if (LookupResult == EGitLfsLocalObjectLookupResult::Found &&
-				GitSourceControlUtils::VerifyLocalLfsObject(InGitBinary, InRepositoryRoot, ObjectFilename, Pointer.Oid, Pointer.Size, OutError))
+			if (LookupResult == EGitLfsLocalObjectLookupResult::Found)
 			{
-				continue;
+				if (InTelemetry != nullptr)
+				{
+					++InTelemetry->LfsVerifyCount;
+				}
+				if (GitSourceControlUtils::VerifyLocalLfsObject(InGitBinary, InRepositoryRoot, ObjectFilename, Pointer.Oid, Pointer.Size, OutError))
+				{
+					continue;
+				}
 			}
 			if (LookupResult == EGitLfsLocalObjectLookupResult::Found)
 			{
 				return false;
+			}
+			if (InTelemetry != nullptr)
+			{
+				++InTelemetry->LfsFetchCount;
 			}
 			if (!GitSourceControlUtils::FetchLfsContentForRevision(InGitBinary, InRepositoryRoot, InPinnedHead, Relative, OutError))
 			{
@@ -452,8 +495,15 @@ namespace GitChangedAssetOperationsPrivate
 			}
 			InObjectStore.InvalidateCachedObject(Pointer);
 			LookupResult = InObjectStore.FindObject(Pointer, ObjectFilename, OutError);
-			if (LookupResult != EGitLfsLocalObjectLookupResult::Found ||
-				!GitSourceControlUtils::VerifyLocalLfsObject(InGitBinary, InRepositoryRoot, ObjectFilename, Pointer.Oid, Pointer.Size, OutError))
+			if (LookupResult != EGitLfsLocalObjectLookupResult::Found)
+			{
+				return false;
+			}
+			if (InTelemetry != nullptr)
+			{
+				++InTelemetry->LfsVerifyCount;
+			}
+			if (!GitSourceControlUtils::VerifyLocalLfsObject(InGitBinary, InRepositoryRoot, ObjectFilename, Pointer.Oid, Pointer.Size, OutError))
 			{
 				return false;
 			}
@@ -462,7 +512,7 @@ namespace GitChangedAssetOperationsPrivate
 	}
 
 	bool RestoreExactPathsFromPinnedHead(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InPinnedHead,
-		const TArray<FString>& InFiles, FString& OutError)
+		const TArray<FString>& InFiles, FString& OutError, FRevertTelemetry* const InTelemetry = nullptr)
 	{
 		if (InFiles.IsEmpty())
 		{
@@ -481,6 +531,10 @@ namespace GitChangedAssetOperationsPrivate
 			RelativeFiles.Add(MoveTemp(Relative));
 		}
 		FString Output;
+		if (InTelemetry != nullptr)
+		{
+			++InTelemetry->GitRestoreBatchCount;
+		}
 		// --literal-pathspecs is a global Git option and therefore must precede the
 		// restore verb. `--` alone does not disable []/* pathspec magic.
 		return GitSourceControlUtils::RunCommandInternalRaw(TEXT("--literal-pathspecs restore"), InGitBinary, InRepositoryRoot,
@@ -488,7 +542,7 @@ namespace GitChangedAssetOperationsPrivate
 	}
 
 	bool ResetExactIndexPathsToPinnedHead(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InPinnedHead,
-		const TArray<FString>& InFiles, FString& OutError)
+		const TArray<FString>& InFiles, FString& OutError, FRevertTelemetry* const InTelemetry = nullptr)
 	{
 		if (InFiles.IsEmpty())
 		{
@@ -507,6 +561,10 @@ namespace GitChangedAssetOperationsPrivate
 			RelativeFiles.Add(MoveTemp(Relative));
 		}
 		FString Output;
+		if (InTelemetry != nullptr)
+		{
+			++InTelemetry->GitResetBatchCount;
+		}
 		return GitSourceControlUtils::RunCommandInternalRaw(TEXT("--literal-pathspecs reset"), InGitBinary, InRepositoryRoot,
 			{ TEXT("-q"), InPinnedHead }, RelativeFiles, Output, OutError);
 	}
@@ -1093,6 +1151,11 @@ namespace GitChangedAssetOperations
 		const FGitChangedAssetRevertCallbacks& InCallbacks, FGitChangedAssetRevertResult& OutResult) const
 	{
 		OutResult = FGitChangedAssetRevertResult();
+		GitChangedAssetOperationsPrivate::FRevertTelemetry* const Telemetry = InCallbacks.Telemetry.Get();
+		if (Telemetry != nullptr)
+		{
+			Telemetry->SelectedEntryCount = InEntries.Num();
+		}
 		const double RevertStartSeconds = FPlatformTime::Seconds();
 		double PreflightSeconds = 0.0;
 		double ConfirmationSeconds = 0.0;
@@ -1103,9 +1166,16 @@ namespace GitChangedAssetOperations
 		double EditorFinalizeSeconds = 0.0;
 		ON_SCOPE_EXIT
 		{
-			UE_LOG(LogGitStandalone, Log, TEXT("Changed Assets Revert timing: success=%d reloadSuccess=%d preflight=%.3fs confirm=%.3fs lfs=%.3fs prepare=%.3fs loaderReset=%.3fs diskMutation=%.3fs editorFinalize=%.3fs total=%.3fs"),
-				OutResult.bSucceeded, OutResult.bReloadSucceeded, PreflightSeconds, ConfirmationSeconds, LfsSeconds, PrepareSeconds,
-				LoaderResetSeconds, DiskMutationSeconds, EditorFinalizeSeconds, FPlatformTime::Seconds() - RevertStartSeconds);
+			if (Telemetry != nullptr)
+			{
+				Telemetry->PreflightSeconds = PreflightSeconds;
+				Telemetry->ConfirmationSeconds = ConfirmationSeconds;
+				Telemetry->LfsSeconds = LfsSeconds;
+				Telemetry->PrepareSeconds = PrepareSeconds;
+				Telemetry->LoaderResetSeconds = LoaderResetSeconds;
+				Telemetry->DiskMutationSeconds = DiskMutationSeconds;
+				Telemetry->EditorFinalizeSeconds = EditorFinalizeSeconds;
+			}
 		};
 		if (GitBinary.IsEmpty() || RepositoryRoot.IsEmpty() || !GitChangedAssetOperationsPrivate::IsCompleteObjectId(InPinnedHead))
 		{
@@ -1136,8 +1206,12 @@ namespace GitChangedAssetOperations
 			OutResult.AddError(Error);
 			return false;
 		}
-		if (!GitChangedAssetOperationsPrivate::VerifyPinnedHead(GitBinary, RepositoryRoot, InPinnedHead, Error) ||
-			!GitChangedAssetOperationsPrivate::ValidateCurrentStatus(GitBinary, RepositoryRoot, Plan.AllFiles, InEntries, Error))
+		if (Telemetry != nullptr)
+		{
+			Telemetry->PlannedFileCount = Plan.AllFiles.Num();
+		}
+		if (!GitChangedAssetOperationsPrivate::VerifyPinnedHead(GitBinary, RepositoryRoot, InPinnedHead, Error, Telemetry) ||
+			!GitChangedAssetOperationsPrivate::ValidateCurrentStatus(GitBinary, RepositoryRoot, Plan.AllFiles, InEntries, Error, Telemetry))
 		{
 			OutResult.AddError(Error);
 			return false;
@@ -1146,7 +1220,7 @@ namespace GitChangedAssetOperations
 		TMap<FString, GitChangedAssetOperationsPrivate::FFileFingerprint> Fingerprints;
 		for (const FString& Filename : Plan.AllFiles)
 		{
-			const GitChangedAssetOperationsPrivate::FFileFingerprint Fingerprint = GitChangedAssetOperationsPrivate::CaptureFingerprint(Filename);
+			const GitChangedAssetOperationsPrivate::FFileFingerprint Fingerprint = GitChangedAssetOperationsPrivate::CaptureFingerprint(Filename, Telemetry);
 			if (!Fingerprint.bHashValid)
 			{
 				OutResult.AddError(FString::Printf(TEXT("Could not fingerprint '%s' before Changed Assets Revert."), *Filename));
@@ -1155,6 +1229,10 @@ namespace GitChangedAssetOperations
 			Fingerprints.Add(GitChangedAssetOperationsPrivate::NormalizePathKey(Filename), Fingerprint);
 		}
 		FGitIndexSnapshot IndexSnapshot;
+		if (Telemetry != nullptr)
+		{
+			++Telemetry->GitIndexSnapshotCount;
+		}
 		if (!GitSourceControlUtils::CaptureIndexEntriesForPaths(GitBinary, RepositoryRoot, Plan.AllFiles, IndexSnapshot, Error))
 		{
 			OutResult.AddError(Error);
@@ -1175,7 +1253,7 @@ namespace GitChangedAssetOperations
 		// before unlinking Editor packages so a network failure leaves the Editor intact.
 		const double LfsStartSeconds = FPlatformTime::Seconds();
 		FGitLfsLocalObjectStore LfsObjectStore(GitBinary, RepositoryRoot);
-		if (!GitChangedAssetOperationsPrivate::EnsureHeadLfsObjectsAvailable(LfsObjectStore, GitBinary, RepositoryRoot, InPinnedHead, Plan.RestoreFromHeadFiles, Error))
+		if (!GitChangedAssetOperationsPrivate::EnsureHeadLfsObjectsAvailable(LfsObjectStore, GitBinary, RepositoryRoot, InPinnedHead, Plan.RestoreFromHeadFiles, Error, Telemetry))
 		{
 			LfsSeconds = FPlatformTime::Seconds() - LfsStartSeconds;
 			OutResult.AddError(Error);
@@ -1216,7 +1294,7 @@ namespace GitChangedAssetOperations
 			InCallbacks.BeforeCommitPointForTesting();
 		}
 #endif
-		if (!GitChangedAssetOperationsPrivate::VerifyPinnedHead(GitBinary, RepositoryRoot, InPinnedHead, Error))
+		if (!GitChangedAssetOperationsPrivate::VerifyPinnedHead(GitBinary, RepositoryRoot, InPinnedHead, Error, Telemetry))
 		{
 			OutResult.AddError(Error);
 			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
@@ -1225,7 +1303,7 @@ namespace GitChangedAssetOperations
 		for (const FString& Filename : Plan.AllFiles)
 		{
 			const GitChangedAssetOperationsPrivate::FFileFingerprint* Expected = Fingerprints.Find(GitChangedAssetOperationsPrivate::NormalizePathKey(Filename));
-			if (Expected == nullptr || !(GitChangedAssetOperationsPrivate::CaptureFingerprint(Filename) == *Expected))
+			if (Expected == nullptr || !(GitChangedAssetOperationsPrivate::CaptureFingerprint(Filename, Telemetry) == *Expected))
 			{
 				OutResult.AddError(FString::Printf(TEXT("The selected file changed while Revert was pending: %s"), *Filename));
 				FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
@@ -1233,6 +1311,10 @@ namespace GitChangedAssetOperations
 			}
 		}
 		FGitIndexSnapshot CurrentIndexSnapshot;
+		if (Telemetry != nullptr)
+		{
+			++Telemetry->GitIndexSnapshotCount;
+		}
 		if (!GitSourceControlUtils::CaptureIndexEntriesForPaths(GitBinary, RepositoryRoot, Plan.AllFiles, CurrentIndexSnapshot, Error) ||
 			!GitChangedAssetOperationsPrivate::SnapshotsEqual(IndexSnapshot, CurrentIndexSnapshot))
 		{
@@ -1240,7 +1322,7 @@ namespace GitChangedAssetOperations
 			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
 			return false;
 		}
-		if (!GitChangedAssetOperationsPrivate::ValidateCurrentStatus(GitBinary, RepositoryRoot, Plan.AllFiles, InEntries, Error))
+		if (!GitChangedAssetOperationsPrivate::ValidateCurrentStatus(GitBinary, RepositoryRoot, Plan.AllFiles, InEntries, Error, Telemetry))
 		{
 			OutResult.AddError(Error);
 			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
@@ -1248,7 +1330,7 @@ namespace GitChangedAssetOperations
 		}
 
 		TArray<GitChangedAssetOperationsPrivate::FFileBackup> Backups;
-		if (!GitChangedAssetOperationsPrivate::CreateBackups(Plan.AllFiles, Backups, Error))
+		if (!GitChangedAssetOperationsPrivate::CreateBackups(Plan.AllFiles, Backups, Error, Telemetry))
 		{
 			OutResult.AddError(Error);
 			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
@@ -1271,6 +1353,10 @@ namespace GitChangedAssetOperations
 			TArray<FString> FailedBackups;
 			const bool bWorktreeRestored = GitChangedAssetOperationsPrivate::RestoreBackups(Backups, FailedBackups);
 			FString RestoreIndexError;
+			if (Telemetry != nullptr)
+			{
+				++Telemetry->GitIndexRollbackCount;
+			}
 			const bool bIndexRestored = GitSourceControlUtils::RestoreIndexEntries(GitBinary, RepositoryRoot, IndexSnapshot, RestoreIndexError);
 			OutResult.AddError(MutationError);
 			if (!bIndexRestored)
@@ -1298,13 +1384,13 @@ namespace GitChangedAssetOperations
 				: EGitChangedAssetMutationOutcome::RollbackFailed);
 		};
 
-		if (!GitChangedAssetOperationsPrivate::RestoreExactPathsFromPinnedHead(GitBinary, RepositoryRoot, InPinnedHead, Plan.RestoreFromHeadFiles, Error))
+		if (!GitChangedAssetOperationsPrivate::RestoreExactPathsFromPinnedHead(GitBinary, RepositoryRoot, InPinnedHead, Plan.RestoreFromHeadFiles, Error, Telemetry))
 		{
 			DiskMutationSeconds = FPlatformTime::Seconds() - DiskMutationStartSeconds;
 			RollBack(Error.IsEmpty() ? TEXT("Could not restore the selected tracked assets from the pinned HEAD.") : Error);
 			return false;
 		}
-		if (!GitChangedAssetOperationsPrivate::ResetExactIndexPathsToPinnedHead(GitBinary, RepositoryRoot, InPinnedHead, Plan.RemoveFromIndexFiles, Error))
+		if (!GitChangedAssetOperationsPrivate::ResetExactIndexPathsToPinnedHead(GitBinary, RepositoryRoot, InPinnedHead, Plan.RemoveFromIndexFiles, Error, Telemetry))
 		{
 			DiskMutationSeconds = FPlatformTime::Seconds() - DiskMutationStartSeconds;
 			RollBack(Error.IsEmpty() ? TEXT("Could not reset the exact Added or Renamed Git index paths to the pinned HEAD.") : Error);
@@ -1477,7 +1563,6 @@ namespace GitChangedAssetOperations
 		static_cast<void>(InEntries);
 		static_cast<void>(InAffectedFiles);
 		OutError.Reset();
-		const double FinishStartSeconds = FPlatformTime::Seconds();
 		if (!IsInGameThread())
 		{
 			OutError = TEXT("Changed Assets package finalization must run on the GameThread.");
@@ -1489,8 +1574,6 @@ namespace GitChangedAssetOperations
 		}
 		ON_SCOPE_EXIT
 		{
-			UE_LOG(LogGitStandalone, Log, TEXT("Changed Assets Revert editor finalize: outcome=%d reloadOwners=%d resetTargets=%d reloadTargets=%d elapsed=%.3fs"),
-				static_cast<int32>(InOutcome), OwnerPackageReloadCount, PackagesToResetLoaders.Num(), PackagesToReload.Num(), FPlatformTime::Seconds() - FinishStartSeconds);
 			PackagesToResetLoaders.Reset();
 			PackagesToReload.Reset();
 			ConfirmedClosureSignature.Reset();

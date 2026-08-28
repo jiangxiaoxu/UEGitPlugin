@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "GitChangedAssetOperations.h"
 #include "GitChangedAssetsMetadata.h"
 #include "GitChangedAssetsModel.h"
 
@@ -104,7 +105,9 @@ private:
 	void FailRefresh(uint64 CompletedGeneration, FString Error);
 	void ClearPendingRefreshWork();
 	void SetRefreshActivity(EGitChangedAssetsRefreshPhase InPhase, int32 InCompleted, int32 InTotal);
-	void CompleteRevert(bool bDiskMutationSucceeded, bool bEditorReloadSucceeded, FString ResultMessage);
+	void CompleteRevert(bool bDiskMutationSucceeded, bool bEditorReloadSucceeded, bool bCancelled, FString ResultMessage,
+		TSharedPtr<GitChangedAssetOperations::FGitChangedAssetRevertTelemetry, ESPMode::ThreadSafe> RevertTelemetry);
+	void EmitPendingRevertTelemetry(bool bPostRefreshSucceeded);
 	bool ConfirmRevert(const TArray<FGitChangedAssetEntry>& Entries, FString& OutError);
 
 	TOptional<FGitChangedAssetSnapshot> Snapshot;
@@ -114,7 +117,7 @@ private:
 	bool bRefreshing = false;
 	bool bReverting = false;
 	bool bPreserveLastErrorForRefresh = false;
-	double PostRevertStatusRefreshStartSeconds = 0.0;
+	TSharedPtr<GitChangedAssetOperations::FGitChangedAssetRevertTelemetry, ESPMode::ThreadSafe> PendingRevertTelemetry;
 	TAtomic<bool> bShuttingDown = false;
 	EGitChangedAssetsRefreshPhase RefreshPhase = EGitChangedAssetsRefreshPhase::Idle;
 	int32 RefreshProgressCompleted = 0;
