@@ -7,6 +7,7 @@
 ## 当前实现
 
 - `FGitSourceControlModule` 注册 standalone Content Browser UI 和 `GitChangedAssets` Nomad tab. Startup 异步且恰好执行一次 Git capability gate, 发现 Git executable 并验证版本 2.53.0+, 但不探测 repository; Content Browser 资产菜单始终注册以保持 discoverability, `Pending`/`Unavailable` 时点击只显示 actionable diagnostic 且不执行 Git, `Available` 时才执行 action. status bar 和 panel 在门禁未通过时只显示 actionable diagnostic 并禁止交互. Git Changes 用户入口仅为 Level Editor 右下角替换默认 Source Control 控件的 status bar 按钮, layout restore 或 programmatic tab invocation 仍受 gate 约束. 模块仍不创建 provider、`DirectoryWatcher`、state cache 或后台 status polling.
+- `UGitLocalSourceControlOperation` 是 AngelScript-only `UObject`, 不暴露 Blueprint, 不提供 public `Tick`. module-owned `FGCObject` registry 保活所有 non-terminal operation; ticker 在 module startup 注册, module shutdown 移除, 自动 pump Game Thread 且 idle 时快速返回. `OnProgress` 和 `OnCompleted` 是事件式通知, completion 在 package reload/recovery 后恰好一次; reload failure 进入 `Failed` phase 并报告 partial-disk 状态. `Cancel` 与 phase/result readback 保持显式 API.
 - `GitLocalSourceControl` 和菜单操作在 startup gate `Available` 后解析 nearest repository root. 每个 job 使用 worker 和 Game Thread completion, 临时 repository context 在 job 结束后释放. 当前 Editor session 不重探 Git; 安装或升级后需重启.
 - `GitSourceControlUtils` 负责 exact path status preflight, repository-wide porcelain-v2 snapshot, fixed-HEAD history, exact blob 和 LFS materialization. Changed Assets status 仅通过窄接口触发一次全仓查询, 空路径的 legacy 操作不会升级为 repository-wide scan.
 - `FGitChangedAssetsMetadataResolver` 以磁盘 package header 作为现存 changed `.uasset` 的名称、类型和 object path 真值, Asset Registry 只用于 owner/DataLayer topology; `FGitChangedAssetsController` 负责 generation, 异步 enrich, refresh phase/progress, 过滤结果刷新和 revert 完成后的状态重查. WorldDataLayers topology 继续使用 Asset Registry 和既有 owner-resolution 路径.
@@ -46,7 +47,7 @@ Changed Assets 在显式打开或 Refresh 时执行一次 `git status --porcelai
 
 ## Editor automation API
 
-AngelScript 和 Blueprint automation 通过 typed `GitLocalSourceControl` API 控制 legacy History/Diff/Restore/Discard 能力. `StartLoadHistory(AssetObjectPath, EGitLocalSourceControlHistoryMode)` 显式选择 `CurrentPath` 或 `ExactRenames`; LFS fetch 和 revision Restore 始终以 `ExactRenames` 解析 historical path. 该 public API 不提供 Changed Assets status refresh 或 untracked delete; Changed Assets tab 保持 private/providerless. Operation handle 仅在 Game Thread 被 Tick, Cancel 和 readback, Git/LFS I/O 在 worker. 输入为 asset object path, 不暴露 raw Git argv.
+AngelScript 通过 typed `GitLocalSourceControl` API 控制 legacy History/Diff/Restore/Discard 能力; 该 surface 不暴露给 Blueprint. `StartLoadHistory(AssetObjectPath, EGitLocalSourceControlHistoryMode)` 显式选择 `CurrentPath` 或 `ExactRenames`; LFS fetch 和 revision Restore 始终以 `ExactRenames` 解析 historical path. 该 public API 不提供 Changed Assets status refresh 或 untracked delete; Changed Assets tab 保持 private/providerless. operation 由 module-owned `FGCObject` registry 保活并由固定 module ticker 自动 pump, 不提供 public `Tick`; AS workflow 绑定 `OnProgress`/`OnCompleted`, 以 `Cancel`, `IsTerminal`, `GetPhase` 和 `GetResult` 控制及 readback. `OnCompleted` 只在 package reload/recovery 后派发一次. `GetProviderInfo(AssetObjectPath)` 按资产路径解析 nearest repository. 输入为 asset object path, 不暴露 raw Git argv.
 
 ## 构建与测试入口
 
@@ -61,7 +62,7 @@ npm run test:unreal:automation -- Cthulhu.GitSourceControl.ChangedAssets.RevertT
 npm run as:diagnostics
 ```
 
-测试使用 isolated temporary Git repository 和 local bare LFS remote, 覆盖 fixed-HEAD history、exact rename、LFS hit/miss、standalone Diff selection、Restore/Discard safety、index invariant、provider absence、startup Git capability gate 恰好一次、Pending/Unavailable UI fail-closed、Content Browser action execution gate 以及 asset lifecycle 中除 startup gate 外的 zero Git process. Changed Assets 专项还必须验证 refresh phase 从 status 持续到 current/HEAD/owner metadata 完成, phase 期间 Refresh/Revert disabled, package-header truth 不触发全局 Asset Registry refresh, activity-only update 保持 row identity, WorldDataLayers topology 继续遵循 Asset Registry/既有 owner-resolution 路径, 以及无 DirectoryWatcher/background polling. 测试需要 Git 和 Git LFS, 不连接 external server.
+测试使用 isolated temporary Git repository 和 local bare LFS remote, 覆盖 fixed-HEAD history、exact rename、LFS hit/miss、standalone Diff selection、Restore/Discard safety、index invariant、provider absence、startup Git capability gate 恰好一次、Pending/Unavailable UI fail-closed、Content Browser action execution gate 以及 asset lifecycle 中除 startup gate 外的 zero Git process. AS operation manager 还必须覆盖 FGCObject 保活、固定 ticker 的 startup/shutdown 生命周期和 idle fast-return、无 public `Tick`、event-driven workflow、progress/completion 单次派发、cancel/terminal readback、reload/recovery completion 顺序以及 reload failure 的 `Failed`/partial-disk diagnostic. Changed Assets 专项还必须验证 refresh phase 从 status 持续到 current/HEAD/owner metadata 完成, phase 期间 Refresh/Revert disabled, package-header truth 不触发全局 Asset Registry refresh, activity-only update 保持 row identity, WorldDataLayers topology 继续遵循 Asset Registry/既有 owner-resolution 路径, 以及无 DirectoryWatcher/background polling. 测试需要 Git 和 Git LFS, 不连接 external server.
 
 ## 已知限制
 
@@ -72,6 +73,7 @@ npm run as:diagnostics
 - Git 缺失或低于 2.53.0 时 startup gate 为 `Unavailable`, 资产右键菜单仍保持可见但点击只显示诊断, 面板入口只显示诊断; 安装/升级后不重启不会重新探测.
 - Git LFS 缺失、低于 3.7.1 或瞬时检查失败时当前 LFS 操作失败且不缓存失败结果, 下一次显式 LFS 操作重试, 无需重启 Editor; 普通 Changed Assets 不受影响.
 - 插件不提供 precompiled binary, 构建需要项目 Unreal Editor target 和可用 C++ toolchain。
+- AngelScript operation 不提供 Blueprint 节点或 public `Tick`; `Task_GitAssetRestoreViaApi` 和 `Task_GitAssetHistoryPerformance` 两个 workflow 必须使用 event-driven progress/completion. ticker 固定保留到 module shutdown, idle 时不执行 operation work.
 
 ## Attribution and license
 

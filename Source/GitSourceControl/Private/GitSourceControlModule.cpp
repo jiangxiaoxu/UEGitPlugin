@@ -43,6 +43,7 @@ namespace GitSourceControlModulePrivate
 void FGitSourceControlModule::StartupModule()
 {
 	UE_LOG(LogGitStandalone, Display, TEXT("GitSourceControl standalone module starting."));
+	GitLocalSourceControl::StartupOperations();
 #if WITH_DEV_AUTOMATION_TESTS
 	if (FApp::IsUnattended() || IsRunningCommandlet())
 	{

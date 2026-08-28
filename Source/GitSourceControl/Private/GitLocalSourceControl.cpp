@@ -3,8 +3,10 @@
 #include "GitLocalSourceControl.h"
 
 #include "Async/Async.h"
+#include "Containers/Ticker.h"
 #include "GitSourceControlAssetOperations.h"
 #include "GitSourceControlRevision.h"
+#include "GitStandaloneLog.h"
 #include "GitStandaloneHistory.h"
 #include "GitSourceControlUtils.h"
 #include "HAL/CriticalSection.h"
@@ -17,9 +19,17 @@
 #include "PackageTools.h"
 #include "UObject/Package.h"
 #include "UObject/SoftObjectPath.h"
+#include "UObject/GCObject.h"
 
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 #include "Misc/AutomationTest.h"
+#endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+namespace GitLocalSourceControlPrivate
+{
+	class FBlockedReadOnlyOperationGate;
+}
 #endif
 
 struct FGitLocalSourceControlOperationState final
@@ -41,13 +51,56 @@ struct FGitLocalSourceControlOperationState final
 	EGitLocalSourceControlOperationPhase Phase = EGitLocalSourceControlOperationPhase::Queued;
 	FGitLocalSourceControlOperationResult Result;
 	TArray<FString> ReloadFilenames;
+	TArray<EGitLocalSourceControlOperationPhase> PendingProgressPhases;
+	TArray<FString> DeferredCleanupAssetObjectPaths;
 	bool bCancellationAllowed = true;
+	bool bCanScheduleDeferredDiscard = false;
+	bool bDiskMutationCommitted = false;
+	bool bInternalDeferredCleanup = false;
 	bool bWorkerFinished = false;
+
+#if WITH_DEV_AUTOMATION_TESTS
+	TSharedPtr<GitLocalSourceControlPrivate::FBlockedReadOnlyOperationGate, ESPMode::ThreadSafe> FinalPublicationGate;
+#endif
 };
 
 namespace GitLocalSourceControlPrivate
 {
-	bool ReloadPreparedPackages(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState);
+	bool ReloadPreparedPackages(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState, TArray<FString>* OutErrors = nullptr);
+	bool RegisterManagedOperation(UGitLocalSourceControlOperation* InOperation, bool bAllowDuringShutdown = false);
+	UGitLocalSourceControlOperation* StartDiscardTrackedInternal(const TArray<FString>& AssetObjectPaths, bool bAllowDuringShutdown, bool bInternalDeferredCleanup);
+
+#if WITH_DEV_AUTOMATION_TESTS
+	TAtomic<bool> GForcePreparedPackageReloadFailureForTesting = false;
+	TAtomic<bool> GForceRestoreWorktreeRollbackForTesting = false;
+
+	void SetForcePreparedPackageReloadFailureForTesting(const bool bEnabled)
+	{
+		GForcePreparedPackageReloadFailureForTesting.Store(bEnabled);
+	}
+
+	void SetForceRestoreWorktreeRollbackForTesting(const bool bEnabled)
+	{
+		GForceRestoreWorktreeRollbackForTesting.Store(bEnabled);
+	}
+
+	FString GLastDeferredCleanupDiagnostic;
+	TAtomic<int32> GDeferredCleanupLaunchCount = 0;
+
+	class FBlockedReadOnlyOperationGate final
+	{
+	public:
+		FEventRef WorkerReachedFinalPublication{ EEventMode::ManualReset };
+		FEventRef ReleaseFinalPublication{ EEventMode::ManualReset };
+	};
+
+	TSharedPtr<FBlockedReadOnlyOperationGate, ESPMode::ThreadSafe> GBlockedReadOnlyOperationGate;
+
+	void SetLastDeferredCleanupDiagnostic(FString InDiagnostic)
+	{
+		GLastDeferredCleanupDiagnostic = MoveTemp(InDiagnostic);
+	}
+#endif
 
 	class FOperationRegistry final
 	{
@@ -63,10 +116,10 @@ namespace GitLocalSourceControlPrivate
 			FPlatformProcess::ReturnSynchEventToPool(AllWorkersFinished);
 		}
 
-		bool TryBegin(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState)
+		bool TryBegin(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState, const bool bAllowDuringShutdown = false)
 		{
 			FScopeLock Lock(&Mutex);
-			if (!bAcceptingNewWorkers)
+			if (!bAcceptingNewWorkers && !bAllowDuringShutdown)
 			{
 				InState->CancellationContext->Cancel();
 				return false;
@@ -78,30 +131,15 @@ namespace GitLocalSourceControlPrivate
 
 		void End(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState)
 		{
-			bool bNeedsReload = false;
-			{
-				FScopeLock StateLock(&InState->Mutex);
-				bNeedsReload = !InState->ReloadFilenames.IsEmpty();
-			}
 			FScopeLock Lock(&Mutex);
 			ActiveStates.RemoveSingleSwap(InState, EAllowShrinking::No);
-			if (bNeedsReload)
-			{
-				if (!PendingReloadStates.ContainsByPredicate([&InState](const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& Candidate)
-				{
-					return &Candidate.Get() == &InState.Get();
-				}))
-				{
-					PendingReloadStates.Add(InState);
-				}
-			}
 			if (ActiveStates.IsEmpty())
 			{
 				AllWorkersFinished->Trigger();
 			}
 		}
 
-		void Shutdown()
+		void BeginShutdown()
 		{
 			check(IsInGameThread());
 			TArray<TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>> StatesToCancel;
@@ -115,30 +153,14 @@ namespace GitLocalSourceControlPrivate
 				State->RequestShutdownCancellationIfAllowed();
 			}
 
-			while (!AllWorkersFinished->Wait(10))
-			{}
-
-			TArray<TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>> StatesToReload;
-			{
-				FScopeLock Lock(&Mutex);
-				StatesToReload = PendingReloadStates;
-				PendingReloadStates.Reset();
-			}
-			for (const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& State : StatesToReload)
-			{
-				const bool bReloadSucceeded = ReloadPreparedPackages(State);
-				FScopeLock StateLock(&State->Mutex);
-				State->Result.bReloadSucceeded = bReloadSucceeded;
-			}
+			WaitForAllWorkers();
 		}
 
-		void CompleteReload(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState)
+		void WaitForAllWorkers()
 		{
-			FScopeLock Lock(&Mutex);
-			PendingReloadStates.RemoveAllSwap([&InState](const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& Candidate)
-			{
-				return &Candidate.Get() == &InState.Get();
-			}, EAllowShrinking::No);
+			check(IsInGameThread());
+			while (!AllWorkersFinished->Wait(10))
+			{}
 		}
 
 	private:
@@ -146,7 +168,6 @@ namespace GitLocalSourceControlPrivate
 		FEvent* AllWorkersFinished = nullptr;
 		bool bAcceptingNewWorkers = true;
 		TArray<TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>> ActiveStates;
-		TArray<TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>> PendingReloadStates;
 	};
 
 	FOperationRegistry& GetOperationRegistry()
@@ -179,18 +200,6 @@ namespace GitLocalSourceControlPrivate
 			InObjectPath = InObjectPath.Mid(FirstQuote + 1, LastQuote - FirstQuote - 1);
 		}
 		return InObjectPath;
-	}
-
-	FGitLocalSourceControlProviderInfo GetProviderInfoOnGameThread()
-	{
-		check(IsInGameThread());
-		FGitLocalSourceControlProviderInfo Info;
-		Info.bAvailable = GitSourceControlUtils::ResolveStandaloneRepositoryForFile(FPaths::ProjectDir(), Info.GitBinary, Info.RepositoryRoot, Info.Error);
-		if (!Info.bAvailable && Info.Error.IsEmpty())
-		{
-			Info.Error = TEXT("Could not resolve a local Git executable and repository root.");
-		}
-		return Info;
 	}
 
 	bool ResolveTarget(const FString& InAssetObjectPath, const ETargetAccess InAccess, FResolvedTarget& OutTarget, FString& OutError)
@@ -282,6 +291,28 @@ namespace GitLocalSourceControlPrivate
 			InOutTarget.GitBinary, InOutTarget.RepositoryRoot, OutError);
 	}
 
+	FGitLocalSourceControlProviderInfo GetProviderInfoOnGameThread(const FString& InAssetObjectPath)
+	{
+		check(IsInGameThread());
+		FGitLocalSourceControlProviderInfo Info;
+		FResolvedTarget Target;
+		if (!ResolveTarget(InAssetObjectPath, ETargetAccess::ReadOnly, Target, Info.Error))
+		{
+			return Info;
+		}
+		Info.bAvailable = ResolveRepositoryForTarget(Target, Info.Error);
+		if (Info.bAvailable)
+		{
+			Info.GitBinary = MoveTemp(Target.GitBinary);
+			Info.RepositoryRoot = MoveTemp(Target.RepositoryRoot);
+		}
+		else if (Info.Error.IsEmpty())
+		{
+			Info.Error = TEXT("Could not resolve a local Git executable and repository root for the asset.");
+		}
+		return Info;
+	}
+
 	bool ResolveRepositoriesForTargets(TArray<FResolvedTarget>& InOutTargets, FString& OutError)
 	{
 		OutError.Reset();
@@ -309,9 +340,21 @@ namespace GitLocalSourceControlPrivate
 		return true;
 	}
 
-	bool ReloadPreparedPackages(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState)
+	bool ReloadPreparedPackages(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState, TArray<FString>* OutErrors)
 	{
 		check(IsInGameThread());
+		bool bReloadSucceeded = true;
+#if WITH_DEV_AUTOMATION_TESTS
+		if (GForcePreparedPackageReloadFailureForTesting.Load())
+		{
+			bReloadSucceeded = false;
+			if (OutErrors != nullptr)
+			{
+				OutErrors->Add(TEXT("Automation test seam forced prepared package reload failure."));
+			}
+		}
+#endif
+
 		TArray<FString> Filenames;
 		{
 			FScopeLock Lock(&InState->Mutex);
@@ -322,15 +365,24 @@ namespace GitLocalSourceControlPrivate
 			FString PackageName;
 			if (!FPackageName::TryConvertFilenameToLongPackageName(Filename, PackageName))
 			{
-				return false;
+				bReloadSucceeded = false;
+				if (OutErrors != nullptr)
+				{
+					OutErrors->Add(FString::Printf(TEXT("Could not resolve the reloaded package name for %s."), *Filename));
+				}
+				continue;
 			}
 			UPackage* Package = LoadPackage(nullptr, *PackageName, LOAD_None);
 			if (Package == nullptr || Package->FindAssetInPackage() == nullptr)
 			{
-				return false;
+				bReloadSucceeded = false;
+				if (OutErrors != nullptr)
+				{
+					OutErrors->Add(FString::Printf(TEXT("Could not reload the Editor package %s."), *PackageName));
+				}
 			}
 		}
-		return true;
+		return bReloadSucceeded;
 	}
 
 	bool PrepareLoadedPackagesForMutation(const TArray<FResolvedTarget>& InTargets,
@@ -377,7 +429,11 @@ namespace GitLocalSourceControlPrivate
 		const EGitLocalSourceControlOperationPhase InPhase, const bool bInCancellationAllowed)
 	{
 		FScopeLock Lock(&InState->Mutex);
-		InState->Phase = InPhase;
+		if (InState->Phase != InPhase)
+		{
+			InState->Phase = InPhase;
+			InState->PendingProgressPhases.Add(InPhase);
+		}
 		InState->bCancellationAllowed = bInCancellationAllowed;
 	}
 
@@ -388,31 +444,45 @@ namespace GitLocalSourceControlPrivate
 		{
 			return false;
 		}
-		InState->Phase = EGitLocalSourceControlOperationPhase::Mutating;
+		if (InState->Phase != EGitLocalSourceControlOperationPhase::Mutating)
+		{
+			InState->Phase = EGitLocalSourceControlOperationPhase::Mutating;
+			InState->PendingProgressPhases.Add(EGitLocalSourceControlOperationPhase::Mutating);
+		}
 		InState->bCancellationAllowed = false;
 		return true;
 	}
 
-	bool WasCancelled(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState)
+	void MarkDiskMutationCommitted(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState)
 	{
-		return InState->CancellationContext->IsCancellationRequested();
+		FScopeLock Lock(&InState->Mutex);
+		InState->bDiskMutationCommitted = true;
 	}
 
 	void FinishWorker(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState, FGitLocalSourceControlOperationResult&& InResult)
 	{
-		const bool bCancelled = InResult.bCancelled || WasCancelled(InState);
-		InResult.bCancelled = bCancelled;
-		if (bCancelled)
+#if WITH_DEV_AUTOMATION_TESTS
+		TSharedPtr<FBlockedReadOnlyOperationGate, ESPMode::ThreadSafe> FinalPublicationGate;
 		{
-			InResult.bSucceeded = false;
+			FScopeLock Lock(&InState->Mutex);
+			FinalPublicationGate = InState->FinalPublicationGate;
 		}
+		if (FinalPublicationGate.IsValid())
+		{
+			FinalPublicationGate->WorkerReachedFinalPublication->Trigger();
+			FinalPublicationGate->ReleaseFinalPublication->Wait();
+		}
+#endif
 
 		{
 			FScopeLock Lock(&InState->Mutex);
+			const bool bCancelled = InResult.bCancelled || InState->CancellationContext->IsCancellationRequested();
+			InResult.bCancelled = bCancelled;
+			if (bCancelled)
+			{
+				InResult.bSucceeded = false;
+			}
 			InState->Result = MoveTemp(InResult);
-			InState->Phase = bCancelled
-				? EGitLocalSourceControlOperationPhase::Cancelled
-				: InState->Result.bSucceeded ? EGitLocalSourceControlOperationPhase::Completed : EGitLocalSourceControlOperationPhase::Failed;
 			InState->bCancellationAllowed = false;
 			InState->bWorkerFinished = true;
 		}
@@ -487,23 +557,24 @@ namespace GitLocalSourceControlPrivate
 		return true;
 	}
 
-	UGitLocalSourceControlOperation* MakeOperation(TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe> InState)
+	UGitLocalSourceControlOperation* MakeOperation(TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe> InState, const bool bAllowDuringShutdown = false)
 	{
 		check(IsInGameThread());
 		UGitLocalSourceControlOperation* Operation = NewObject<UGitLocalSourceControlOperation>(GetTransientPackage());
 		Operation->Initialize(MoveTemp(InState));
-		return Operation;
+		return RegisterManagedOperation(Operation, bAllowDuringShutdown) ? Operation : nullptr;
 	}
 
-	UGitLocalSourceControlOperation* MakeFailedOperation(const FString& InError)
+	UGitLocalSourceControlOperation* MakeFailedOperation(const FString& InError, const bool bAllowDuringShutdown = false,
+		const bool bInternalDeferredCleanup = false, const TArray<FString>& DeferredCleanupAssetObjectPaths = {})
 	{
 		TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe> State = MakeShared<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>();
+		State->bInternalDeferredCleanup = bInternalDeferredCleanup;
+		State->DeferredCleanupAssetObjectPaths = DeferredCleanupAssetObjectPaths;
 		FGitLocalSourceControlOperationResult Result;
 		Result.Errors.Add(InError);
 		FinishWorker(State, MoveTemp(Result));
-		UGitLocalSourceControlOperation* Operation = MakeOperation(State);
-		Operation->Tick();
-		return Operation;
+		return MakeOperation(State, bAllowDuringShutdown);
 	}
 
 	GitSourceControlAssetOperations::FGitAssetOperationCallbacks MakePreauthorizedClosedAssetCallbacks(
@@ -529,7 +600,158 @@ namespace GitLocalSourceControlPrivate
 			SetWorkerPhase(InState, EGitLocalSourceControlOperationPhase::Reloading, false);
 			return true;
 		};
+#if WITH_DEV_AUTOMATION_TESTS
+		Callbacks.AllowWorktreeReplaceForTesting = []()
+		{
+			return !GForceRestoreWorktreeRollbackForTesting.Load();
+		};
+#endif
 		return Callbacks;
+	}
+
+	class FOperationManager final : public FGCObject
+	{
+	public:
+		void Startup()
+		{
+			check(IsInGameThread());
+			check(!bShuttingDown);
+			if (!TickerHandle.IsValid())
+			{
+				TickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+					FTickerDelegate::CreateRaw(this, &FOperationManager::Tick), 0.0f);
+			}
+		}
+
+		bool Register(UGitLocalSourceControlOperation* InOperation, const bool bAllowDuringShutdown)
+		{
+			check(IsInGameThread());
+			check(InOperation != nullptr);
+			if ((bShuttingDown && !bAllowDuringShutdown) || (!TickerHandle.IsValid() && !bAllowDuringShutdown))
+			{
+				return false;
+			}
+			ManagedOperations.Add(InOperation);
+			return true;
+		}
+
+		void PumpOperations(const bool bBroadcastNotifications, const bool bAllowShutdownCleanup)
+		{
+			check(IsInGameThread());
+			TArray<TObjectPtr<UGitLocalSourceControlOperation>> Snapshot;
+			TArray<TObjectPtr<UGitLocalSourceControlOperation>> DeferredRemovals;
+			Snapshot.Reserve(ManagedOperations.Num());
+			DeferredRemovals.Reserve(ManagedOperations.Num());
+			for (const TObjectPtr<UGitLocalSourceControlOperation>& Operation : ManagedOperations)
+			{
+				Snapshot.Add(Operation);
+			}
+			for (UGitLocalSourceControlOperation* Operation : Snapshot)
+			{
+				if (Operation != nullptr && ManagedOperations.Contains(Operation))
+				{
+					Operation->PumpOnGameThread(bBroadcastNotifications, bAllowShutdownCleanup);
+				}
+				if (Operation == nullptr || Operation->IsTerminal())
+				{
+					DeferredRemovals.Add(Operation);
+				}
+			}
+			for (const TObjectPtr<UGitLocalSourceControlOperation>& Operation : DeferredRemovals)
+			{
+				ManagedOperations.Remove(Operation);
+			}
+		}
+
+		void Shutdown()
+		{
+			check(IsInGameThread());
+			bShuttingDown = true;
+			StopTicker();
+			while (!ManagedOperations.IsEmpty())
+			{
+				GetOperationRegistry().WaitForAllWorkers();
+				PumpOperations(false, true);
+			}
+		}
+
+#if WITH_DEV_AUTOMATION_TESTS
+		void PumpForTesting()
+		{
+			PumpOperations(true, false);
+		}
+
+		bool DrainForTesting()
+		{
+			check(IsInGameThread());
+			const bool bTickerWasRegistered = TickerHandle.IsValid();
+			StopTicker();
+			while (!ManagedOperations.IsEmpty())
+			{
+				GetOperationRegistry().WaitForAllWorkers();
+				PumpOperations(false, true);
+			}
+			Startup();
+			return bTickerWasRegistered && TickerHandle.IsValid();
+		}
+#endif
+
+		int32 GetManagedOperationCount() const
+		{
+			check(IsInGameThread());
+			return ManagedOperations.Num();
+		}
+
+		bool HasTicker() const
+		{
+			check(IsInGameThread());
+			return TickerHandle.IsValid();
+		}
+
+		virtual void AddReferencedObjects(FReferenceCollector& Collector) override
+		{
+			Collector.AddReferencedObjects(ManagedOperations);
+		}
+
+		virtual FString GetReferencerName() const override
+		{
+			return TEXT("GitLocalSourceControlOperationManager");
+		}
+
+	private:
+		bool Tick(float DeltaTime)
+		{
+			static_cast<void>(DeltaTime);
+			if (!ManagedOperations.IsEmpty())
+			{
+				PumpOperations(true, false);
+			}
+			return true;
+		}
+
+		void StopTicker()
+		{
+			if (TickerHandle.IsValid())
+			{
+				FTSTicker::GetCoreTicker().RemoveTicker(TickerHandle);
+				TickerHandle.Reset();
+			}
+		}
+
+		TSet<TObjectPtr<UGitLocalSourceControlOperation>> ManagedOperations;
+		FTSTicker::FDelegateHandle TickerHandle;
+		bool bShuttingDown = false;
+	};
+
+	FOperationManager& GetOperationManager()
+	{
+		static FOperationManager Manager;
+		return Manager;
+	}
+
+	bool RegisterManagedOperation(UGitLocalSourceControlOperation* InOperation, const bool bAllowDuringShutdown)
+	{
+		return GetOperationManager().Register(InOperation, bAllowDuringShutdown);
 	}
 }
 
@@ -539,7 +761,7 @@ void UGitLocalSourceControlOperation::Initialize(TSharedRef<FGitLocalSourceContr
 	State = MoveTemp(InState);
 }
 
-void UGitLocalSourceControlOperation::Tick()
+void UGitLocalSourceControlOperation::PumpOnGameThread(const bool bBroadcastNotifications, const bool bAllowShutdownCleanup)
 {
 	check(IsInGameThread());
 	if (!State.IsValid() || bTerminal)
@@ -547,27 +769,116 @@ void UGitLocalSourceControlOperation::Tick()
 		return;
 	}
 
+	TArray<EGitLocalSourceControlOperationPhase> ProgressPhases;
+	bool bWorkerFinished = false;
+	bool bDiskMutationCommitted = false;
 	bool bNeedsReload = false;
 	{
 		FScopeLock Lock(&State->Mutex);
-		if (!State->bWorkerFinished)
+		ProgressPhases = MoveTemp(State->PendingProgressPhases);
+		bWorkerFinished = State->bWorkerFinished;
+		if (bWorkerFinished)
 		{
-			return;
+			Result = State->Result;
+			bDiskMutationCommitted = State->bDiskMutationCommitted;
 		}
-		Result = State->Result;
 		bNeedsReload = !State->ReloadFilenames.IsEmpty();
 	}
+	for (const EGitLocalSourceControlOperationPhase ProgressPhase : ProgressPhases)
+	{
+		Phase = ProgressPhase;
+		if (bBroadcastNotifications)
+		{
+			OnProgress.Broadcast(ProgressPhase);
+		}
+	}
+	if (!bWorkerFinished)
+	{
+		return;
+	}
+
 	if (bNeedsReload)
 	{
-		Result.bReloadSucceeded = GitLocalSourceControlPrivate::ReloadPreparedPackages(State.ToSharedRef());
-		GitLocalSourceControlPrivate::GetOperationRegistry().CompleteReload(State.ToSharedRef());
+		TArray<FString> ReloadErrors;
+		Result.bReloadSucceeded = GitLocalSourceControlPrivate::ReloadPreparedPackages(State.ToSharedRef(), &ReloadErrors);
+		if (!Result.bReloadSucceeded)
+		{
+			Result.Errors.Append(MoveTemp(ReloadErrors));
+			if (Result.bSucceeded)
+			{
+				Result.Errors.Add(TEXT("Git changed the asset file on disk, but the Editor package reload failed. The operation is incomplete; reload the asset or Editor before further edits."));
+			}
+			else
+			{
+				Result.Errors.Add(TEXT("The Editor package recovery reload failed after the Git operation stopped. Reload the asset or Editor before further edits."));
+			}
+			Result.bSucceeded = false;
+		}
+	}
+
+	const EGitLocalSourceControlOperationPhase TerminalPhase = !Result.bReloadSucceeded
+		? EGitLocalSourceControlOperationPhase::Failed
+		: Result.bCancelled ? EGitLocalSourceControlOperationPhase::Cancelled
+		: Result.bSucceeded ? EGitLocalSourceControlOperationPhase::Completed : EGitLocalSourceControlOperationPhase::Failed;
+	bool bInternalDeferredCleanup = false;
+	TArray<FString> DeferredCleanupAssetObjectPaths;
+	{
+		FScopeLock Lock(&State->Mutex);
+		State->Result = Result;
+		State->Phase = TerminalPhase;
+		bInternalDeferredCleanup = State->bInternalDeferredCleanup;
+		DeferredCleanupAssetObjectPaths = State->DeferredCleanupAssetObjectPaths;
+	}
+	Phase = TerminalPhase;
+	bTerminal = true;
+	if (bInternalDeferredCleanup && (!Result.bSucceeded || !Result.bReloadSucceeded))
+	{
+		const FString Diagnostic = FString::Printf(
+			TEXT("Deferred Git cleanup failed for asset paths [%s]. succeeded=%s reload_succeeded=%s errors=[%s]. The original restore may remain partially applied; inspect these assets before further edits."),
+			*FString::Join(DeferredCleanupAssetObjectPaths, TEXT(", ")),
+			Result.bSucceeded ? TEXT("true") : TEXT("false"),
+			Result.bReloadSucceeded ? TEXT("true") : TEXT("false"),
+			*FString::Join(Result.Errors, TEXT(" | ")));
+		UE_LOG(LogGitStandalone, Error, TEXT("%s"), *Diagnostic);
+#if WITH_DEV_AUTOMATION_TESTS
+		GitLocalSourceControlPrivate::SetLastDeferredCleanupDiagnostic(Diagnostic);
+#endif
+	}
+	if (bBroadcastNotifications)
+	{
+		OnProgress.Broadcast(TerminalPhase);
+		OnCompleted.Broadcast(Result);
+	}
+
+	if (!DeferredDiscardObjectPaths.IsEmpty())
+	{
+		TArray<FString> ObjectPaths = MoveTemp(DeferredDiscardObjectPaths);
+		if (bDiskMutationCommitted)
+		{
+#if WITH_DEV_AUTOMATION_TESTS
+			++GitLocalSourceControlPrivate::GDeferredCleanupLaunchCount;
+#endif
+			GitLocalSourceControlPrivate::StartDiscardTrackedInternal(ObjectPaths, bAllowShutdownCleanup, true);
+		}
+	}
+}
+
+bool UGitLocalSourceControlOperation::ScheduleDiscardTrackedAfterCompletion(const TArray<FString>& AssetObjectPaths)
+{
+	check(IsInGameThread());
+	if (!State.IsValid() || bTerminal || AssetObjectPaths.IsEmpty() || !DeferredDiscardObjectPaths.IsEmpty())
+	{
+		return false;
 	}
 	{
 		FScopeLock Lock(&State->Mutex);
-		State->Result.bReloadSucceeded = Result.bReloadSucceeded;
-		CompletedPhase = State->Phase;
+		if (!State->bCanScheduleDeferredDiscard)
+		{
+			return false;
+		}
 	}
-	bTerminal = true;
+	DeferredDiscardObjectPaths = AssetObjectPaths;
+	return true;
 }
 
 bool UGitLocalSourceControlOperation::Cancel()
@@ -595,7 +906,7 @@ EGitLocalSourceControlOperationPhase UGitLocalSourceControlOperation::GetPhase()
 	}
 	if (bTerminal)
 	{
-		return CompletedPhase;
+		return Phase;
 	}
 	FScopeLock Lock(&State->Mutex);
 	return State->Phase;
@@ -607,9 +918,9 @@ FGitLocalSourceControlOperationResult UGitLocalSourceControlOperation::GetResult
 	return Result;
 }
 
-FGitLocalSourceControlProviderInfo UGitLocalSourceControlLibrary::GetProviderInfo()
+FGitLocalSourceControlProviderInfo UGitLocalSourceControlLibrary::GetProviderInfo(const FString& AssetObjectPath)
 {
-	return GitLocalSourceControlPrivate::GetProviderInfoOnGameThread();
+	return GitLocalSourceControlPrivate::GetProviderInfoOnGameThread(AssetObjectPath);
 }
 
 UGitLocalSourceControlOperation* UGitLocalSourceControlLibrary::StartLoadHistory(const FString& AssetObjectPath, const EGitLocalSourceControlHistoryMode Mode)
@@ -732,6 +1043,7 @@ UGitLocalSourceControlOperation* UGitLocalSourceControlLibrary::StartRestoreRevi
 		return GitLocalSourceControlPrivate::MakeFailedOperation(Error);
 	}
 	const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe> State = MakeShared<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>();
+	State->bCanScheduleDeferredDiscard = true;
 	if (!GitLocalSourceControlPrivate::PrepareLoadedPackagesForMutation({ Target }, State, true, Error))
 	{
 		GitLocalSourceControlPrivate::ReloadPreparedPackages(State);
@@ -779,6 +1091,10 @@ UGitLocalSourceControlOperation* UGitLocalSourceControlLibrary::StartRestoreRevi
 		GitSourceControlAssetOperations::FGitAssetOperationResult AssetResult;
 		const bool bRestored = Operations.RestoreRevisionToWorkspace(Target.Filename, SelectedRevision.CommitId, SelectedRevision.Filename,
 			GitLocalSourceControlPrivate::MakePreauthorizedClosedAssetCallbacks(State), AssetResult);
+		if (bRestored && AssetResult.bSucceeded)
+		{
+			GitLocalSourceControlPrivate::MarkDiskMutationCommitted(State);
+		}
 		GitLocalSourceControlPrivate::AddAssetOperationResult(Result, AssetResult);
 		Result.bSucceeded = bRestored && AssetResult.bSucceeded;
 		GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
@@ -786,25 +1102,29 @@ UGitLocalSourceControlOperation* UGitLocalSourceControlLibrary::StartRestoreRevi
 	return GitLocalSourceControlPrivate::MakeOperation(State);
 }
 
-UGitLocalSourceControlOperation* UGitLocalSourceControlLibrary::StartDiscardTracked(const TArray<FString>& AssetObjectPaths)
+UGitLocalSourceControlOperation* GitLocalSourceControlPrivate::StartDiscardTrackedInternal(const TArray<FString>& AssetObjectPaths,
+	const bool bAllowDuringShutdown, const bool bInternalDeferredCleanup)
 {
 	check(IsInGameThread());
 	TArray<GitLocalSourceControlPrivate::FResolvedTarget> Targets;
 	FString Error;
 	if (!GitLocalSourceControlPrivate::ResolveTargets(AssetObjectPaths, GitLocalSourceControlPrivate::ETargetAccess::Mutation, Targets, Error))
 	{
-		return GitLocalSourceControlPrivate::MakeFailedOperation(Error);
+		return GitLocalSourceControlPrivate::MakeFailedOperation(Error, bAllowDuringShutdown, bInternalDeferredCleanup, AssetObjectPaths);
 	}
 	const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe> State = MakeShared<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>();
+	State->bCanScheduleDeferredDiscard = true;
+	State->bInternalDeferredCleanup = bInternalDeferredCleanup;
+	State->DeferredCleanupAssetObjectPaths = AssetObjectPaths;
 	if (!GitLocalSourceControlPrivate::PrepareLoadedPackagesForMutation(Targets, State, false, Error))
 	{
 		GitLocalSourceControlPrivate::ReloadPreparedPackages(State);
-		return GitLocalSourceControlPrivate::MakeFailedOperation(Error);
+		return GitLocalSourceControlPrivate::MakeFailedOperation(Error, bAllowDuringShutdown, bInternalDeferredCleanup, AssetObjectPaths);
 	}
-	if (!GitLocalSourceControlPrivate::GetOperationRegistry().TryBegin(State))
+	if (!GitLocalSourceControlPrivate::GetOperationRegistry().TryBegin(State, bAllowDuringShutdown))
 	{
 		GitLocalSourceControlPrivate::ReloadPreparedPackages(State);
-		return GitLocalSourceControlPrivate::MakeFailedOperation(TEXT("Git Local SourceControl is shutting down."));
+		return GitLocalSourceControlPrivate::MakeFailedOperation(TEXT("Git Local SourceControl is shutting down."), bAllowDuringShutdown, bInternalDeferredCleanup, AssetObjectPaths);
 	}
 	Async(EAsyncExecution::ThreadPool, [State, Targets]() mutable
 	{
@@ -826,17 +1146,141 @@ UGitLocalSourceControlOperation* UGitLocalSourceControlLibrary::StartDiscardTrac
 		GitSourceControlAssetOperations::FGitSourceControlAssetOperations Operations(Targets[0].GitBinary, Targets[0].RepositoryRoot);
 		GitSourceControlAssetOperations::FGitAssetOperationResult AssetResult;
 		const bool bDiscarded = Operations.DiscardTrackedFiles(Files, GitLocalSourceControlPrivate::MakePreauthorizedClosedAssetCallbacks(State), AssetResult);
+		if (bDiscarded && AssetResult.bSucceeded)
+		{
+			GitLocalSourceControlPrivate::MarkDiskMutationCommitted(State);
+		}
 		GitLocalSourceControlPrivate::AddAssetOperationResult(Result, AssetResult);
 		Result.bSucceeded = bDiscarded && AssetResult.bSucceeded;
 		GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
 	});
-	return GitLocalSourceControlPrivate::MakeOperation(State);
+	return GitLocalSourceControlPrivate::MakeOperation(State, bAllowDuringShutdown);
+}
+
+UGitLocalSourceControlOperation* UGitLocalSourceControlLibrary::StartDiscardTracked(const TArray<FString>& AssetObjectPaths)
+{
+	return GitLocalSourceControlPrivate::StartDiscardTrackedInternal(AssetObjectPaths, false, false);
 }
 
 void GitLocalSourceControl::ShutdownOperations()
 {
-	GitLocalSourceControlPrivate::GetOperationRegistry().Shutdown();
+	check(IsInGameThread());
+	GitLocalSourceControlPrivate::GetOperationRegistry().BeginShutdown();
+	GitLocalSourceControlPrivate::GetOperationManager().Shutdown();
 }
+
+void GitLocalSourceControl::StartupOperations()
+{
+	check(IsInGameThread());
+	GitLocalSourceControlPrivate::GetOperationManager().Startup();
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+void GitLocalSourceControl::Testing::PumpOperations()
+{
+	GitLocalSourceControlPrivate::GetOperationManager().PumpForTesting();
+}
+
+int32 GitLocalSourceControl::Testing::GetManagedOperationCount()
+{
+	return GitLocalSourceControlPrivate::GetOperationManager().GetManagedOperationCount();
+}
+
+bool GitLocalSourceControl::Testing::HasOperationTicker()
+{
+	return GitLocalSourceControlPrivate::GetOperationManager().HasTicker();
+}
+
+void GitLocalSourceControl::Testing::SetForcePreparedPackageReloadFailure(const bool bEnabled)
+{
+	GitLocalSourceControlPrivate::SetForcePreparedPackageReloadFailureForTesting(bEnabled);
+}
+
+void GitLocalSourceControl::Testing::SetForceRestoreWorktreeRollback(const bool bEnabled)
+{
+	GitLocalSourceControlPrivate::SetForceRestoreWorktreeRollbackForTesting(bEnabled);
+}
+
+FString GitLocalSourceControl::Testing::GetLastDeferredCleanupDiagnostic()
+{
+	return GitLocalSourceControlPrivate::GLastDeferredCleanupDiagnostic;
+}
+
+void GitLocalSourceControl::Testing::ClearLastDeferredCleanupDiagnostic()
+{
+	GitLocalSourceControlPrivate::SetLastDeferredCleanupDiagnostic(FString());
+}
+
+void GitLocalSourceControl::Testing::ResetDeferredCleanupLaunchCount()
+{
+	GitLocalSourceControlPrivate::GDeferredCleanupLaunchCount.Store(0);
+}
+
+int32 GitLocalSourceControl::Testing::GetDeferredCleanupLaunchCount()
+{
+	return GitLocalSourceControlPrivate::GDeferredCleanupLaunchCount.Load();
+}
+
+UGitLocalSourceControlOperation* GitLocalSourceControl::Testing::StartBlockedReadOnlyOperationForTesting()
+{
+	check(IsInGameThread());
+	if (GitLocalSourceControlPrivate::GBlockedReadOnlyOperationGate.IsValid())
+	{
+		return nullptr;
+	}
+	const TSharedRef<GitLocalSourceControlPrivate::FBlockedReadOnlyOperationGate, ESPMode::ThreadSafe> Gate =
+		MakeShared<GitLocalSourceControlPrivate::FBlockedReadOnlyOperationGate, ESPMode::ThreadSafe>();
+	GitLocalSourceControlPrivate::GBlockedReadOnlyOperationGate = Gate;
+	const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe> State = MakeShared<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>();
+	State->FinalPublicationGate = Gate;
+	if (!GitLocalSourceControlPrivate::GetOperationRegistry().TryBegin(State))
+	{
+		GitLocalSourceControlPrivate::GBlockedReadOnlyOperationGate.Reset();
+		return nullptr;
+	}
+	Async(EAsyncExecution::ThreadPool, [State, Gate]()
+	{
+		GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(State->CancellationContext);
+		GitLocalSourceControlPrivate::SetWorkerPhase(State, EGitLocalSourceControlOperationPhase::LoadingHistory, true);
+		FGitLocalSourceControlOperationResult Result;
+		Result.bSucceeded = true;
+		GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
+	});
+	UGitLocalSourceControlOperation* Operation = GitLocalSourceControlPrivate::MakeOperation(State);
+	if (Operation == nullptr)
+	{
+		Gate->ReleaseFinalPublication->Trigger();
+		GitLocalSourceControlPrivate::GBlockedReadOnlyOperationGate.Reset();
+	}
+	return Operation;
+}
+
+bool GitLocalSourceControl::Testing::WaitForBlockedReadOnlyOperationToReachFinalPublication(const double TimeoutSeconds)
+{
+	check(IsInGameThread());
+	const TSharedPtr<GitLocalSourceControlPrivate::FBlockedReadOnlyOperationGate, ESPMode::ThreadSafe> Gate =
+		GitLocalSourceControlPrivate::GBlockedReadOnlyOperationGate;
+	return Gate.IsValid() && Gate->WorkerReachedFinalPublication->Wait(FTimespan::FromSeconds(TimeoutSeconds));
+}
+
+void GitLocalSourceControl::Testing::ReleaseBlockedReadOnlyOperation()
+{
+	check(IsInGameThread());
+	const TSharedPtr<GitLocalSourceControlPrivate::FBlockedReadOnlyOperationGate, ESPMode::ThreadSafe> Gate =
+		MoveTemp(GitLocalSourceControlPrivate::GBlockedReadOnlyOperationGate);
+	if (Gate.IsValid())
+	{
+		Gate->ReleaseFinalPublication->Trigger();
+	}
+}
+
+bool GitLocalSourceControl::Testing::DrainOperationsForTesting()
+{
+	return GitLocalSourceControlPrivate::GetOperationManager().DrainForTesting();
+}
+
+#endif
 
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 

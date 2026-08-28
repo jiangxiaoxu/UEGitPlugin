@@ -10,7 +10,7 @@
 #include "GitLocalSourceControl.generated.h"
 
 /** 生命周期中的 Git Local SourceControl 异步操作阶段. */
-UENUM(BlueprintType)
+UENUM()
 enum class EGitLocalSourceControlOperationPhase : uint8
 {
 	Queued,
@@ -25,115 +25,132 @@ enum class EGitLocalSourceControlOperationPhase : uint8
 };
 
 /** 当前 Editor 可用的 standalone local Git repository snapshot. */
-USTRUCT(BlueprintType)
+USTRUCT(meta = (ForceAngelscriptBind))
 struct GITSOURCECONTROL_API FGitLocalSourceControlProviderInfo
 {
 	GENERATED_BODY()
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	bool bAvailable = false;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	FString GitBinary;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	FString RepositoryRoot;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	FString Error;
 };
 
 /** 一条机器可读的单文件 Git revision. */
-USTRUCT(BlueprintType)
+USTRUCT(meta = (ForceAngelscriptBind))
 struct GITSOURCECONTROL_API FGitLocalSourceControlHistoryEntry
 {
 	GENERATED_BODY()
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	FString CommitId;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	FString HistoricalPath;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	FString Description;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	FString Author;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	FString Action;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	FString DateUtc;
 };
 
 /** 一次异步本地 Git 操作的最终结果. */
-USTRUCT(BlueprintType)
+USTRUCT(meta = (ForceAngelscriptBind))
 struct GITSOURCECONTROL_API FGitLocalSourceControlOperationResult
 {
 	GENERATED_BODY()
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	bool bSucceeded = false;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	bool bCancelled = false;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	bool bReloadSucceeded = true;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	TArray<FString> AffectedFiles;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	TArray<FString> Errors;
 
-	UPROPERTY(BlueprintReadOnly, Category = "Git Local SourceControl")
+	UPROPERTY(ScriptReadOnly)
 	TArray<FGitLocalSourceControlHistoryEntry> History;
 };
 
 struct FGitLocalSourceControlOperationState;
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FGitLocalSourceControlOperationProgressEvent, EGitLocalSourceControlOperationPhase, Phase);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FGitLocalSourceControlOperationCompletedEvent, FGitLocalSourceControlOperationResult, Result);
+
+namespace GitLocalSourceControlPrivate
+{
+	class FOperationManager;
+}
 
 /**
- * Game-thread owned handle for one local Git operation. Call Tick until terminal.
+ * Game-thread owned handle for one local Git operation. The module drives it until terminal.
  * Cancel only succeeds while the operation remains in a read-only or LFS-fetch phase.
  */
-UCLASS(BlueprintType, meta = (ScriptName = "GitLocalSourceControlOperation"))
+UCLASS(meta = (ScriptName = "GitLocalSourceControlOperation"))
 class GITSOURCECONTROL_API UGitLocalSourceControlOperation final : public UObject
 {
 	GENERATED_BODY()
 
 public:
-	/** Consumes completed worker output on the Game Thread. */
-	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
-	void Tick();
-
 	/** Request cancellation of a read-only/history/LFS phase. */
-	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
+	UFUNCTION(ScriptCallable)
 	bool Cancel();
 
-	UFUNCTION(BlueprintPure, ScriptCallable, Category = "Git Local SourceControl")
+	UFUNCTION(ScriptCallable)
 	bool IsTerminal() const;
 
-	UFUNCTION(BlueprintPure, ScriptCallable, Category = "Git Local SourceControl")
+	UFUNCTION(ScriptCallable)
 	EGitLocalSourceControlOperationPhase GetPhase() const;
 
-	UFUNCTION(BlueprintPure, ScriptCallable, Category = "Git Local SourceControl")
+	UFUNCTION(ScriptCallable)
 	FGitLocalSourceControlOperationResult GetResult() const;
+
+	UPROPERTY(ScriptReadWrite)
+	FGitLocalSourceControlOperationProgressEvent OnProgress;
+
+	UPROPERTY(ScriptReadWrite)
+	FGitLocalSourceControlOperationCompletedEvent OnCompleted;
+
+	/** Arms one tracked-file discard for a mutation operation; read-only operations reject the request. */
+	UFUNCTION(ScriptCallable)
+	bool ScheduleDiscardTrackedAfterCompletion(const TArray<FString>& AssetObjectPaths);
 
 	/** Internal C++ initialization. New operations are created only by the library. */
 	void Initialize(TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe> InState);
 
 private:
+	friend class GitLocalSourceControlPrivate::FOperationManager;
+
+	void PumpOnGameThread(bool bBroadcastNotifications, bool bAllowShutdownCleanup);
+	TArray<FString> DeferredDiscardObjectPaths;
 	TSharedPtr<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe> State;
 	FGitLocalSourceControlOperationResult Result;
-	EGitLocalSourceControlOperationPhase CompletedPhase = EGitLocalSourceControlOperationPhase::Queued;
+	EGitLocalSourceControlOperationPhase Phase = EGitLocalSourceControlOperationPhase::Queued;
 	bool bTerminal = false;
 };
 
 /**
- * Editor-only typed local Git operations for AngelScript and Blueprint automation.
+ * Editor-only typed local Git operations for AngelScript automation.
  * Inputs are asset object paths, never shell commands. Remote access is limited to an
  * exact historical LFS revision fetch requested by the caller.
  */
@@ -143,27 +160,49 @@ class GITSOURCECONTROL_API UGitLocalSourceControlLibrary final : public UBluepri
 	GENERATED_BODY()
 
 public:
-	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
-	static FGitLocalSourceControlProviderInfo GetProviderInfo();
+	UFUNCTION(ScriptCallable)
+	static FGitLocalSourceControlProviderInfo GetProviderInfo(const FString& AssetObjectPath);
 
-	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
+	UFUNCTION(ScriptCallable)
 	/** 加载单个资产的当前路径历史或已提交 R100 rename 链. */
 	static UGitLocalSourceControlOperation* StartLoadHistory(const FString& AssetObjectPath, EGitLocalSourceControlHistoryMode Mode);
 
-	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
+	UFUNCTION(ScriptCallable)
 	static UGitLocalSourceControlOperation* StartFetchLfsRevision(const FString& AssetObjectPath, const FString& Revision);
 
 /** Force-restores one same-path historical revision. Working, staged, conflicted, untracked, and in-memory changes are discarded without undo. */
-	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
+	UFUNCTION(ScriptCallable)
 	static UGitLocalSourceControlOperation* StartRestoreRevision(const FString& AssetObjectPath, const FString& Revision);
 
 	/** Discards index and worktree changes only for clean tracked .uasset files and schedules reload after completion. */
-	UFUNCTION(BlueprintCallable, ScriptCallable, Category = "Git Local SourceControl")
+	UFUNCTION(ScriptCallable)
 	static UGitLocalSourceControlOperation* StartDiscardTracked(const TArray<FString>& AssetObjectPaths);
 };
 
 /** Cancels and joins API workers before the owning Editor module unloads. */
 namespace GitLocalSourceControl
 {
+	/** Starts the module-owned Game Thread operation pump. Called during module startup. */
+	GITSOURCECONTROL_API void StartupOperations();
+
 	GITSOURCECONTROL_API void ShutdownOperations();
+
+#if WITH_DEV_AUTOMATION_TESTS
+	namespace Testing
+	{
+		GITSOURCECONTROL_API void PumpOperations();
+		GITSOURCECONTROL_API int32 GetManagedOperationCount();
+		GITSOURCECONTROL_API bool HasOperationTicker();
+		GITSOURCECONTROL_API void SetForcePreparedPackageReloadFailure(bool bEnabled);
+		GITSOURCECONTROL_API void SetForceRestoreWorktreeRollback(bool bEnabled);
+		GITSOURCECONTROL_API FString GetLastDeferredCleanupDiagnostic();
+		GITSOURCECONTROL_API void ClearLastDeferredCleanupDiagnostic();
+		GITSOURCECONTROL_API void ResetDeferredCleanupLaunchCount();
+		GITSOURCECONTROL_API int32 GetDeferredCleanupLaunchCount();
+		GITSOURCECONTROL_API UGitLocalSourceControlOperation* StartBlockedReadOnlyOperationForTesting();
+		GITSOURCECONTROL_API bool WaitForBlockedReadOnlyOperationToReachFinalPublication(double TimeoutSeconds = 15.0);
+		GITSOURCECONTROL_API void ReleaseBlockedReadOnlyOperation();
+		GITSOURCECONTROL_API bool DrainOperationsForTesting();
+	}
+#endif
 }

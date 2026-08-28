@@ -10,9 +10,13 @@
 - Content Browser asset lifecycle 的 create、move、copy、save、rename、delete 不得触发 Git command。
 - Level Editor 右下角 status bar 以 owner-scoped ToolMenus entry 替换默认 Source Control 组合控件, 保留 Unsaved Assets 指示并提供 `Git Changes` 直达按钮. 这是 Git Changes 的唯一用户入口; layout restore 或 programmatic tab invocation 仍受 startup gate 约束. 原 entry 在 shutdown 时恢复; module 禁止 dynamic reload, 避免 ToolMenus/Slate 缓存持有已卸载 DLL delegate.
 
+`UGitLocalSourceControlOperation` 是 AngelScript-only `UObject`, 不标记为 Blueprint surface, 也不提供 public `Tick`. module-owned `FGCObject` registry 持有所有 non-terminal operation, 防止异步期间被 GC. registry 由 module startup 注册、module shutdown 移除的固定 ticker 驱动 operation 的 Game Thread readback 和事件派发; idle tick 只快速返回, 不改变 ticker 注册状态. `OnProgress` 在 phase/progress 变化时派发, `OnCompleted` 在 package reload 或 recovery 完成后恰好派发一次. `Cancel`, `IsTerminal`, `GetPhase` 和 `GetResult` 是 readback/control API; worker 只写线程安全 state, 不触碰 UObject 或 Slate.
+
+`ScheduleDiscardTrackedAfterCompletion` 只接受 Restore/Discard mutation operation, 可在 parent 尚未进入 mutation 时预先 arm, 但只在 parent 实际 commit 了磁盘 mutation 后启动一次 child discard. read-only history/LFS success 不能启动 child; parent failure 或 rollback 不启动 child; parent reload failure 不改变已成功的磁盘 mutation 判断. internal child failure 会记录资产路径和人工恢复指引, 随后由 manager 释放。
+
 ## Explicit asynchronous jobs
 
-每个 Changed Assets refresh/revert, History, Diff, LFS Fetch, Restore 或 Discard 都是显式 async job, 且必须先通过 startup Git gate. Git/LFS process 和 file I/O 在 worker, 所有 Slate, asset load/unload/reload 和 completion callback 在 Game Thread. 窗口或 operation handle 持有临时 job context, job 结束即释放; 不建立插件持久缓存. Git LFS 3.7.1+ 只在首次需要 LFS object 的显式操作时 lazy gate, 只缓存成功结果; 缺失、版本过低或瞬时失败不缓存, 当前动作失败且下次显式 LFS 动作重试, 无需重启 Editor. 未触发 LFS 时不执行 LFS version probe.
+每个 Changed Assets refresh/revert, History, Diff, LFS Fetch, Restore 或 Discard 都是显式 async job, 且必须先通过 startup Git gate. Git/LFS process 和 file I/O 在 worker, 所有 Slate, asset load/unload/reload 和 operation event/completion callback 在 Game Thread. operation 生命周期由 module-owned `FGCObject` registry 和固定 module ticker 管理, 不依赖调用方持续持有 UObject, 也不向 AS 暴露手动 `Tick`. completion 必须晚于 package reload/recovery; reload 失败进入 `Failed` phase, 并带有 partial-disk diagnostic. Git LFS 3.7.1+ 只在首次需要 LFS object 的显式操作时 lazy gate, 只缓存成功结果; 缺失、版本过低或瞬时失败不缓存, 当前动作失败且下次显式 LFS 动作重试, 无需重启 Editor. 未触发 LFS 时不执行 LFS version probe.
 
 Read-only job 可由用户取消, window close 和 module shutdown 必须终止并等待其 process。Mutation 在 commit point 前可取消, 进入 commit point 后必须完成或 rollback。任何 callback 都必须先验证 window/module lifetime, 禁止在 worker thread 访问 UObject、Slate 或 Editor subsystem。
 
@@ -53,6 +57,7 @@ Repository discovery 只接受用户显式选中的 asset path, 解析 nearest r
 
 - startup Git capability gate 恰好执行一次, `Pending`/`Unavailable` 时所有 Git action 均 fail closed 并给出 actionable diagnostic, 同时保留 Content Browser 菜单 discoverability; 安装或升级 Git 后必须重启 Editor 才重新探测。
 - Git gate 完成后的 module idle 和普通 asset lifecycle 不再启动额外 Git process, 且没有 Unreal Source Control modular feature。
+- AS operation manager 在 module startup 后始终保留一个 idle fast-return ticker; active operation 由 module `FGCObject` registry 保活, 无 public `Tick`, `OnProgress`/`OnCompleted` 只在 Game Thread 派发且 completion 只发生一次并晚于 reload/recovery. Cancel、terminal readback、reload failure `Failed` phase 和 partial-disk diagnostic 均需覆盖。
 - CurrentPath、multi-hop `R100`、fixed HEAD、250 条上限和无 `--follow`。
 - Diff 三种选择模式、跨 rename path、类型不兼容和 temp cleanup。
 - LFS capability 在首次需要 LFS 的显式操作中 lazy 探测, 只缓存成功的 3.7.1+ 结果; 缺失、版本过低或瞬时失败不缓存, 当前动作失败且下次显式 LFS 动作重试. cache hit 零 network fetch; miss 只进行目标 commit/path fetch; ambiguous remote 在网络前失败.
@@ -60,5 +65,7 @@ Repository discovery 只接受用户显式选中的 asset path, 解析 nearest r
 - Changed Assets 的 repository-wide status parser, `.uasset` state aggregation, Added/Untracked 删除, Rename 原子回退, OFPA owner unresolved/dirty-map gate, generation cancellation 和 mutation guard.
 - Changed Assets refresh phase/progress 从 status 持续到 current/HEAD/owner metadata 完成, 期间 Refresh/Revert 禁用; 现存文件使用 package-header truth, activity-only 更新不重建 rows, WDL topology 沿用 Asset Registry/既有 owner-resolution 路径, 且无 DirectoryWatcher、后台 polling 或全局 Asset Registry refresh.
 - window close、cancel、module shutdown 时无遗留 Git process、notification 或 temp package。
+
+文档和发布检查还必须确认 `UGitLocalSourceControlOperation` 不再出现在 Blueprint surface, `Task_GitAssetRestoreViaApi` 和 `Task_GitAssetHistoryPerformance` 两个 AngelScript workflow 只绑定 progress/completion events, 不手动 Tick; `GetProviderInfo(AssetObjectPath)` 与 nearest repository 解析一致.
 
 交付前运行 `npm run build:regular`, 相关 Unreal automation filters, `npm run as:diagnostics` 和 `git diff --check`。需要 C++/AS API 变化时验证真实 generated surface。最终必须有独立 reviewer 审核 providerless 边界、零隐式 Git、LFS/Restore safety、API surface、测试证据和文档结论。

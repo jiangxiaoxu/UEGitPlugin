@@ -2,6 +2,7 @@
 
 #include "GitSourceControlAssetOperations.h"
 #include "GitLocalSourceControl.h"
+#include "GitLocalSourceControlOperationTestReceiver.h"
 #include "GitSourceControlModule.h"
 #include "GitSourceControlUtils.h"
 
@@ -229,11 +230,22 @@ namespace GitSourceControlLocalAutomationTestsPrivate
 		const FDateTime Deadline = FDateTime::UtcNow() + FTimespan::FromSeconds(15.0);
 		while (!Operation->IsTerminal() && FDateTime::UtcNow() < Deadline)
 		{
-			Operation->Tick();
+			GitLocalSourceControl::Testing::PumpOperations();
 			FPlatformProcess::SleepNoStats(0.01f);
 		}
-		Operation->Tick();
 		return Test.TestTrue(*FString::Printf(TEXT("%s reaches a terminal state"), *Label), Operation->IsTerminal());
+	}
+
+	bool WaitForManagedOperationsToSettle(FAutomationTestBase& Test, const FString& Label)
+	{
+		const FDateTime Deadline = FDateTime::UtcNow() + FTimespan::FromSeconds(15.0);
+		while (GitLocalSourceControl::Testing::GetManagedOperationCount() > 0 && FDateTime::UtcNow() < Deadline)
+		{
+			GitLocalSourceControl::Testing::PumpOperations();
+			FPlatformProcess::SleepNoStats(0.01f);
+		}
+		GitLocalSourceControl::Testing::PumpOperations();
+		return Test.TestEqual(*FString::Printf(TEXT("%s leaves no managed operations"), *Label), GitLocalSourceControl::Testing::GetManagedOperationCount(), 0);
 	}
 
 	bool SaveCurvePackage(FAutomationTestBase& Test, UPackage* Package, UCurveFloat* Asset, const FString& Filename, const FString& Revision)
@@ -437,10 +449,78 @@ bool FGitSourceControlIntegrationHistoryDiffRestoreAutomationTest::RunTest(const
 		return false;
 	}
 	const FString AssetObjectPath = PackageName + TEXT(".") + AssetName;
+	const FName BlueprintTypeMetadata(TEXT("BlueprintType"));
+	const FName ForceAngelscriptBindMetadata(TEXT("ForceAngelscriptBind"));
+	const FName ScriptCallableMetadata(TEXT("ScriptCallable"));
+	for (UScriptStruct* Struct : { FGitLocalSourceControlProviderInfo::StaticStruct(), FGitLocalSourceControlHistoryEntry::StaticStruct(), FGitLocalSourceControlOperationResult::StaticStruct() })
+	{
+		TestFalse(FString::Printf(TEXT("%s remains outside the Blueprint type surface"), *Struct->GetName()), Struct->HasMetaData(BlueprintTypeMetadata));
+		TestTrue(FString::Printf(TEXT("%s force-admits to AngelScript binding"), *Struct->GetName()), Struct->HasMetaData(ForceAngelscriptBindMetadata));
+	}
+	for (const FName FunctionName : { GET_FUNCTION_NAME_CHECKED(UGitLocalSourceControlOperation, Cancel), GET_FUNCTION_NAME_CHECKED(UGitLocalSourceControlOperation, ScheduleDiscardTrackedAfterCompletion), GET_FUNCTION_NAME_CHECKED(UGitLocalSourceControlLibrary, StartLoadHistory) })
+	{
+		const UFunction* Function = FunctionName == GET_FUNCTION_NAME_CHECKED(UGitLocalSourceControlLibrary, StartLoadHistory)
+			? UGitLocalSourceControlLibrary::StaticClass()->FindFunctionByName(FunctionName)
+			: UGitLocalSourceControlOperation::StaticClass()->FindFunctionByName(FunctionName);
+		TestTrue(FString::Printf(TEXT("%s remains callable from AngelScript"), *FunctionName.ToString()), Function != nullptr && Function->HasMetaData(ScriptCallableMetadata));
+	}
+	const FGitLocalSourceControlProviderInfo ProviderInfo = UGitLocalSourceControlLibrary::GetProviderInfo(AssetObjectPath);
+	TestTrue(TEXT("Per-asset provider info resolves the mounted fixture repository"), ProviderInfo.bAvailable);
+	TestTrue(TEXT("Per-asset provider info returns the nearest fixture repository"), FPaths::IsSamePath(ProviderInfo.RepositoryRoot, Fixture.GetDirectory()));
+	TestTrue(TEXT("Operation has no public manual Tick reflection method"), UGitLocalSourceControlOperation::StaticClass()->FindFunctionByName(TEXT("Tick")) == nullptr);
+	TestTrue(TEXT("The module startup operation pump remains registered while idle"), GitLocalSourceControl::Testing::HasOperationTicker());
+	GitLocalSourceControl::Testing::ResetDeferredCleanupLaunchCount();
 	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
 	UGitLocalSourceControlOperation* LocalHitFetch = UGitLocalSourceControlLibrary::StartFetchLfsRevision(AssetObjectPath, History[1].CommitId);
+	if (!TestNotNull(TEXT("A read-only LFS fetch returns an operation"), LocalHitFetch)) return false;
+	TestEqual(TEXT("A non-terminal operation is held by the module manager"), GitLocalSourceControl::Testing::GetManagedOperationCount(), 1);
+	TestTrue(TEXT("The fixed module operation pump remains registered while active"), GitLocalSourceControl::Testing::HasOperationTicker());
+	TestFalse(TEXT("A successful read-only LFS fetch cannot arm destructive deferred cleanup"), LocalHitFetch->ScheduleDiscardTrackedAfterCompletion({ AssetObjectPath }));
 	if (!WaitForOperation(*this, LocalHitFetch, TEXT("StartFetchLfsRevision local cache hit"))) return false;
 	TestTrue(TEXT("StartFetchLfsRevision local cache hit succeeds"), LocalHitFetch->GetResult().bSucceeded);
+	TestEqual(TEXT("A successful read-only LFS fetch never launches deferred cleanup"), GitLocalSourceControl::Testing::GetDeferredCleanupLaunchCount(), 0);
+	TestEqual(TEXT("A terminal operation is released by the module manager"), GitLocalSourceControl::Testing::GetManagedOperationCount(), 0);
+	TestTrue(TEXT("The idle module operation pump remains registered"), GitLocalSourceControl::Testing::HasOperationTicker());
+	UGitLocalSourceControlOperation* BlockedReadOnlyOperation = GitLocalSourceControl::Testing::StartBlockedReadOnlyOperationForTesting();
+	if (!TestNotNull(TEXT("A blocked read-only operation returns an operation"), BlockedReadOnlyOperation)) return false;
+	bool bBlockedReadOnlyOperationReleased = false;
+	ON_SCOPE_EXIT
+	{
+		if (!bBlockedReadOnlyOperationReleased)
+		{
+			GitLocalSourceControl::Testing::ReleaseBlockedReadOnlyOperation();
+		}
+	};
+	if (!TestTrue(TEXT("The blocked read-only worker reaches its final-publication test gate"), GitLocalSourceControl::Testing::WaitForBlockedReadOnlyOperationToReachFinalPublication())) return false;
+	TWeakObjectPtr<UGitLocalSourceControlOperation> WeakBlockedReadOnlyOperation = BlockedReadOnlyOperation;
+	BlockedReadOnlyOperation = nullptr;
+	CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+	if (!TestTrue(TEXT("The FGCObject manager keeps a caller-unreferenced non-terminal operation alive through GC"), WeakBlockedReadOnlyOperation.IsValid())) return false;
+	GitLocalSourceControl::Testing::ReleaseBlockedReadOnlyOperation();
+	bBlockedReadOnlyOperationReleased = true;
+	BlockedReadOnlyOperation = WeakBlockedReadOnlyOperation.Get();
+	if (!WaitForOperation(*this, BlockedReadOnlyOperation, TEXT("Blocked read-only operation after caller reference is dropped"))) return false;
+	TestTrue(TEXT("The caller-unreferenced operation completes after its worker is released"), BlockedReadOnlyOperation->GetResult().bSucceeded);
+	{
+		UGitLocalSourceControlOperation* CancelAtFinalPublication = GitLocalSourceControl::Testing::StartBlockedReadOnlyOperationForTesting();
+		if (!TestNotNull(TEXT("A cancellation-race operation returns an operation"), CancelAtFinalPublication)) return false;
+		bool bCancelAtFinalPublicationReleased = false;
+		ON_SCOPE_EXIT
+		{
+			if (!bCancelAtFinalPublicationReleased)
+			{
+				GitLocalSourceControl::Testing::ReleaseBlockedReadOnlyOperation();
+			}
+		};
+		if (!TestTrue(TEXT("The cancellation-race worker reaches final publication before result lock"), GitLocalSourceControl::Testing::WaitForBlockedReadOnlyOperationToReachFinalPublication())) return false;
+		if (!TestTrue(TEXT("Cancel succeeds while the worker is paused before final result publication"), CancelAtFinalPublication->Cancel())) return false;
+		GitLocalSourceControl::Testing::ReleaseBlockedReadOnlyOperation();
+		bCancelAtFinalPublicationReleased = true;
+		if (!WaitForOperation(*this, CancelAtFinalPublication, TEXT("Cancellation-race operation"))) return false;
+		TestTrue(TEXT("A successful Cancel linearizes the terminal result as cancelled"), CancelAtFinalPublication->GetResult().bCancelled);
+		TestFalse(TEXT("A successful Cancel cannot publish a successful terminal result"), CancelAtFinalPublication->GetResult().bSucceeded);
+		TestEqual(TEXT("A successful Cancel reaches the Cancelled terminal phase"), CancelAtFinalPublication->GetPhase(), EGitLocalSourceControlOperationPhase::Cancelled);
+	}
 	TestEqual(TEXT("StartFetchLfsRevision local cache hit starts no LFS fetch"), GitSourceControlUtils::Testing::GetGitLfsFetchLaunchCount(), static_cast<uint64>(0));
 	if (!TestTrue(TEXT("StartFetchLfsRevision local cache hit verifies the materialized object"), GitSourceControlUtils::VerifyLocalLfsObject(Fixture.GetGitBinary(), Fixture.GetDirectory(), LfsObjectFilename, LfsOid, LfsSize, LfsError)))
 	{
@@ -553,6 +633,133 @@ bool FGitSourceControlIntegrationHistoryDiffRestoreAutomationTest::RunTest(const
 	TestTrue(TEXT("Cancelled StartRestoreRevision reloads the formerly loaded package"), CancelledRestore->GetResult().bReloadSucceeded);
 	LoadedPackage = FindPackage(nullptr, *PackageName);
 	if (!TestNotNull(TEXT("Cancelled StartRestoreRevision leaves the package reloaded"), LoadedPackage) || !TestNotNull(TEXT("Cancelled StartRestoreRevision reload has an asset"), LoadedPackage->FindAssetInPackage())) return false;
+	LoadedPackage->SetDirtyFlag(false);
+	GitLocalSourceControl::Testing::ResetDeferredCleanupLaunchCount();
+	UGitLocalSourceControlOperation* FailedDeferredParent = UGitLocalSourceControlLibrary::StartRestoreRevision(AssetObjectPath, TEXT("0000000000000000000000000000000000000000"));
+	if (!TestNotNull(TEXT("A parent that fails before mutation returns an operation"), FailedDeferredParent)
+		|| !TestTrue(TEXT("A pre-armed cleanup accepts a parent that later fails before mutation"), FailedDeferredParent->ScheduleDiscardTrackedAfterCompletion({ AssetObjectPath }))
+		|| !WaitForOperation(*this, FailedDeferredParent, TEXT("StartRestoreRevision failed parent with pre-armed cleanup"))) return false;
+	TestFalse(TEXT("The invalid parent revision does not mutate disk"), FailedDeferredParent->GetResult().bSucceeded);
+	TestEqual(TEXT("A failed parent never starts its deferred cleanup"), GitLocalSourceControl::Testing::GetDeferredCleanupLaunchCount(), 0);
+	if (!WaitForManagedOperationsToSettle(*this, TEXT("A failed parent"))) return false;
+
+	{
+		GitLocalSourceControl::Testing::ResetDeferredCleanupLaunchCount();
+		TArray<uint8> RollbackBaselineBytes;
+		if (!TestTrue(TEXT("The rollback parent baseline bytes are readable"), FFileHelper::LoadFileToArray(RollbackBaselineBytes, *PackageFilename))) return false;
+		FString RollbackBaselineStatus;
+		if (!Fixture.RunGit(TEXT("status --porcelain -- Content/HistoryDiffFixture.uasset"), RollbackBaselineStatus)) return false;
+		GitLocalSourceControl::Testing::SetForceRestoreWorktreeRollback(true);
+		ON_SCOPE_EXIT { GitLocalSourceControl::Testing::SetForceRestoreWorktreeRollback(false); };
+		UGitLocalSourceControlOperation* RolledBackDeferredParent = UGitLocalSourceControlLibrary::StartRestoreRevision(AssetObjectPath, History[1].CommitId);
+		if (!TestNotNull(TEXT("A rollback parent returns an operation"), RolledBackDeferredParent)
+			|| !TestTrue(TEXT("A rollback parent accepts pre-armed deferred cleanup"), RolledBackDeferredParent->ScheduleDiscardTrackedAfterCompletion({ AssetObjectPath }))
+			|| !WaitForOperation(*this, RolledBackDeferredParent, TEXT("StartRestoreRevision forced rollback with pre-armed cleanup"))) return false;
+		TestFalse(TEXT("The forced worktree replacement failure rolls the parent back"), RolledBackDeferredParent->GetResult().bSucceeded);
+		TestTrue(TEXT("The forced parent failure reports rollback"), RolledBackDeferredParent->GetResult().Errors.ContainsByPredicate([](const FString& Error)
+		{
+			return Error.Contains(TEXT("rollback"), ESearchCase::IgnoreCase);
+		}));
+		TestEqual(TEXT("A rolled-back parent never starts its deferred cleanup"), GitLocalSourceControl::Testing::GetDeferredCleanupLaunchCount(), 0);
+		if (!WaitForManagedOperationsToSettle(*this, TEXT("A rolled-back parent"))) return false;
+		TArray<uint8> RollbackResultBytes;
+		if (!TestTrue(TEXT("The rollback parent result bytes are readable"), FFileHelper::LoadFileToArray(RollbackResultBytes, *PackageFilename))) return false;
+		TestTrue(TEXT("The failed parent restores the exact pre-mutation worktree bytes before deferred cleanup is skipped"), RollbackResultBytes == RollbackBaselineBytes);
+		FString RollbackStatus;
+		if (!Fixture.RunGit(TEXT("status --porcelain -- Content/HistoryDiffFixture.uasset"), RollbackStatus)) return false;
+		TestEqual(TEXT("The failed parent restores the pre-mutation index and worktree status before deferred cleanup is skipped"), RollbackStatus, RollbackBaselineStatus);
+	}
+
+	GitLocalSourceControl::Testing::ResetDeferredCleanupLaunchCount();
+	UGitLocalSourceControlOperation* SuccessfulDeferredParent = UGitLocalSourceControlLibrary::StartRestoreRevision(AssetObjectPath, History[1].CommitId);
+	if (!TestNotNull(TEXT("A successful parent returns an operation"), SuccessfulDeferredParent)
+		|| !TestTrue(TEXT("A successful parent accepts pre-armed deferred cleanup"), SuccessfulDeferredParent->ScheduleDiscardTrackedAfterCompletion({ AssetObjectPath }))
+		|| !TestEqual(TEXT("The shutdown-style drain starts with the managed parent operation"), GitLocalSourceControl::Testing::GetManagedOperationCount(), 1)
+		|| !TestTrue(TEXT("A shutdown-style drain removes the fixed ticker, drains parent and child, then restores the pump"), GitLocalSourceControl::Testing::DrainOperationsForTesting())) return false;
+	TestTrue(TEXT("The shutdown-style drain terminalizes the successful parent"), SuccessfulDeferredParent->IsTerminal());
+	TestTrue(TEXT("The successful parent changes disk before scheduling cleanup"), SuccessfulDeferredParent->GetResult().bSucceeded);
+	TestEqual(TEXT("The shutdown-style drain releases parent and internal child from the manager"), GitLocalSourceControl::Testing::GetManagedOperationCount(), 0);
+	TestTrue(TEXT("The fixed ticker is registered again after the shutdown-style drain"), GitLocalSourceControl::Testing::HasOperationTicker());
+	TestEqual(TEXT("A successful parent starts its deferred cleanup exactly once"), GitLocalSourceControl::Testing::GetDeferredCleanupLaunchCount(), 1);
+	FString DeferredCleanupStatus;
+	if (!Fixture.RunGit(TEXT("status --porcelain -- Content/HistoryDiffFixture.uasset"), DeferredCleanupStatus)) return false;
+	DeferredCleanupStatus.TrimStartAndEndInline();
+	TestTrue(TEXT("Successful deferred cleanup returns the worktree to HEAD"), DeferredCleanupStatus.IsEmpty());
+
+	GitLocalSourceControl::Testing::ResetDeferredCleanupLaunchCount();
+	GitLocalSourceControl::Testing::SetForcePreparedPackageReloadFailure(true);
+	UGitLocalSourceControlOperation* ReloadFailureDeferredParent = UGitLocalSourceControlLibrary::StartRestoreRevision(AssetObjectPath, History[1].CommitId);
+	if (!TestNotNull(TEXT("A reload-failure parent returns an operation"), ReloadFailureDeferredParent)
+		|| !TestTrue(TEXT("A reload-failure parent accepts pre-armed deferred cleanup"), ReloadFailureDeferredParent->ScheduleDiscardTrackedAfterCompletion({ AssetObjectPath }))
+		|| !WaitForOperation(*this, ReloadFailureDeferredParent, TEXT("StartRestoreRevision reload failure with deferred cleanup")))
+	{
+		GitLocalSourceControl::Testing::SetForcePreparedPackageReloadFailure(false);
+		return false;
+	}
+	GitLocalSourceControl::Testing::SetForcePreparedPackageReloadFailure(false);
+	TestFalse(TEXT("A post-mutation reload failure makes the parent fail"), ReloadFailureDeferredParent->GetResult().bSucceeded);
+	TestFalse(TEXT("A post-mutation reload failure is reported on the parent"), ReloadFailureDeferredParent->GetResult().bReloadSucceeded);
+	if (!WaitForManagedOperationsToSettle(*this, TEXT("A reload-failure parent and its cleanup"))) return false;
+	TestEqual(TEXT("A reload-failure parent still starts deferred cleanup exactly once"), GitLocalSourceControl::Testing::GetDeferredCleanupLaunchCount(), 1);
+	FString ReloadFailureDeferredStatus;
+	if (!Fixture.RunGit(TEXT("status --porcelain -- Content/HistoryDiffFixture.uasset"), ReloadFailureDeferredStatus)) return false;
+	ReloadFailureDeferredStatus.TrimStartAndEndInline();
+	TestTrue(TEXT("Deferred cleanup returns disk to HEAD after parent reload failure"), ReloadFailureDeferredStatus.IsEmpty());
+
+	GitLocalSourceControl::Testing::ClearLastDeferredCleanupDiagnostic();
+	GitLocalSourceControl::Testing::ResetDeferredCleanupLaunchCount();
+	AddExpectedErrorPlain(TEXT("Deferred Git cleanup failed for asset paths [/Invalid/DeferredCleanup.DeferredCleanup]"), EAutomationExpectedErrorFlags::Contains, 1);
+	UGitLocalSourceControlOperation* FailedDeferredChildParent = UGitLocalSourceControlLibrary::StartRestoreRevision(AssetObjectPath, History[1].CommitId);
+	if (!TestNotNull(TEXT("A parent with a failing cleanup returns an operation"), FailedDeferredChildParent)
+		|| !TestTrue(TEXT("A parent accepts an invalid deferred cleanup target for failure handling"), FailedDeferredChildParent->ScheduleDiscardTrackedAfterCompletion({ TEXT("/Invalid/DeferredCleanup.DeferredCleanup") }))
+		|| !WaitForOperation(*this, FailedDeferredChildParent, TEXT("StartRestoreRevision parent with failing deferred cleanup"))) return false;
+	TestTrue(TEXT("The parent succeeds before the internal cleanup failure"), FailedDeferredChildParent->GetResult().bSucceeded);
+	if (!WaitForManagedOperationsToSettle(*this, TEXT("The failing internal cleanup"))) return false;
+	TestEqual(TEXT("A parent starts the failing internal cleanup exactly once"), GitLocalSourceControl::Testing::GetDeferredCleanupLaunchCount(), 1);
+	const FString DeferredCleanupDiagnostic = GitLocalSourceControl::Testing::GetLastDeferredCleanupDiagnostic();
+	TestTrue(TEXT("A failed internal deferred cleanup reports its asset path"), DeferredCleanupDiagnostic.Contains(TEXT("/Invalid/DeferredCleanup.DeferredCleanup")));
+	TestTrue(TEXT("A failed internal deferred cleanup gives an actionable recovery instruction"), DeferredCleanupDiagnostic.Contains(TEXT("inspect these assets"), ESearchCase::IgnoreCase));
+	TestEqual(TEXT("A failed internal deferred cleanup is released by the manager"), GitLocalSourceControl::Testing::GetManagedOperationCount(), 0);
+	TestTrue(TEXT("A failed internal deferred cleanup leaves the fixed module pump registered"), GitLocalSourceControl::Testing::HasOperationTicker());
+
+	GitLocalSourceControl::Testing::SetForcePreparedPackageReloadFailure(true);
+	UGitLocalSourceControlOperation* ReloadFailure = UGitLocalSourceControlLibrary::StartDiscardTracked({ AssetObjectPath });
+	if (!TestNotNull(TEXT("A reload-failure operation exists"), ReloadFailure))
+	{
+		GitLocalSourceControl::Testing::SetForcePreparedPackageReloadFailure(false);
+		return false;
+	}
+	UGitLocalSourceControlOperationTestReceiver* ReloadFailureReceiver = NewObject<UGitLocalSourceControlOperationTestReceiver>();
+	if (!TestNotNull(TEXT("A reload-failure operation event receiver exists"), ReloadFailureReceiver))
+	{
+		GitLocalSourceControl::Testing::SetForcePreparedPackageReloadFailure(false);
+		return false;
+	}
+	ReloadFailure->OnProgress.AddDynamic(ReloadFailureReceiver, &UGitLocalSourceControlOperationTestReceiver::HandleProgress);
+	ReloadFailure->OnCompleted.AddDynamic(ReloadFailureReceiver, &UGitLocalSourceControlOperationTestReceiver::HandleCompleted);
+	if (!WaitForOperation(*this, ReloadFailure, TEXT("StartDiscardTracked forced package reload failure")))
+	{
+		GitLocalSourceControl::Testing::SetForcePreparedPackageReloadFailure(false);
+		return false;
+	}
+	GitLocalSourceControl::Testing::SetForcePreparedPackageReloadFailure(false);
+	TestFalse(TEXT("A delayed package reload failure makes the operation fail"), ReloadFailure->GetResult().bSucceeded);
+	TestFalse(TEXT("A delayed package reload failure is reported"), ReloadFailure->GetResult().bReloadSucceeded);
+	TestEqual(TEXT("A delayed package reload failure reaches Failed"), ReloadFailure->GetPhase(), EGitLocalSourceControlOperationPhase::Failed);
+	TestTrue(TEXT("The reload-failure operation broadcasts its worker Reloading phase"), ReloadFailureReceiver->ProgressPhases.Contains(EGitLocalSourceControlOperationPhase::Reloading));
+	TestEqual(TEXT("The reload-failure operation broadcasts exactly one terminal progress phase"), ReloadFailureReceiver->TerminalProgressCount, 1);
+	TestEqual(TEXT("The reload-failure operation broadcasts completion exactly once"), ReloadFailureReceiver->CompletedCount, 1);
+	TestTrue(TEXT("Completion is broadcast after terminal progress following package reload"), ReloadFailureReceiver->bCompletedAfterTerminalProgress);
+	TestFalse(TEXT("Completion observes the final package reload failure"), ReloadFailureReceiver->CompletedResult.bReloadSucceeded);
+	GitLocalSourceControl::Testing::PumpOperations();
+	GitLocalSourceControl::Testing::PumpOperations();
+	TestEqual(TEXT("Additional manager pumps do not repeat completion"), ReloadFailureReceiver->CompletedCount, 1);
+	TestTrue(TEXT("A delayed package reload failure explains the partial disk mutation"), ReloadFailure->GetResult().Errors.ContainsByPredicate([](const FString& Error)
+	{
+		return Error.Contains(TEXT("changed the asset file on disk"));
+	}));
+	LoadedPackage = LoadPackage(nullptr, *PackageName, LOAD_None);
+	if (!TestNotNull(TEXT("The force-failed package can be recovered after the test seam is cleared"), LoadedPackage)) return false;
 	LoadedPackage->SetDirtyFlag(false);
 	TArray<UPackage*> FinalPackagesToUnload;
 	FinalPackagesToUnload.Add(LoadedPackage);
