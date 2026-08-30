@@ -1567,12 +1567,17 @@ namespace GitChangedAssetOperations
 			{
 				return true;
 			}
+
 #if WITH_DEV_AUTOMATION_TESTS
 			if (GitChangedAssetOperationsPrivate::ReloadPackagesForTesting)
 			{
 				return GitChangedAssetOperationsPrivate::ReloadPackagesForTesting(Packages, OutError);
 			}
 #endif
+			UWorld* const CurrentEditorWorld = GitChangedAssetOperationsPrivate::GetCurrentEditorWorld();
+			UPackage* const CurrentEditorWorldPackage = CurrentEditorWorld != nullptr ? CurrentEditorWorld->GetOutermost() : nullptr;
+			const bool bReloadsCurrentEditorWorld = CurrentEditorWorldPackage != nullptr && Packages.Contains(CurrentEditorWorldPackage);
+
 			FText ReloadError;
 			const bool bReloaded = UPackageTools::ReloadPackages(Packages, ReloadError, EReloadPackagesInteractionMode::AssumePositive);
 			if (!ReloadError.IsEmpty())
@@ -1584,13 +1589,9 @@ namespace GitChangedAssetOperations
 			{
 				return true;
 			}
-
-			UWorld* const CurrentEditorWorld = GEditor != nullptr ? GEditor->GetEditorWorldContext().World() : nullptr;
-			const bool bReloadedCurrentWorld = CurrentEditorWorld != nullptr && Packages.Contains(CurrentEditorWorld->GetOutermost());
-			if (bReloadedCurrentWorld)
+			if (bReloadsCurrentEditorWorld)
 			{
-				// UPackageTools intentionally reports false for its CreateNewMapForEditing/
-				// OpenEditorsForAssets current-world route even when that route succeeds.
+				// UPackageTools 对当前 Editor world 走切换并重开地图的特殊路径，成功时也可能返回 false。
 				return true;
 			}
 			OutError = TEXT("UPackageTools did not reload any requested Changed Assets package.");
