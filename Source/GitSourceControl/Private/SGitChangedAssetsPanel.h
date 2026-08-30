@@ -60,6 +60,9 @@ private:
 	FReply HandleCopyPathsClicked();
 	FReply HandleRevertClicked();
 	bool IsStartupGitCapabilityAvailable() const;
+	bool IsPanelBusy() const;
+	bool IsContentEnabled() const;
+	EVisibility GetBusyOverlayVisibility() const;
 	bool HasSelection() const;
 	bool CanRevertSelection() const;
 

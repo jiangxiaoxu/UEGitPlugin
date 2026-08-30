@@ -351,6 +351,53 @@ bool FGitChangedAssetsStatus::CaptureSnapshot(const FString& InGitBinary, const 
 	return true;
 }
 
+bool FGitChangedAssetsStatus::CapturePathsSnapshot(const FString& InGitBinary, const FString& InRepositoryRoot,
+	const FString& InExpectedPinnedHead, const TArray<FString>& InFiles, TArray<FGitChangedAssetEntry>& OutEntries, FString& OutError)
+{
+	OutEntries.Reset();
+	OutError.Reset();
+	if (InGitBinary.IsEmpty() || InRepositoryRoot.IsEmpty() || !GitChangedAssetsStatusPrivate::IsFullObjectId(InExpectedPinnedHead))
+	{
+		OutError = TEXT("Git binary path, repository root, and complete expected HEAD commit are required.");
+		return false;
+	}
+
+	FString RepositoryRoot = FPaths::ConvertRelativePathToFull(InRepositoryRoot);
+	FPaths::NormalizeDirectoryName(RepositoryRoot);
+	FString InitialHead;
+	if (!GitChangedAssetsStatusPrivate::ReadHeadCommitId(InGitBinary, RepositoryRoot, InitialHead, OutError))
+	{
+		return false;
+	}
+	if (!InitialHead.Equals(InExpectedPinnedHead, ESearchCase::IgnoreCase))
+	{
+		OutError = TEXT("Repository HEAD changed while Changed Assets was checking Revert results.");
+		return false;
+	}
+
+	TArray<uint8> StatusOutput;
+	if (!GitSourceControlUtils::RunPathsStatusPorcelainV2(InGitBinary, RepositoryRoot, InFiles, StatusOutput, OutError))
+	{
+		return false;
+	}
+	if (!ParsePorcelainV2(StatusOutput, RepositoryRoot, OutEntries, OutError))
+	{
+		return false;
+	}
+
+	FString CompletedHead;
+	if (!GitChangedAssetsStatusPrivate::ReadHeadCommitId(InGitBinary, RepositoryRoot, CompletedHead, OutError))
+	{
+		return false;
+	}
+	if (!CompletedHead.Equals(InExpectedPinnedHead, ESearchCase::IgnoreCase))
+	{
+		OutError = TEXT("Repository HEAD changed while Changed Assets was checking Revert results.");
+		return false;
+	}
+	return true;
+}
+
 bool FGitChangedAssetsStatus::ParsePorcelainV2(const TArray<uint8>& InOutput, const FString& InRepositoryRoot,
 	TArray<FGitChangedAssetEntry>& OutEntries, FString& OutError)
 {

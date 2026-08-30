@@ -104,7 +104,12 @@ private:
 	void FailRefresh(uint64 CompletedGeneration, FString Error);
 	void ClearPendingRefreshWork();
 	void SetRefreshActivity(EGitChangedAssetsRefreshPhase InPhase, int32 InCompleted, int32 InTotal);
-	void CompleteRevert(bool bDiskMutationSucceeded, bool bEditorReloadSucceeded, FString ResultMessage);
+	void CompleteRevert(bool bDiskMutationSucceeded, bool bEditorReloadSucceeded, FString ResultMessage, TArray<FString> AffectedFiles);
+	void RefreshPostRevertAffectedFiles(TArray<FString> AffectedFiles, bool bPreserveLastError);
+	void CompletePostRevertAffectedFilesRefresh(uint64 CompletedGeneration, TArray<FString> AffectedFiles,
+		TArray<FGitChangedAssetEntry> ExactStatusEntries, double ExactStatusDurationSeconds, FString Error);
+	bool RemoveRevertedEntriesFromSnapshot(const TArray<FString>& AffectedFiles, FString& OutError);
+	void FallBackToFullPostRevertRefresh(uint64 CompletedGeneration, bool bPreserveLastError, FString Reason);
 	bool ConfirmRevert(const TArray<FGitChangedAssetEntry>& Entries, FString& OutError);
 
 	TOptional<FGitChangedAssetSnapshot> Snapshot;

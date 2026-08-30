@@ -330,6 +330,31 @@ namespace GitChangedAssetsControllerPrivate
 		}
 		return Result.Errors.IsEmpty() ? TEXT("Revert failed without a diagnostic.") : FString::Join(Result.Errors, TEXT("\n"));
 	}
+
+	FString NormalizeChangedAssetPathKey(FString InPath)
+	{
+		FPaths::NormalizeFilename(InPath);
+#if PLATFORM_WINDOWS
+		InPath.ToLowerInline();
+#endif
+		return InPath;
+	}
+
+	bool EntryTouchesAffectedPath(const FGitChangedAssetEntry& InEntry, const TSet<FString>& InAffectedPathKeys)
+	{
+		return InAffectedPathKeys.Contains(NormalizeChangedAssetPathKey(InEntry.AbsoluteFilename)) ||
+			(!InEntry.RenameFromAbsoluteFilename.IsEmpty() &&
+				InAffectedPathKeys.Contains(NormalizeChangedAssetPathKey(InEntry.RenameFromAbsoluteFilename)));
+	}
+
+	void MarkAffectedPathsMatchedByEntry(const FGitChangedAssetEntry& InEntry, TSet<FString>& InOutUnmatchedPathKeys)
+	{
+		InOutUnmatchedPathKeys.Remove(NormalizeChangedAssetPathKey(InEntry.AbsoluteFilename));
+		if (!InEntry.RenameFromAbsoluteFilename.IsEmpty())
+		{
+			InOutUnmatchedPathKeys.Remove(NormalizeChangedAssetPathKey(InEntry.RenameFromAbsoluteFilename));
+		}
+	}
 }
 
 FGitChangedAssetsController::FGitChangedAssetsController()
@@ -595,11 +620,12 @@ void FGitChangedAssetsController::RevertToHead(TArray<FGitChangedAssetEntry> Ent
 			.RevertToHead(PinnedHead, Entries, Callbacks, Result);
 		const bool bEditorReloadSucceeded = Result.bReloadSucceeded;
 		FString ResultMessage = GitChangedAssetsControllerPrivate::MakeRevertResultMessage(Result);
-		GitChangedAssetsControllerPrivate::InvokeOnGameThreadAndWait(Dispatcher, [WeakController, bSucceeded, bEditorReloadSucceeded, ResultMessage = MoveTemp(ResultMessage)]() mutable
+		GitChangedAssetsControllerPrivate::InvokeOnGameThreadAndWait(Dispatcher, [WeakController, bSucceeded, bEditorReloadSucceeded,
+			ResultMessage = MoveTemp(ResultMessage), AffectedFiles = MoveTemp(Result.AffectedFiles)]() mutable
 		{
 			if (const TSharedPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> Controller = WeakController.Pin())
 			{
-				Controller->CompleteRevert(bSucceeded, bEditorReloadSucceeded, MoveTemp(ResultMessage));
+				Controller->CompleteRevert(bSucceeded, bEditorReloadSucceeded, MoveTemp(ResultMessage), MoveTemp(AffectedFiles));
 			}
 			return true;
 		});
@@ -640,8 +666,9 @@ void FGitChangedAssetsController::CompleteRefresh(const uint64 CompletedGenerati
 	}
 	if (PostRevertStatusRefreshStartSeconds > 0.0)
 	{
-		UE_LOG(LogGitStandalone, Log, TEXT("Changed Assets Revert full Git status refresh: entries=%d elapsed=%.3fs"),
-			CompletedSnapshot->Entries.Num(), FPlatformTime::Seconds() - PostRevertStatusRefreshStartSeconds);
+		UE_LOG(LogGitStandalone, Log, TEXT("Changed Assets Revert full Git status refresh: entries=%d gitStatus=%.3fs total=%.3fs"),
+			CompletedSnapshot->Entries.Num(), CompletedSnapshot->StatusDurationSeconds,
+			FPlatformTime::Seconds() - PostRevertStatusRefreshStartSeconds);
 		PostRevertStatusRefreshStartSeconds = 0.0;
 	}
 
@@ -1048,7 +1075,8 @@ bool FGitChangedAssetsController::ConfirmRevert(const TArray<FGitChangedAssetEnt
 	return true;
 }
 
-void FGitChangedAssetsController::CompleteRevert(const bool bDiskMutationSucceeded, const bool bEditorReloadSucceeded, FString ResultMessage)
+void FGitChangedAssetsController::CompleteRevert(const bool bDiskMutationSucceeded, const bool bEditorReloadSucceeded, FString ResultMessage,
+	TArray<FString> AffectedFiles)
 {
 	check(IsInGameThread());
 	if (bShuttingDown.Load())
@@ -1068,14 +1096,191 @@ void FGitChangedAssetsController::CompleteRevert(const bool bDiskMutationSucceed
 		LastError = MoveTemp(ResultMessage);
 		ActivityChangedDelegate.Broadcast();
 		PostRevertStatusRefreshStartSeconds = FPlatformTime::Seconds();
-		Refresh(false);
+		RefreshPostRevertAffectedFiles(MoveTemp(AffectedFiles), true);
 		return;
 	}
 
 	LastError.Empty();
 	ActivityChangedDelegate.Broadcast();
 	PostRevertStatusRefreshStartSeconds = FPlatformTime::Seconds();
-	Refresh();
+	RefreshPostRevertAffectedFiles(MoveTemp(AffectedFiles), false);
+}
+
+void FGitChangedAssetsController::RefreshPostRevertAffectedFiles(TArray<FString> AffectedFiles, const bool bPreserveLastError)
+{
+	check(IsInGameThread());
+	if (bShuttingDown.Load())
+	{
+		return;
+	}
+	if (!Snapshot.IsSet() || AffectedFiles.IsEmpty())
+	{
+		const uint64 RequestedGeneration = ++Generation;
+		FallBackToFullPostRevertRefresh(RequestedGeneration, bPreserveLastError,
+			TEXT("Changed Assets Revert did not retain a snapshot and exact affected-file closure."));
+		return;
+	}
+
+	ClearPendingRefreshWork();
+	bRefreshing = true;
+	bPreserveLastErrorForRefresh = bPreserveLastError;
+	const uint64 RequestedGeneration = ++Generation;
+	SetRefreshActivity(EGitChangedAssetsRefreshPhase::GitStatus, 0, 1);
+	const FString GitBinary = Snapshot->GitBinary;
+	const FString RepositoryRoot = Snapshot->RepositoryRoot;
+	const FString PinnedHead = Snapshot->PinnedHead;
+	const TWeakPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> WeakController = AsShared();
+	const TSharedRef<GitChangedAssetsControllerPrivate::FWorkerState, ESPMode::ThreadSafe> RefreshWorkerState = WorkerState.ToSharedRef();
+	const TSharedRef<GitChangedAssetsControllerPrivate::FGameThreadDispatcher, ESPMode::ThreadSafe> Dispatcher = GameThreadDispatcher.ToSharedRef();
+	const TSharedRef<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe> CancellationContext =
+		MakeShared<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>();
+	if (!RefreshWorkerState->TryBegin(CancellationContext, true))
+	{
+		FallBackToFullPostRevertRefresh(RequestedGeneration, bPreserveLastError,
+			TEXT("Changed Assets could not start its exact Revert status refresh."));
+		return;
+	}
+
+	Async(EAsyncExecution::ThreadPool, [WeakController, RequestedGeneration, GitBinary, RepositoryRoot, PinnedHead,
+		AffectedFiles = MoveTemp(AffectedFiles), RefreshWorkerState, Dispatcher, CancellationContext]() mutable
+	{
+		GitChangedAssetsControllerPrivate::FScopedWorker Worker(RefreshWorkerState, CancellationContext);
+		GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(CancellationContext);
+		const double StatusStartSeconds = FPlatformTime::Seconds();
+		TArray<FGitChangedAssetEntry> ExactStatusEntries;
+		FString Error;
+		if (!FGitChangedAssetsStatus::CapturePathsSnapshot(GitBinary, RepositoryRoot, PinnedHead, AffectedFiles, ExactStatusEntries, Error) && Error.IsEmpty())
+		{
+			Error = TEXT("Changed Assets Revert exact status refresh failed without a diagnostic.");
+		}
+		const double ExactStatusDurationSeconds = FPlatformTime::Seconds() - StatusStartSeconds;
+		GitChangedAssetsControllerPrivate::InvokeOnGameThreadAndWait(Dispatcher, [WeakController, RequestedGeneration,
+			AffectedFiles = MoveTemp(AffectedFiles), ExactStatusEntries = MoveTemp(ExactStatusEntries), ExactStatusDurationSeconds, Error = MoveTemp(Error)]() mutable
+		{
+			if (const TSharedPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> Controller = WeakController.Pin())
+			{
+				Controller->CompletePostRevertAffectedFilesRefresh(RequestedGeneration, MoveTemp(AffectedFiles), MoveTemp(ExactStatusEntries),
+					ExactStatusDurationSeconds, MoveTemp(Error));
+			}
+			return true;
+		});
+	});
+}
+
+void FGitChangedAssetsController::CompletePostRevertAffectedFilesRefresh(const uint64 CompletedGeneration, TArray<FString> AffectedFiles,
+	TArray<FGitChangedAssetEntry> ExactStatusEntries, const double ExactStatusDurationSeconds, FString Error)
+{
+	check(IsInGameThread());
+	if (bShuttingDown.Load() || CompletedGeneration != Generation)
+	{
+		return;
+	}
+	SetRefreshActivity(EGitChangedAssetsRefreshPhase::GitStatus, 1, 1);
+	const bool bPreserveLastError = bPreserveLastErrorForRefresh;
+	bPreserveLastErrorForRefresh = false;
+	if (!Error.IsEmpty())
+	{
+		FallBackToFullPostRevertRefresh(CompletedGeneration, bPreserveLastError, MoveTemp(Error));
+		return;
+	}
+	if (!ExactStatusEntries.IsEmpty())
+	{
+		FallBackToFullPostRevertRefresh(CompletedGeneration, bPreserveLastError,
+			TEXT("Changed Assets Revert exact status still contains changed asset records."));
+		return;
+	}
+	if (!RemoveRevertedEntriesFromSnapshot(AffectedFiles, Error))
+	{
+		FallBackToFullPostRevertRefresh(CompletedGeneration, bPreserveLastError, MoveTemp(Error));
+		return;
+	}
+
+	Snapshot->Generation = CompletedGeneration;
+	bRefreshing = false;
+	if (!bPreserveLastError)
+	{
+		LastError.Empty();
+	}
+	if (PostRevertStatusRefreshStartSeconds > 0.0)
+	{
+		UE_LOG(LogGitStandalone, Log, TEXT("Changed Assets Revert exact Git status refresh: files=%d status=%.3fs total=%.3fs"),
+			AffectedFiles.Num(), ExactStatusDurationSeconds, FPlatformTime::Seconds() - PostRevertStatusRefreshStartSeconds);
+		PostRevertStatusRefreshStartSeconds = 0.0;
+	}
+	SetRefreshActivity(EGitChangedAssetsRefreshPhase::Idle, 0, 0);
+	RowsChangedDelegate.Broadcast();
+}
+
+bool FGitChangedAssetsController::RemoveRevertedEntriesFromSnapshot(const TArray<FString>& AffectedFiles, FString& OutError)
+{
+	check(IsInGameThread());
+	OutError.Reset();
+	if (!Snapshot.IsSet() || AffectedFiles.IsEmpty())
+	{
+		OutError = TEXT("Changed Assets Revert cannot patch an empty snapshot or affected-file closure.");
+		return false;
+	}
+
+	TSet<FString> AffectedPathKeys;
+	for (const FString& AffectedFile : AffectedFiles)
+	{
+		const FString PathKey = GitChangedAssetsControllerPrivate::NormalizeChangedAssetPathKey(FPaths::ConvertRelativePathToFull(AffectedFile));
+		if (PathKey.IsEmpty())
+		{
+			OutError = TEXT("Changed Assets Revert returned an invalid affected-file path.");
+			return false;
+		}
+		AffectedPathKeys.Add(PathKey);
+	}
+
+	for (const TPair<FString, FGitChangedAssetDataLayerOwnerCache>& OwnerCache : Snapshot->DataLayerOwnerCaches)
+	{
+		for (const FGitChangedAssetWorldDataLayersIndexEntry& WorldDataLayers : OwnerCache.Value.WorldDataLayers)
+		{
+			const FString CachePathKey = GitChangedAssetsControllerPrivate::NormalizeChangedAssetPathKey(
+				FPaths::ConvertRelativePathToFull(Snapshot->RepositoryRoot, WorldDataLayers.RepositoryRelativePath));
+			if (AffectedPathKeys.Contains(CachePathKey))
+			{
+				OutError = TEXT("Changed Assets Revert affected a cached WorldDataLayers entry, so it requires a full refresh.");
+				return false;
+			}
+		}
+	}
+
+	TSet<FString> UnmatchedPathKeys = AffectedPathKeys;
+	for (const FGitChangedAssetEntry& Entry : Snapshot->Entries)
+	{
+		if (GitChangedAssetsControllerPrivate::EntryTouchesAffectedPath(Entry, AffectedPathKeys))
+		{
+			GitChangedAssetsControllerPrivate::MarkAffectedPathsMatchedByEntry(Entry, UnmatchedPathKeys);
+		}
+	}
+	if (!UnmatchedPathKeys.IsEmpty())
+	{
+		OutError = TEXT("Changed Assets Revert affected-file closure no longer matches the current snapshot.");
+		return false;
+	}
+
+	Snapshot->Entries.RemoveAll([&AffectedPathKeys](const FGitChangedAssetEntry& Entry)
+	{
+		return GitChangedAssetsControllerPrivate::EntryTouchesAffectedPath(Entry, AffectedPathKeys);
+	});
+	return true;
+}
+
+void FGitChangedAssetsController::FallBackToFullPostRevertRefresh(const uint64 CompletedGeneration, const bool bPreserveLastError, FString Reason)
+{
+	check(IsInGameThread());
+	if (bShuttingDown.Load() || CompletedGeneration != Generation)
+	{
+		return;
+	}
+	UE_LOG(LogGitStandalone, Warning, TEXT("Changed Assets Revert exact Git status refresh cannot patch the snapshot: %s. Falling back to full refresh."),
+		*Reason);
+	bRefreshing = false;
+	bPreserveLastErrorForRefresh = false;
+	SetRefreshActivity(EGitChangedAssetsRefreshPhase::Idle, 0, 0);
+	Refresh(!bPreserveLastError);
 }
 
 #undef LOCTEXT_NAMESPACE

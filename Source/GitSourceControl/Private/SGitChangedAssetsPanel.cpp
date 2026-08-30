@@ -17,6 +17,7 @@
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Input/SComboBox.h"
 #include "Widgets/Input/SSearchBox.h"
+#include "Widgets/Images/SThrobber.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/SBoxPanel.h"
@@ -566,12 +567,15 @@ void SGitChangedAssetsPanel::Construct(const FArguments& InArgs)
 
 	ChildSlot
 	[
-		SNew(SBorder)
-		.Padding(8.0f)
-		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-		.IsEnabled(this, &SGitChangedAssetsPanel::IsStartupGitCapabilityAvailable)
+		SNew(SOverlay)
+		+ SOverlay::Slot()
 		[
-			SNew(SVerticalBox)
+			SNew(SBorder)
+			.Padding(8.0f)
+			.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+			.IsEnabled(this, &SGitChangedAssetsPanel::IsContentEnabled)
+			[
+				SNew(SVerticalBox)
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			.Padding(0.0f, 0.0f, 0.0f, 6.0f)
@@ -699,6 +703,43 @@ void SGitChangedAssetsPanel::Construct(const FArguments& InArgs)
 					+ SHeaderRow::Column(StatusColumn).DefaultLabel(LOCTEXT("ChangedAssetsStatus", "Status")).FillWidth(0.08f)
 				)
 			]
+			]
+		]
+		+ SOverlay::Slot()
+		[
+			SNew(SBorder)
+			.Visibility(this, &SGitChangedAssetsPanel::GetBusyOverlayVisibility)
+			.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
+			.BorderBackgroundColor(FLinearColor(0.02f, 0.02f, 0.02f, 0.70f))
+			[
+				SNew(SBox)
+				.HAlign(HAlign_Center)
+				.VAlign(VAlign_Center)
+				[
+					SNew(SBorder)
+					.Padding(FMargin(20.0f, 14.0f))
+					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+					.BorderBackgroundColor(FLinearColor(0.06f, 0.06f, 0.06f, 0.96f))
+					[
+						SNew(SHorizontalBox)
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(0.0f, 0.0f, 10.0f, 0.0f)
+						[
+							SNew(SCircularThrobber)
+						]
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(STextBlock)
+							.Text(this, &SGitChangedAssetsPanel::GetStatusText)
+							.ColorAndOpacity(FSlateColor::UseForeground())
+						]
+					]
+				]
+			]
 		]
 	];
 
@@ -725,9 +766,8 @@ void SGitChangedAssetsPanel::HandleControllerRowsChanged()
 
 void SGitChangedAssetsPanel::HandleControllerActivityChanged()
 {
-	// Progress and action-state transitions intentionally do not reconcile/filter/sort
-	// the virtualized row model. Dynamic row attributes render metadata only when rows change.
-	Invalidate(EInvalidateWidgetReason::Paint);
+	// 活动状态只更新控件属性和忙碌遮罩, 不重建虚拟化行模型.
+	Invalidate(EInvalidateWidgetReason::LayoutAndVolatility);
 	RequestInitialRefreshIfAvailable();
 }
 
@@ -1105,6 +1145,21 @@ bool SGitChangedAssetsPanel::CanRevertSelection() const
 bool SGitChangedAssetsPanel::IsStartupGitCapabilityAvailable() const
 {
 	return GitSourceControlUtils::IsStartupGitCapabilityAvailable();
+}
+
+bool SGitChangedAssetsPanel::IsPanelBusy() const
+{
+	return Controller.IsValid() && (Controller->IsRefreshing() || Controller->IsReverting());
+}
+
+bool SGitChangedAssetsPanel::IsContentEnabled() const
+{
+	return IsStartupGitCapabilityAvailable() && !IsPanelBusy();
+}
+
+EVisibility SGitChangedAssetsPanel::GetBusyOverlayVisibility() const
+{
+	return IsPanelBusy() ? EVisibility::Visible : EVisibility::Collapsed;
 }
 
 FReply SGitChangedAssetsPanel::HandleEntryMouseButtonDown(FEntryPtr Entry, const FPointerEvent& MouseEvent)

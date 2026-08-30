@@ -18,6 +18,12 @@ public:
 	static bool CaptureSnapshot(const FString& InGitBinary, const FString& InRepositoryRoot, uint64 InGeneration,
 		FGitChangedAssetSnapshot& OutSnapshot, FString& OutError);
 
+	/**
+	 * 查询固定 HEAD 下的精确 Changed Assets 路径. 调用方只可在结果为空时基于既有 snapshot 做安全增量移除.
+	 */
+	static bool CapturePathsSnapshot(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InExpectedPinnedHead,
+		const TArray<FString>& InFiles, TArray<FGitChangedAssetEntry>& OutEntries, FString& OutError);
+
 	/** 供低成本自动化测试及 status snapshot 使用的 NUL-safe porcelain-v2 parser. */
 	static bool ParsePorcelainV2(const TArray<uint8>& InOutput, const FString& InRepositoryRoot,
 		TArray<FGitChangedAssetEntry>& OutEntries, FString& OutError);
