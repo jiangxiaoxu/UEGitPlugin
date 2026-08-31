@@ -92,7 +92,7 @@ namespace GitSourceControlAssetOperations
 		/** Resolve one nearest Git root; reject mixed-root requests instead of mutating a parent repository. */
 		static bool ResolveSingleRepositoryRoot(const TArray<FString>& InFiles, const FString& InFallbackRepositoryRoot, FString& OutRepositoryRoot, FString& OutError);
 
-		/** Reject world and external packages; standalone mutation currently supports tracked .uasset files only. */
+		/** Reject world and external packages; map mutations must use the logical map package operation service. */
 		static bool ValidateStandaloneMutationPreflight(const TArray<FString>& InFiles, const TArray<UPackage*>& InLoadedPackages, FString& OutError);
 
 	private:

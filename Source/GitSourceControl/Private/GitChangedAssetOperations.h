@@ -6,6 +6,7 @@
 
 #include "CoreMinimal.h"
 #include "GitChangedAssetsModel.h"
+#include "GitMapPackageSet.h"
 
 class UPackage;
 class UWorld;
@@ -26,6 +27,8 @@ namespace GitChangedAssetOperations
 
 	struct FGitChangedAssetRevertResult
 	{
+		/** Exact Git/worktree mutation completed, even if Editor reload then failed. */
+		bool bDiskMutationSucceeded = false;
 		bool bSucceeded = false;
 		bool bCancelled = false;
 		bool bReloadSucceeded = true;
@@ -40,6 +43,13 @@ namespace GitChangedAssetOperations
 				Errors.Add(InError);
 			}
 		}
+	};
+
+	/** A fixed historical package artifact set applied atomically to one current selection set. */
+	struct FGitChangedAssetRevisionRestoreRequest
+	{
+		FGitChangedAssetMutationSet CurrentMutationSet;
+		FGitPackageRevisionArtifactSet RevisionArtifacts;
 	};
 
 	/** 供确认 UI 展示的 GameThread lifecycle closure. */
@@ -121,8 +131,18 @@ namespace GitChangedAssetOperations
 		bool RevertToHead(const FString& InPinnedHead, const TArray<FGitChangedAssetEntry>& InEntries,
 			const FGitChangedAssetRevertCallbacks& InCallbacks, FGitChangedAssetRevertResult& OutResult) const;
 
-		/** Fast, UI-independent eligibility guard. 不能替代 metadata resolver 的 owner 检查. */
-		static bool ValidateEntries(const TArray<FGitChangedAssetEntry>& InEntries, FString& OutError);
+		/** Atomic selection-driven package transaction. Artifacts include selected package sidecars. */
+		bool RevertToHead(const FGitChangedAssetMutationSet& InMutationSet,
+			const FGitChangedAssetRevertCallbacks& InCallbacks, FGitChangedAssetRevertResult& OutResult) const;
+
+		/** Restore a selected package and its exact sidecars from one validated historical revision. */
+		bool RestorePackageRevision(const FGitChangedAssetRevisionRestoreRequest& InRequest,
+			const FGitChangedAssetRevertCallbacks& InCallbacks, FGitChangedAssetRevertResult& OutResult) const;
+
+		/** Fast, UI-independent eligibility guard for one explicit operation contract. */
+		static bool ValidateEntries(const TArray<FGitChangedAssetEntry>& InEntries, EGitChangedAssetOperationMode InOperationMode, FString& OutError);
+		/** Validate the complete primary/artifact closure under its declared operation contract. */
+		static bool ValidateMutationSet(const FGitChangedAssetMutationSet& InMutationSet, FString& OutError);
 
 	private:
 		FString GitBinary;

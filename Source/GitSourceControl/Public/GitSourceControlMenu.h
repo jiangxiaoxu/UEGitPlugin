@@ -11,6 +11,7 @@
 
 class FMenuBuilder;
 struct FAssetData;
+class UToolMenu;
 class FGitSourceControlMenuLifetimeState;
 
 /** Asset-focused Git actions exposed in the Editor. */
@@ -23,11 +24,15 @@ public:
 private:
 	TSharedRef<class FExtender> OnExtendContentBrowserAssetSelectionMenu(const TArray<FAssetData>& SelectedAssets);
 	void AddAssetMenuEntries(FMenuBuilder& MenuBuilder, const TArray<FAssetData> SelectedAssets);
+	void RegisterActorContextMenu();
+	void AddActorContextMenuEntries(UToolMenu* InMenu);
 
 	void DiscardSelectedAssets(TArray<FAssetData> SelectedAssets);
 	void ViewSelectedAssetHistory(TArray<FAssetData> SelectedAssets, EGitLocalSourceControlHistoryMode Mode);
+	void ViewPackageHistory(FString Filename, EGitLocalSourceControlHistoryMode Mode);
 
 	FDelegateHandle AssetMenuExtenderHandle;
+	FDelegateHandle ActorContextMenuStartupHandle;
 	TSharedPtr<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe> LifetimeState;
 	bool bRegistered = false;
 };

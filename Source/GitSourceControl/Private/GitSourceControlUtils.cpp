@@ -2379,7 +2379,7 @@ bool RunPathsStatusPorcelainV2(const FString& InPathToGitBinary, const FString& 
 	OutError.Reset();
 	if (InPathToGitBinary.IsEmpty() || InRepositoryRoot.IsEmpty() || InFiles.IsEmpty())
 	{
-		OutError = TEXT("Git binary path, repository root, and one or more exact .uasset paths are required.");
+		OutError = TEXT("Git binary path, repository root, and one or more exact package artifact paths are required.");
 		return false;
 	}
 
@@ -2392,9 +2392,16 @@ bool RunPathsStatusPorcelainV2(const FString& InPathToGitBinary, const FString& 
 	{
 		FString AbsoluteFilename = FPaths::ConvertRelativePathToFull(InFile);
 		FPaths::NormalizeFilename(AbsoluteFilename);
-		if (FPaths::DirectoryExists(AbsoluteFilename) || !FPaths::GetExtension(AbsoluteFilename, false).Equals(TEXT("uasset"), ESearchCase::IgnoreCase))
+		const FString Extension = FPaths::GetExtension(AbsoluteFilename, false);
+		const bool bPackageArtifact = Extension.Equals(TEXT("uasset"), ESearchCase::IgnoreCase)
+			|| Extension.Equals(TEXT("umap"), ESearchCase::IgnoreCase)
+			|| Extension.Equals(TEXT("uexp"), ESearchCase::IgnoreCase)
+			|| Extension.Equals(TEXT("ubulk"), ESearchCase::IgnoreCase)
+			|| Extension.Equals(TEXT("uptnl"), ESearchCase::IgnoreCase)
+			|| Extension.Equals(TEXT("upayload"), ESearchCase::IgnoreCase);
+		if (FPaths::DirectoryExists(AbsoluteFilename) || !bPackageArtifact)
 		{
-			OutError = FString::Printf(TEXT("Changed Assets status only accepts explicit .uasset files: %s"), *InFile);
+			OutError = FString::Printf(TEXT("Changed Assets status only accepts explicit package artifact files: %s"), *InFile);
 			return false;
 		}
 
@@ -2423,7 +2430,7 @@ bool RunPathsStatusPorcelainV2(const FString& InPathToGitBinary, const FString& 
 	}
 	if (SeenRelativePaths.IsEmpty())
 	{
-		OutError = TEXT("Changed Assets status requires at least one unique .uasset path.");
+		OutError = TEXT("Changed Assets status requires at least one unique package artifact path.");
 		return false;
 	}
 

@@ -170,11 +170,11 @@ public:
 	UFUNCTION(ScriptCallable)
 	static UGitLocalSourceControlOperation* StartFetchLfsRevision(const FString& AssetObjectPath, const FString& Revision);
 
-/** Force-restores one same-path historical revision. Working, staged, conflicted, untracked, and in-memory changes are discarded without undo. */
+/** Force-restores one same-path historical package revision. Working, staged, conflicted, untracked, and in-memory changes are discarded without undo. */
 	UFUNCTION(ScriptCallable)
 	static UGitLocalSourceControlOperation* StartRestoreRevision(const FString& AssetObjectPath, const FString& Revision);
 
-	/** Discards index and worktree changes only for clean tracked .uasset files and schedules reload after completion. */
+	/** Discards index and worktree changes for selected tracked primary packages. Maps use the logical package-artifact and world lifecycle path. */
 	UFUNCTION(ScriptCallable)
 	static UGitLocalSourceControlOperation* StartDiscardTracked(const TArray<FString>& AssetObjectPaths);
 };

@@ -29,19 +29,27 @@ Read-only job 可由用户取消, window close 和 module shutdown 必须终止�
 - historical package 使用唯一 temp identity。失败或取消的 temp file 立即清理; 成功打开 Diff 的导出保留到当前 Editor session 的 `FCoreDelegates::OnPreExit`, 避免 Diff editor 延迟读取时文件消失。普通 module unload/hot reload 不删除成功导出; pre-exit 只扫描并删除插件专用 `Diff/UEGitPlugin/UEGit-Diff-*` 路径, 不依赖旧 DLL 的 static registry, 也不触碰其他 Diff 文件。
 - Fixed-HEAD 结果可以在 HEAD 改变后显示, 但必须提示用户 Refresh; 不得把新 HEAD 混入旧 snapshot。
 
+## OFPA Actor menu and Diff
+
+- Level Editor Viewport 与 Scene Outliner 的 Actor context menu 只为恰好一个已加载, 已保存, Editor-world 的 OFPA external main actor 注册 `Git (Local) > View Git History...`. 普通 actor, PIE/transient/unsaved actor, child actor, 多选, 混选和 unloaded actor 均不显示入口.
+- Actor menu 只使用 `CurrentPath`; 不提供 `ExactRenames`. Exact rename 对普通 asset 仅表示 Git 已证明的 committed single-parent `R100` path transition, 不代表 Unreal asset identity; OFPA actor package 不据此推断历史归属.
+- Actor History 的 Diff 使用 `SDetailsDiff` 比较 reflected properties. 它不是完整 package diff, 也不展开 component graph 或 subobject graph. workspace 一侧使用当前加载的 actor, 因此包含未保存的内存修改.
+- Actor History 的 Restore 复用现有 HistoricalRestore transaction, 包括 owner/dirty/PIE/LevelInstance/LFS/fingerprint/index/rollback/reload safety. Actor context menu 不提供顶层 Discard; History window 仅在 capability 和 preflight 满足时启用 Restore.
+- context menu 生成只解析 selection, world 和 package path, 不启动 Git process; Git capability gate 仅在用户点击 action 后生效.
+
 ## Asset scope and safety
 
-Changed Assets 与 mutation scope 只处理单个 `.uasset` 文件. `.umap`, `.uexp`, `.ubulk`, `.uptnl`, `.upayload` 等 sidecar 或其他 package 不在本期范围, 不应通过猜测扩展名加入同一操作. 普通 `.uasset`, Blueprint, Animation, DataAsset 以及 OFPA external actor/object 的 `.uasset` 均可进入项目级列表.
+Changed Assets 与 mutation scope 以单个 primary package 为单位, 支持 `.uasset` 和 `.umap`. 每个选中的 primary package 显式展开为同 package 的现有/status-visible sidecars; 不通过目录或猜测扩展名扩大范围. OFPA external actor/object package 仍作为独立 primary, 只有被选中时才进入 mutation.
 
 Changed Assets tab 是 providerless, 显式触发的 repository-wide view: 一次 `git status --porcelain=v2 -z` snapshot 聚合相对固定 `HEAD` 的 `Modified`, `Deleted`, `Added`, `Untracked`, `Renamed` 和 `Conflicted`. 同一路径的 staged 与 worktree 差异合并为一条总体状态, 不暴露 staging UI. 当前 snapshot 仅存于 tab/job 生命周期, generation 用于丢弃过期异步结果.
 
 列表的 Slate selection 是 checkbox, 行高亮, 计数和 Revert 输入的唯一真值. 普通点击切换单项, Shift/Ctrl 使用当前过滤结果的连续范围语义; filter 或 generation 变化必须剔除不可见/过期选择并同步 Slate navigation anchor, 防止隐藏资产进入 Revert.
 
-刷新性能契约是每次只启动一个 repository status process, 解析复杂度随 changed `.uasset` 数量增长, 不执行逐行 Git 查询, 目录递归扫描或网络访问. 刷新 generation 按以下阶段串行推进: `Git status` 固定 repository snapshot, 当前文件 metadata, 固定 `HEAD` metadata, 最后 owner/DataLayer fallback. 所有阶段完成前都保持 `IsRefreshing`, 面板显示当前 phase/progress, `Refresh` 与 `Revert` 均禁用; 旧 generation 的结果直接丢弃. UI 行使用虚拟化列表, metadata 结果按批次回到 Game Thread 更新, activity-only 通知不会触发 row reconcile/filter/sort 重建.
+刷新性能契约是每次只启动一个 repository status process, 解析复杂度随 changed primary package 数量增长, 不执行逐行 Git 查询, 目录递归扫描或网络访问. 刷新 generation 按以下阶段串行推进: `Git status` 固定 repository snapshot, 当前文件 metadata, 固定 `HEAD` metadata, 最后 owner/DataLayer fallback. 所有阶段完成前都保持 `IsRefreshing`, 面板显示当前 phase/progress, `Refresh` 与 `Revert` 均禁用; 旧 generation 的结果直接丢弃. UI 行使用虚拟化列表, metadata 结果按批次回到 Game Thread 更新, activity-only 通知不会触发 row reconcile/filter/sort 重建.
 
-现存 changed `.uasset` 的名称、类型和 object path 以磁盘 package header 为真值; 不为显示 metadata 强制刷新全局 Asset Registry. Asset Registry 只作为 owner level 与 DataLayer topology 的查询源, OFPA 仍优先使用 `OptionalOuterPath`/actor descriptor. 无法唯一解析 owner 时保留原始 path 并禁用 Revert, dirty owner map 同样阻止 OFPA Revert. WorldDataLayers topology 继续使用 Asset Registry 和既有 owner-resolution 路径.
+现存 changed `.uasset` 的名称、类型和 object path 以磁盘 package header 为真值; map 使用 package identity/short name, type 为 `World`. 不为显示 metadata 强制刷新全局 Asset Registry. Asset Registry 只作为 owner level 与 DataLayer topology 的查询源, OFPA 仍优先使用 `OptionalOuterPath`/actor descriptor. 无法唯一解析 owner 时保留原始 path 并 fail closed, dirty owner map 同样阻止 OFPA Revert. WorldDataLayers topology 继续使用 Asset Registry 和既有 owner-resolution 路径.
 
-`Revert to HEAD` 必须复核 workspace fingerprint, HEAD, index snapshot 和单文件 `.uasset` 校验, 并在 repository mutex 内执行 all-or-nothing mutation. `Modified`/`Deleted` 恢复 HEAD 的 index 与 worktree; `Added`/`Untracked` 精确删除文件并清除 index; `Renamed` 成对原子恢复; `Conflicted` 或 owner unresolved 禁用. 操作同时丢弃 staged 与 unstaged 内容, 不执行 `git clean`, 目录删除或模糊 pathspec, 也不提供 Undo. 失败时 rollback 并保留无法恢复的 backup 路径.
+`Revert to HEAD` 必须复核 workspace fingerprint, HEAD, index snapshot 和 package 校验, 并在 repository mutex 内执行 all-or-nothing mutation. selection 只决定 primary package 和已选 OFPA; 单选 map 只 mutation map package artifacts, map+selected OFPA 在一个 transaction 中处理. 未选 OFPA 或 BuiltData 不 mutation, 但未选 OFPA 的 dirty 状态及 owner/lifecycle closure 必须纳入检查. `Modified`/`Deleted` 恢复 HEAD 的 index 与 worktree; `Added`/`Untracked` 精确删除文件并清除 index; `Renamed` 成对原子恢复; `Conflicted`, owner 无法证明, PIE/非 Editor world 或不完整 WorldPartition closure 均 fail closed. sidecar 与 primary 一起处理, 不执行 `git clean`, 目录删除或模糊 pathspec, 也不提供 Undo. 失败时 rollback 并保留无法恢复的 backup 路径.
 
 ## LFS and remote resolution
 
@@ -53,19 +61,20 @@ Repository discovery 只接受用户显式选中的 asset path, 解析 nearest r
 
 ## Tests and release gates
 
-变更至少应覆盖以下边界:
+当前 automation suite 保留 16 个 focused tests, 统一使用 `UEGitPlugin.*` 前缀。自动化只覆盖安全核心:
 
-- startup Git capability gate 恰好执行一次, `Pending`/`Unavailable` 时所有 Git action 均 fail closed 并给出 actionable diagnostic, 同时保留 Content Browser 菜单 discoverability; 安装或升级 Git 后必须重启 Editor 才重新探测。
-- Git gate 完成后的 module idle 和普通 asset lifecycle 不再启动额外 Git process, 且没有 Unreal Source Control modular feature。
-- AS operation manager 仅在 active operation 存在时注册 ticker, terminal 后自动移除; active operation 由 module `FGCObject` registry 保活, 无 public `Tick`, `OnProgress`/`OnCompleted` 只在 Game Thread 派发且 completion 只发生一次并晚于 reload/recovery. Cancel、terminal readback、reload failure `Failed` phase 和 partial-disk diagnostic 均需覆盖。
-- CurrentPath、multi-hop `R100`、fixed HEAD、250 条上限和无 `--follow`。
-- Diff 三种选择模式、跨 rename path、类型不兼容和 temp cleanup。
-- LFS capability 在首次需要 LFS 的显式操作中 lazy 探测, 只缓存成功的 3.7.1+ 结果; 缺失、版本过低或瞬时失败不缓存, 当前动作失败且下次显式 LFS 动作重试. cache hit 零 network fetch; miss 只进行目标 commit/path fetch; ambiguous remote 在网络前失败.
-- Restore/Discard 的 dirty、staged、conflict、untracked、index-added、package load/reload、rollback 和 index invariants。
-- Changed Assets 的 repository-wide status parser, `.uasset` state aggregation, Added/Untracked 删除, Rename 原子回退, OFPA owner unresolved/dirty-map gate, generation cancellation 和 mutation guard.
-- Changed Assets refresh phase/progress 从 status 持续到 current/HEAD/owner metadata 完成, 期间 Refresh/Revert 禁用; 现存文件使用 package-header truth, activity-only 更新不重建 rows, WDL topology 沿用 Asset Registry/既有 owner-resolution 路径, 且无 DirectoryWatcher、后台 polling 或全局 Asset Registry refresh.
-- window close、cancel、module shutdown 时无遗留 Git process、notification 或 temp package。
+- repository-wide status、primary package 聚合、fixed `HEAD` 和普通资产的 multi-hop `R100` exact rename.
+- LFS lazy capability、目标 commit/path fetch、OID/size 校验和 ambiguous remote fail closed。
+- Git index/worktree rollback、dirty/staged/conflict/untracked rejection, 以及 map + selected OFPA 的 all-or-nothing transaction 和 exact sidecars。
+- package reload、dirty owner、historical conflict、World Partition lifecycle gate 和失败后的 rollback 诊断。
+- `Standalone.GameThreadUiLifetime` 中的 operation UI state lifetime、Game Thread destruction、pre-commit cancel、post-commit safe shutdown, 以及 Actor target resolver.
+
+以下项目只作为人工 GUI 验收, 不宣称由 automation 覆盖:
+
+- Viewport/Scene Outliner 中 Actor menu 的可见性、selection gate 和 zero-Git menu generation。
+- Actor History 的 `CurrentPath`-only 行为, 不显示 `ExactRenames`。
+- History window 的 `SDetailsDiff` 窗口、Diff 按钮启用状态和 `Restore Selected...` capability/preflight 交互; DetailsDiff window/artifact cleanup 与 module shutdown lifecycle 结合 production lifecycle review 验收.
 
 文档和发布检查还必须确认 `UGitLocalSourceControlOperation` 不再出现在 Blueprint surface, `Task_GitAssetRestoreViaApi` 和 `Task_GitAssetHistoryPerformance` 两个 AngelScript workflow 只绑定 progress/completion events, 不手动 Tick; `GetProviderInfo(AssetObjectPath)` 与 nearest repository 解析一致.
 
-交付前运行 `npm run build:regular`, 相关 Unreal automation filters, `npm run as:diagnostics` 和 `git diff --check`。需要 C++/AS API 变化时验证真实 generated surface。最终必须有独立 reviewer 审核 providerless 边界、零隐式 Git、LFS/Restore safety、API surface、测试证据和文档结论。
+交付前运行 `npm run build:regular`, `npm run test:unreal:automation -- UEGitPlugin`, `npm run as:diagnostics` 和 `git diff --check`。需要 C++/AS API 变化时验证真实 generated surface。最终必须有独立 reviewer 审核 providerless 边界、零隐式 Git、LFS/Restore safety、API surface、测试证据和文档结论。

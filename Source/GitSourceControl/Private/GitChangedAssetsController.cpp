@@ -529,7 +529,16 @@ void FGitChangedAssetsController::RevertToHead(TArray<FGitChangedAssetEntry> Ent
 	}
 
 	FString EligibilityError;
-	if (!GitChangedAssetOperations::FGitChangedAssetOperations::ValidateEntries(Entries, EligibilityError))
+	if (!GitChangedAssetOperations::FGitChangedAssetOperations::ValidateEntries(Entries,
+		EGitChangedAssetOperationMode::ChangedAssetsRevert, EligibilityError))
+	{
+		LastError = MoveTemp(EligibilityError);
+		ActivityChangedDelegate.Broadcast();
+		return;
+	}
+	FGitChangedAssetMutationSet MutationSet;
+	if (!GitMapPackageSet::BuildSelectionMutationSet(Snapshot.GetValue(), Entries,
+		EGitChangedAssetOperationMode::ChangedAssetsRevert, MutationSet, EligibilityError))
 	{
 		LastError = MoveTemp(EligibilityError);
 		ActivityChangedDelegate.Broadcast();
@@ -540,7 +549,6 @@ void FGitChangedAssetsController::RevertToHead(TArray<FGitChangedAssetEntry> Ent
 	LastError.Empty();
 	const FString GitBinary = Snapshot->GitBinary;
 	const FString RepositoryRoot = Snapshot->RepositoryRoot;
-	const FString PinnedHead = Snapshot->PinnedHead;
 	const TWeakPtr<FGitChangedAssetsController, ESPMode::ThreadSafe> WeakController = AsShared();
 	const TSharedRef<GitChangedAssetsControllerPrivate::FWorkerState, ESPMode::ThreadSafe> RevertWorkerState = WorkerState.ToSharedRef();
 	const TSharedRef<GitChangedAssetsControllerPrivate::FGameThreadDispatcher, ESPMode::ThreadSafe> Dispatcher = GameThreadDispatcher.ToSharedRef();
@@ -555,7 +563,7 @@ void FGitChangedAssetsController::RevertToHead(TArray<FGitChangedAssetEntry> Ent
 	}
 	ActivityChangedDelegate.Broadcast();
 
-	Async(EAsyncExecution::ThreadPool, [WeakController, GitBinary, RepositoryRoot, PinnedHead, Entries = MoveTemp(Entries), RevertWorkerState, Dispatcher, CancellationContext]() mutable
+	Async(EAsyncExecution::ThreadPool, [WeakController, GitBinary, RepositoryRoot, MutationSet = MoveTemp(MutationSet), RevertWorkerState, Dispatcher, CancellationContext]() mutable
 	{
 		GitChangedAssetsControllerPrivate::FScopedWorker Worker(RevertWorkerState, CancellationContext);
 		GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(CancellationContext);
@@ -617,7 +625,7 @@ void FGitChangedAssetsController::RevertToHead(TArray<FGitChangedAssetEntry> Ent
 
 		GitChangedAssetOperations::FGitChangedAssetRevertResult Result;
 		const bool bSucceeded = GitChangedAssetOperations::FGitChangedAssetOperations(GitBinary, RepositoryRoot)
-			.RevertToHead(PinnedHead, Entries, Callbacks, Result);
+			.RevertToHead(MutationSet, Callbacks, Result);
 		const bool bEditorReloadSucceeded = Result.bReloadSucceeded;
 		FString ResultMessage = GitChangedAssetsControllerPrivate::MakeRevertResultMessage(Result);
 		GitChangedAssetsControllerPrivate::InvokeOnGameThreadAndWait(Dispatcher, [WeakController, bSucceeded, bEditorReloadSucceeded,

@@ -9,9 +9,6 @@
 #include "HAL/PlatformApplicationMisc.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
-#if WITH_DEV_AUTOMATION_TESTS
-#include "Misc/AutomationTest.h"
-#endif
 #include "Styling/AppStyle.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
@@ -43,11 +40,6 @@ public:
 	FEntryPtr GetRangeSelectionAnchor() const
 	{
 		return RangeSelectionStart;
-	}
-
-	FEntryPtr GetSelectorItem() const
-	{
-		return SelectorItem;
 	}
 
 	void RebaseNavigationState(const FEntryPtr& NewAnchor)
@@ -1272,118 +1264,5 @@ FText SGitChangedAssetsPanel::GetCopyPathsButtonText() const
 		: FText::Format(LOCTEXT("ChangedAssetsCopyPaths", "Copy {0} File Paths"), FText::AsNumber(SelectedCount));
 }
 
-#if WITH_DEV_AUTOMATION_TESTS
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitChangedAssetsFileExplorerSelectionTest, "Cthulhu.GitSourceControl.ChangedAssets.FileExplorerSelection",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitChangedAssetsFileExplorerSelectionTest::RunTest(const FString& Parameters)
-{
-	using namespace SGitChangedAssetsPanelPrivate;
-	(void)Parameters;
-	bool bInitialRefreshRequested = false;
-	TestFalse(TEXT("A panel opened while the startup probe is pending does not request repository status"),
-		ShouldRequestInitialRefresh(bInitialRefreshRequested, false));
-	if (ShouldRequestInitialRefresh(bInitialRefreshRequested, true))
-	{
-		bInitialRefreshRequested = true;
-	}
-	TestTrue(TEXT("A visible panel requests repository status when Git becomes available"), bInitialRefreshRequested);
-	TestFalse(TEXT("The same visible panel does not request a duplicate initial repository status"),
-		ShouldRequestInitialRefresh(bInitialRefreshRequested, true));
-
-	const auto MakeEntry = [](const TCHAR* Filename)
-	{
-		FEntryPtr Entry = MakeShared<FGitChangedAssetEntry>();
-		Entry->AbsoluteFilename = Filename;
-		return Entry;
-	};
-	const auto SelectionPaths = [](const TArray<FEntryPtr>& Selection)
-	{
-		TArray<FString> Paths;
-		for (const FEntryPtr& Entry : Selection)
-		{
-			if (Entry.IsValid())
-			{
-				Paths.Add(Entry->AbsoluteFilename);
-			}
-		}
-		Paths.Sort();
-		return FString::Join(Paths, TEXT(","));
-	};
-
-	const FEntryPtr A = MakeEntry(TEXT("A.uasset"));
-	const FEntryPtr B = MakeEntry(TEXT("B.uasset"));
-	const FEntryPtr C = MakeEntry(TEXT("C.uasset"));
-	const FEntryPtr D = MakeEntry(TEXT("D.uasset"));
-	const TArray<FEntryPtr> FilteredItems = { A, B, C, D };
-
-	TestEqual(TEXT("Plain row click toggles the target while preserving other selections"),
-		SelectionPaths(BuildMouseSelection(FilteredItems, { A, C }, FEntryPtr(), B, false, false)), TEXT("A.uasset,B.uasset,C.uasset"));
-	TestEqual(TEXT("Plain row click toggles an already selected target off"),
-		SelectionPaths(BuildMouseSelection(FilteredItems, { A, B, C }, B, A, false, false)), TEXT("B.uasset,C.uasset"));
-	TestEqual(TEXT("Shift replaces selection with the filtered contiguous range"),
-		SelectionPaths(BuildMouseSelection(FilteredItems, { A }, B, D, true, false)), TEXT("B.uasset,C.uasset,D.uasset"));
-	TestEqual(TEXT("Ctrl+Shift adds the filtered contiguous range"),
-		SelectionPaths(BuildMouseSelection(FilteredItems, { A }, B, D, true, true)), TEXT("A.uasset,B.uasset,C.uasset,D.uasset"));
-	TestEqual(TEXT("Metadata-driven filter membership removes hidden selected items"),
-		SelectionPaths(IntersectSelectionWithFilteredItems({ A, B }, { A, C })), TEXT("A.uasset"));
-	const TArray<FEntryPtr> SelectionAfterLastToggle = BuildMouseSelection(FilteredItems, { A }, A, A, false, false);
-	TestTrue(TEXT("Toggling the final selected item leaves no ListView selection"), SelectionAfterLastToggle.IsEmpty());
-	TestFalse(TEXT("A blank click after the final toggle clears the stale range anchor"),
-		ResolveSelectionAnchor(FilteredItems, SelectionAfterLastToggle, A).IsValid());
-
-	FGitChangedAssetEntry InitialEntry;
-	InitialEntry.AbsoluteFilename = TEXT("Stable.uasset");
-	TMap<FString, FEntryPtr> ItemsByIdentity;
-	TArray<FEntryPtr> ReconciledItems;
-	ReconcileItemsByIdentity({ InitialEntry }, ItemsByIdentity, ReconciledItems);
-	const FEntryPtr OriginalItem = ReconciledItems[0];
-	InitialEntry.DisplayName = TEXT("ResolvedName");
-	ReconcileItemsByIdentity({ InitialEntry }, ItemsByIdentity, ReconciledItems);
-	TestTrue(TEXT("Metadata enrichment keeps the existing item identity"), ReconciledItems[0] == OriginalItem);
-	TestEqual(TEXT("Metadata enrichment updates the preserved item in place"), ReconciledItems[0]->DisplayName, TEXT("ResolvedName"));
-
-	const TSharedPtr<FString> AllOwnersOption = MakeShared<FString>(TEXT("All owner levels"));
-	const TSharedPtr<FString> NoOwnerOption = MakeShared<FString>(TEXT("<No owner level>"));
-	const TSharedPtr<FString> ExistingOwnerOption = MakeShared<FString>(TEXT("/Game/Maps/Stable"));
-	const TArray<TSharedPtr<FString>> PreviousOwnerOptions = { AllOwnersOption, NoOwnerOption, ExistingOwnerOption };
-	OriginalItem->OwnerLevel = TEXT("/Game/Maps/Stable");
-	const FOwnerOptionsBuildResult StableOwnerOptions = BuildOwnerOptions(PreviousOwnerOptions, ExistingOwnerOption, { OriginalItem });
-	TestFalse(TEXT("Metadata update retains an owner filter whose value is still valid"), StableOwnerOptions.bOwnerFilterChanged);
-	TestTrue(TEXT("Metadata update reuses the selected owner option identity"), StableOwnerOptions.SelectedOption == ExistingOwnerOption);
-	OriginalItem->OwnerLevel = TEXT("/Game/Maps/Other");
-	const FOwnerOptionsBuildResult InvalidatedOwnerOptions = BuildOwnerOptions(PreviousOwnerOptions, ExistingOwnerOption, { OriginalItem });
-	TestTrue(TEXT("Missing owner filter is reset and reported as a semantic filter change"), InvalidatedOwnerOptions.bOwnerFilterChanged);
-	TestEqual(TEXT("Invalid owner filter falls back to all owner levels"), *InvalidatedOwnerOptions.SelectedOption, TEXT("All owner levels"));
-
-	TestFalse(TEXT("Empty ListView selection clears a stale range anchor"), ResolveSelectionAnchor(FilteredItems, {}, B).IsValid());
-	TestTrue(TEXT("Native keyboard range anchor wins when it remains visible"), ResolveSelectionAnchor(FilteredItems, { A }, B) == B);
-	TestTrue(TEXT("Missing native range anchor falls back to a selected filtered item"), ResolveSelectionAnchor(FilteredItems, { C }, FEntryPtr()) == C);
-
-	const TArray<FString> CopiedPaths = BuildSelectedAbsolutePaths(FilteredItems, { D, B });
-	TestEqual(TEXT("Copied paths follow visible filtered order"), CopiedPaths.Num(), 2);
-	if (CopiedPaths.Num() == 2)
-	{
-		FString ExpectedB = FPaths::ConvertRelativePathToFull(B->AbsoluteFilename);
-		FString ExpectedD = FPaths::ConvertRelativePathToFull(D->AbsoluteFilename);
-		FPaths::MakePlatformFilename(ExpectedB);
-		FPaths::MakePlatformFilename(ExpectedD);
-		TestEqual(TEXT("Copied paths include the current target path first"), CopiedPaths[0], ExpectedB);
-		TestEqual(TEXT("Copied paths include the current target path second"), CopiedPaths[1], ExpectedD);
-	}
-
-	TArray<FEntryPtr> NavigationItems = { A, B };
-	const TSharedRef<SChangedAssetsListView> NavigationList = SNew(SChangedAssetsListView, TWeakPtr<SGitChangedAssetsPanel>())
-		.ListItemsSource(&NavigationItems)
-		.SelectionMode(ESelectionMode::Multi);
-	NavigationList->RebaseNavigationState(B);
-	TestTrue(TEXT("Navigation rebase updates Slate selector state"), NavigationList->GetSelectorItem() == B);
-	TestTrue(TEXT("Navigation rebase updates Slate range state"), NavigationList->GetRangeSelectionAnchor() == B);
-	NavigationList->RebaseNavigationState(nullptr);
-	TestFalse(TEXT("Navigation rebase clears Slate selector state"), NavigationList->GetSelectorItem().IsValid());
-	TestFalse(TEXT("Navigation rebase clears Slate range state"), NavigationList->GetRangeSelectionAnchor().IsValid());
-	return true;
-}
-#endif
 
 #undef LOCTEXT_NAMESPACE

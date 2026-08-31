@@ -58,5 +58,8 @@ namespace GitSourceControlRevision
 {
 	/** Release an export that was not handed to a successfully opened Diff window. */
 	void ReleaseTemporaryExport(const FString& Filename);
+	/** 注册一个包含主 package 及 sidecar 的 Diff materialization 精确目录. */
+	GITSOURCECONTROL_API void RegisterTemporaryExportDirectory(const FString& Directory);
+	GITSOURCECONTROL_API void ReleaseTemporaryExportDirectory(const FString& Directory);
 	void CleanupTemporaryExports();
 }

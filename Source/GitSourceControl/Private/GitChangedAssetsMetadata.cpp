@@ -1450,6 +1450,17 @@ int32 FGitChangedAssetsMetadataResolver::ApplyCurrentMetadataRange(FGitChangedAs
 	for (int32 EntryIndex = InStartIndex; EntryIndex < EndIndex; ++EntryIndex)
 	{
 		FGitChangedAssetEntry& Entry = InOutSnapshot.Entries[EntryIndex];
+		if (IsGitChangedAssetMapPath(Entry.RepositoryRelativePath))
+		{
+			// Maps are primary packages, not actor descriptors. Filename-to-package
+			// identity remains valid for deleted maps and needs no Asset Registry load.
+			EnsurePackageName(Entry);
+			Entry.DisplayName = Entry.DisplayName.IsEmpty() ? FPackageName::GetShortName(Entry.PackageName) : Entry.DisplayName;
+			Entry.AssetType = TEXT("World");
+			Entry.MetadataSource = EGitChangedAssetMetadataSource::CurrentPackageRegistry;
+			Entry.bMetadataResolved = !Entry.PackageName.IsEmpty();
+			continue;
+		}
 		if (!ShouldResolveCurrentFileMetadata(Entry) || !FPaths::FileExists(Entry.AbsoluteFilename))
 		{
 			continue;

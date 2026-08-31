@@ -118,9 +118,19 @@ namespace GitChangedAssetOperationsPrivate
 		});
 	}
 
-	bool IsSupportedUassetFilename(const FString& InFilename)
+	bool IsSupportedPrimaryPackageFilename(const FString& InFilename)
 	{
-		return !InFilename.IsEmpty() && FPaths::GetExtension(InFilename, false).Equals(TEXT("uasset"), ESearchCase::IgnoreCase);
+		return !InFilename.IsEmpty() && (FPaths::GetExtension(InFilename, false).Equals(TEXT("uasset"), ESearchCase::IgnoreCase)
+			|| FPaths::GetExtension(InFilename, false).Equals(TEXT("umap"), ESearchCase::IgnoreCase));
+	}
+
+	bool IsSupportedArtifactFilename(const FString& InFilename)
+	{
+		return IsSupportedPrimaryPackageFilename(InFilename)
+			|| FPaths::GetExtension(InFilename, false).Equals(TEXT("uexp"), ESearchCase::IgnoreCase)
+			|| FPaths::GetExtension(InFilename, false).Equals(TEXT("ubulk"), ESearchCase::IgnoreCase)
+			|| FPaths::GetExtension(InFilename, false).Equals(TEXT("uptnl"), ESearchCase::IgnoreCase)
+			|| FPaths::GetExtension(InFilename, false).Equals(TEXT("upayload"), ESearchCase::IgnoreCase);
 	}
 
 	bool NormalizeAbsolutePath(const FString& InRepositoryRoot, const FString& InInput, FString& OutFilename, FString& OutRelativePath, FString& OutError)
@@ -286,10 +296,10 @@ namespace GitChangedAssetOperationsPrivate
 			A.IndexInfo.Num() == B.IndexInfo.Num() && (A.IndexInfo.Num() == 0 || FMemory::Memcmp(A.IndexInfo.GetData(), B.IndexInfo.GetData(), A.IndexInfo.Num()) == 0);
 	}
 
-	const FGitChangedAssetEntry* FindSnapshotEntry(const FGitChangedAssetSnapshot& InSnapshot, const FString& InFilename)
+	const FGitChangedAssetArtifact* FindSnapshotArtifact(const TArray<FGitChangedAssetArtifact>& InArtifacts, const FString& InFilename)
 	{
 		const FString Key = NormalizePathKey(InFilename);
-		for (const FGitChangedAssetEntry& Candidate : InSnapshot.Entries)
+		for (const FGitChangedAssetArtifact& Candidate : InArtifacts)
 		{
 			if (NormalizePathKey(Candidate.AbsoluteFilename) == Key)
 			{
@@ -299,7 +309,7 @@ namespace GitChangedAssetOperationsPrivate
 		return nullptr;
 	}
 
-	bool HasSameGitTopology(const FGitChangedAssetEntry& Expected, const FGitChangedAssetEntry& Current)
+	bool HasSameGitTopology(const FGitChangedAssetArtifact& Expected, const FGitChangedAssetArtifact& Current)
 	{
 		return Expected.State == Current.State
 			&& Expected.IndexStatus == Current.IndexStatus
@@ -310,35 +320,36 @@ namespace GitChangedAssetOperationsPrivate
 	}
 
 	bool ValidateCurrentStatus(const FString& InGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InExactPaths,
-		const TArray<FGitChangedAssetEntry>& InEntries, FString& OutError)
+		const TArray<FGitChangedAssetArtifact>& InArtifacts, FString& OutError)
 	{
 		TArray<uint8> StatusOutput;
 		if (!GitSourceControlUtils::RunPathsStatusPorcelainV2(InGitBinary, InRepositoryRoot, InExactPaths, StatusOutput, OutError))
 		{
 			return false;
 		}
-		FGitChangedAssetSnapshot CurrentSnapshot;
-		if (!FGitChangedAssetsStatus::ParsePorcelainV2(StatusOutput, InRepositoryRoot, CurrentSnapshot.Entries, OutError))
+		TArray<FGitChangedAssetEntry> IgnoredEntries;
+		TArray<FGitChangedAssetArtifact> CurrentArtifacts;
+		if (!FGitChangedAssetsStatus::ParsePorcelainV2WithArtifacts(StatusOutput, InRepositoryRoot, IgnoredEntries, CurrentArtifacts, OutError))
 		{
 			return false;
 		}
-		for (const FGitChangedAssetEntry& Expected : InEntries)
+		for (const FGitChangedAssetArtifact& Expected : InArtifacts)
 		{
-			const FGitChangedAssetEntry* Current = FindSnapshotEntry(CurrentSnapshot, Expected.AbsoluteFilename);
-			if (Current == nullptr || !HasSameGitTopology(Expected, *Current))
+			const FGitChangedAssetArtifact* Current = FindSnapshotArtifact(CurrentArtifacts, Expected.AbsoluteFilename);
+			if ((Expected.bKnownUnchanged && Current != nullptr) || (!Expected.bKnownUnchanged && (Current == nullptr || !HasSameGitTopology(Expected, *Current))))
 			{
-				OutError = FString::Printf(TEXT("The selected asset's repository-wide Git status changed while Revert was pending: %s"), *Expected.AbsoluteFilename);
+				OutError = FString::Printf(TEXT("The selected package artifact's Git status changed while Revert was pending: %s"), *Expected.AbsoluteFilename);
 				return false;
 			}
 		}
 		return true;
 	}
 
-	bool BuildPlan(const FString& InRepositoryRoot, const TArray<FGitChangedAssetEntry>& InEntries, FRevertPlan& OutPlan, FString& OutError)
+	bool BuildPlan(const FString& InRepositoryRoot, const TArray<FGitChangedAssetArtifact>& InArtifacts, FRevertPlan& OutPlan, FString& OutError)
 	{
 		OutPlan = FRevertPlan();
 		TSet<FString> SeenFiles;
-		for (const FGitChangedAssetEntry& Entry : InEntries)
+		for (const FGitChangedAssetArtifact& Artifact : InArtifacts)
 		{
 			auto AddPath = [&InRepositoryRoot, &OutPlan, &OutError, &SeenFiles](const FString& Input, const FString& ExpectedRelative, TArray<FString>* Destination) -> bool
 			{
@@ -348,9 +359,9 @@ namespace GitChangedAssetOperationsPrivate
 				{
 					return false;
 				}
-				if (!IsSupportedUassetFilename(Filename))
+				if (!IsSupportedArtifactFilename(Filename))
 				{
-					OutError = FString::Printf(TEXT("Changed Assets Revert supports only individual .uasset files: %s"), *Filename);
+					OutError = FString::Printf(TEXT("Changed Assets Revert supports only package artifacts: %s"), *Filename);
 					return false;
 				}
 				FString NormalizedExpected = ExpectedRelative;
@@ -379,26 +390,68 @@ namespace GitChangedAssetOperationsPrivate
 				return true;
 			};
 
-			switch (Entry.State)
+			if (Artifact.bKnownUnchanged)
+			{
+				if (!AddPath(Artifact.AbsoluteFilename, Artifact.RepositoryRelativePath, nullptr)) return false;
+				continue;
+			}
+
+			switch (Artifact.State)
 			{
 			case EGitChangedAssetState::Modified:
 			case EGitChangedAssetState::Deleted:
-				if (!AddPath(Entry.AbsoluteFilename, Entry.RepositoryRelativePath, &OutPlan.RestoreFromHeadFiles)) return false;
+				if (!AddPath(Artifact.AbsoluteFilename, Artifact.RepositoryRelativePath, &OutPlan.RestoreFromHeadFiles)) return false;
 				break;
 			case EGitChangedAssetState::Added:
 			case EGitChangedAssetState::Untracked:
-				if (!AddPath(Entry.AbsoluteFilename, Entry.RepositoryRelativePath, &OutPlan.RemoveFromIndexFiles)) return false;
+				if (!AddPath(Artifact.AbsoluteFilename, Artifact.RepositoryRelativePath, &OutPlan.RemoveFromIndexFiles)) return false;
 				OutPlan.DeleteFromWorktreeFiles.Add(OutPlan.RemoveFromIndexFiles.Last());
 				break;
 			case EGitChangedAssetState::Renamed:
-				if (!AddPath(Entry.RenameFromAbsoluteFilename, Entry.RenameFromRepositoryRelativePath, &OutPlan.RestoreFromHeadFiles)) return false;
-				if (!AddPath(Entry.AbsoluteFilename, Entry.RepositoryRelativePath, &OutPlan.RemoveFromIndexFiles)) return false;
+				if (!AddPath(Artifact.RenameFromAbsoluteFilename, Artifact.RenameFromRepositoryRelativePath, &OutPlan.RestoreFromHeadFiles)) return false;
+				if (!AddPath(Artifact.AbsoluteFilename, Artifact.RepositoryRelativePath, &OutPlan.RemoveFromIndexFiles)) return false;
 				OutPlan.DeleteFromWorktreeFiles.Add(OutPlan.RemoveFromIndexFiles.Last());
 				break;
 			default:
-				OutError = FString::Printf(TEXT("Changed Assets entry has an unsupported Revert state: %s"), *Entry.AbsoluteFilename);
+				OutError = FString::Printf(TEXT("Changed Assets artifact has an unsupported Revert state: %s"), *Artifact.AbsoluteFilename);
 				return false;
 			}
+		}
+		return !OutPlan.AllFiles.IsEmpty();
+	}
+
+	/** Historical force restore replaces exact revision targets; current porcelain state is intentionally not a plan discriminator. */
+	bool BuildHistoricalRestorePlan(const FString& InRepositoryRoot, const TArray<FGitChangedAssetArtifact>& InArtifacts,
+		FRevertPlan& OutPlan, FString& OutError)
+	{
+		OutPlan = FRevertPlan();
+		TSet<FString> SeenFiles;
+		for (const FGitChangedAssetArtifact& Artifact : InArtifacts)
+		{
+			FString Filename;
+			FString Relative;
+			if (!NormalizeAbsolutePath(InRepositoryRoot, Artifact.AbsoluteFilename, Filename, Relative, OutError)
+				|| !IsSupportedArtifactFilename(Filename))
+			{
+				if (OutError.IsEmpty())
+				{
+					OutError = FString::Printf(TEXT("Historical restore contains an unsupported package artifact: %s"), *Artifact.AbsoluteFilename);
+				}
+				return false;
+			}
+			if (!Relative.Equals(Artifact.RepositoryRelativePath, ESearchCase::CaseSensitive))
+			{
+				OutError = FString::Printf(TEXT("Historical restore artifact path metadata does not match the workspace file: %s"), *Filename);
+				return false;
+			}
+			const FString Key = NormalizePathKey(Filename);
+			if (SeenFiles.Contains(Key))
+			{
+				OutError = FString::Printf(TEXT("Historical restore selected the same package artifact more than once: %s"), *Filename);
+				return false;
+			}
+			SeenFiles.Add(Key);
+			OutPlan.AllFiles.Add(MoveTemp(Filename));
 		}
 		return !OutPlan.AllFiles.IsEmpty();
 	}
@@ -487,6 +540,30 @@ namespace GitChangedAssetOperationsPrivate
 			{ TEXT("--source=") + InPinnedHead, TEXT("--staged"), TEXT("--worktree") }, RelativeFiles, Output, OutError);
 	}
 
+	bool RestoreExactWorktreePathsFromRevision(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InRevision,
+		const TArray<FString>& InFiles, FString& OutError)
+	{
+		if (InFiles.IsEmpty())
+		{
+			return true;
+		}
+		TArray<FString> RelativeFiles;
+		RelativeFiles.Reserve(InFiles.Num());
+		for (const FString& Filename : InFiles)
+		{
+			FString Absolute;
+			FString Relative;
+			if (!NormalizeAbsolutePath(InRepositoryRoot, Filename, Absolute, Relative, OutError))
+			{
+				return false;
+			}
+			RelativeFiles.Add(MoveTemp(Relative));
+		}
+		FString Output;
+		return GitSourceControlUtils::RunCommandInternalRaw(TEXT("--literal-pathspecs restore"), InGitBinary, InRepositoryRoot,
+			{ TEXT("--source=") + InRevision, TEXT("--worktree") }, RelativeFiles, Output, OutError);
+	}
+
 	bool ResetExactIndexPathsToPinnedHead(const FString& InGitBinary, const FString& InRepositoryRoot, const FString& InPinnedHead,
 		const TArray<FString>& InFiles, FString& OutError)
 	{
@@ -560,6 +637,7 @@ namespace GitChangedAssetOperationsPrivate
 		TSet<UWorld*> OwnerEditorWorlds;
 		TArray<FString> SelectedDirtyPackageNames;
 		TArray<FString> OwnerMapsToReload;
+		TArray<FString> MapWorldClosureSignatures;
 	};
 
 	void AddOwnerPackageForReload(UPackage* InOwnerPackage, FEditorLifecyclePlan& InOutPlan, UWorld* InOwnerEditorWorld = nullptr)
@@ -911,6 +989,34 @@ namespace GitChangedAssetOperationsPrivate
 					return false;
 				}
 			}
+			else if (IsGitChangedAssetMapPath(Entry.RepositoryRelativePath) && DirectPackage != nullptr)
+			{
+				UWorld* const MapWorld = UWorld::FindWorldInPackage(DirectPackage);
+				if (MapWorld != nullptr)
+				{
+					if (MapWorld->WorldType == EWorldType::PIE)
+					{
+						OutError = FString::Printf(TEXT("The selected map is consumed by PIE and cannot be reverted: %s"), *Entry.AbsoluteFilename);
+						return false;
+					}
+					if (MapWorld->WorldType != EWorldType::Editor)
+					{
+						OutError = FString::Printf(TEXT("The selected map belongs to a non-Editor world and cannot be safely reloaded: %s"), *Entry.AbsoluteFilename);
+						return false;
+					}
+					FGitMapWorldClosure MapClosure;
+					if (!GitMapPackageSet::BuildMapWorldClosure(Entry, MapClosure, OutError))
+					{
+						return false;
+					}
+					OutPlan.MapWorldClosureSignatures.Add(MapClosure.Signature);
+					AddOwnerPackageForReload(DirectPackage, OutPlan, MapWorld);
+				}
+				else
+				{
+					OutPlan.PackagesToReload.Add(DirectPackage);
+				}
+			}
 			else if (DirectPackage != nullptr)
 			{
 				OutPlan.PackagesToReload.Add(DirectPackage);
@@ -942,7 +1048,7 @@ namespace GitChangedAssetOperationsPrivate
 
 		for (UPackage* OwnerPackage : OutPlan.OwnerWorldPackages)
 		{
-			if (OwnerPackage->IsDirty())
+			if (OwnerPackage->IsDirty() && !OutPlan.SelectedPackages.Contains(OwnerPackage))
 			{
 				OutError = FString::Printf(TEXT("The OFPA owner map has unsaved Editor changes. Save or discard it before Changed Assets Revert: %s"), *OwnerPackage->GetName());
 				return false;
@@ -1006,6 +1112,7 @@ namespace GitChangedAssetOperationsPrivate
 		}
 		OutPlan.SelectedDirtyPackageNames.Sort();
 		OutPlan.OwnerMapsToReload.Sort();
+		OutPlan.MapWorldClosureSignatures.Sort();
 		return true;
 	}
 
@@ -1032,6 +1139,10 @@ namespace GitChangedAssetOperationsPrivate
 		{
 			Tokens.Add(TEXT("Owner:") + PackageName);
 		}
+		for (const FString& MapWorldClosureSignature : InPlan.MapWorldClosureSignatures)
+		{
+			Tokens.Add(TEXT("MapWorldClosure:") + MapWorldClosureSignature);
+		}
 		for (UWorld* OwnerWorld : InPlan.OwnerEditorWorlds)
 		{
 			if (OwnerWorld != nullptr)
@@ -1046,31 +1157,24 @@ namespace GitChangedAssetOperationsPrivate
 
 namespace GitChangedAssetOperations
 {
-	bool FGitChangedAssetOperations::ValidateEntries(const TArray<FGitChangedAssetEntry>& InEntries, FString& OutError)
+	bool ValidateEntriesForLifecycle(const TArray<FGitChangedAssetEntry>& InEntries, FString& OutError)
 	{
 		OutError.Reset();
 		if (InEntries.IsEmpty())
 		{
-			OutError = TEXT("Select at least one Changed Asset to revert.");
+			OutError = TEXT("Select at least one primary package.");
 			return false;
 		}
 		for (const FGitChangedAssetEntry& Entry : InEntries)
 		{
-			if (!Entry.bBaseRevertEligible || !Entry.bCanRevert || Entry.IsConflicted())
+			if (!GitChangedAssetOperationsPrivate::IsSupportedPrimaryPackageFilename(Entry.AbsoluteFilename) || !IsGitChangedAssetPrimaryPackagePath(Entry.RepositoryRelativePath))
 			{
-				OutError = Entry.RevertBlockReason.IsEmpty()
-					? FString::Printf(TEXT("This Changed Asset cannot be reverted: %s"), *Entry.AbsoluteFilename)
-					: Entry.RevertBlockReason;
+				OutError = FString::Printf(TEXT("Package mutation supports only individual .uasset or .umap primary packages: %s"), *Entry.AbsoluteFilename);
 				return false;
 			}
-			if (!GitChangedAssetOperationsPrivate::IsSupportedUassetFilename(Entry.AbsoluteFilename) || !IsGitChangedAssetUassetPath(Entry.RepositoryRelativePath))
+			if (Entry.IsRename() && (!GitChangedAssetOperationsPrivate::IsSupportedPrimaryPackageFilename(Entry.RenameFromAbsoluteFilename) || !IsGitChangedAssetPrimaryPackagePath(Entry.RenameFromRepositoryRelativePath)))
 			{
-				OutError = FString::Printf(TEXT("Changed Assets Revert supports only individual .uasset files: %s"), *Entry.AbsoluteFilename);
-				return false;
-			}
-			if (Entry.IsRename() && (!GitChangedAssetOperationsPrivate::IsSupportedUassetFilename(Entry.RenameFromAbsoluteFilename) || !IsGitChangedAssetUassetPath(Entry.RenameFromRepositoryRelativePath)))
-			{
-				OutError = FString::Printf(TEXT("The renamed Changed Asset does not have a valid .uasset source: %s"), *Entry.AbsoluteFilename);
+				OutError = FString::Printf(TEXT("The renamed primary package does not have a valid source: %s"), *Entry.AbsoluteFilename);
 				return false;
 			}
 			if (GitChangedAssetOperationsPrivate::IsExternalEntry(Entry) && (!Entry.bOwnerLevelResolved || Entry.OwnerLevel.IsEmpty()))
@@ -1080,6 +1184,81 @@ namespace GitChangedAssetOperations
 			}
 		}
 		return true;
+	}
+
+	bool FGitChangedAssetOperations::ValidateEntries(const TArray<FGitChangedAssetEntry>& InEntries,
+		const EGitChangedAssetOperationMode InOperationMode, FString& OutError)
+	{
+		if (!ValidateEntriesForLifecycle(InEntries, OutError))
+		{
+			return false;
+		}
+		if (InOperationMode == EGitChangedAssetOperationMode::HistoricalRestore)
+		{
+			return true;
+		}
+		for (const FGitChangedAssetEntry& Entry : InEntries)
+		{
+			if (!Entry.bBaseRevertEligible || !Entry.bCanRevert || Entry.IsConflicted())
+			{
+				OutError = Entry.RevertBlockReason.IsEmpty()
+					? FString::Printf(TEXT("This primary package is not eligible for the requested Git operation: %s"), *Entry.AbsoluteFilename)
+					: Entry.RevertBlockReason;
+				return false;
+			}
+			if (InOperationMode == EGitChangedAssetOperationMode::DiscardTracked
+				&& ((Entry.State != EGitChangedAssetState::Modified && Entry.State != EGitChangedAssetState::Deleted) || Entry.bHasUntrackedReplacement))
+			{
+				OutError = FString::Printf(TEXT("Discard tracked changes accepts only a current tracked modified or deleted package; added, untracked, renamed, conflicted, and replacement topologies are rejected: %s"), *Entry.AbsoluteFilename);
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool ValidateArtifacts(const TArray<FGitChangedAssetArtifact>& InArtifacts, const EGitChangedAssetOperationMode InOperationMode, FString& OutError)
+	{
+		if (InArtifacts.IsEmpty())
+		{
+			OutError = TEXT("Changed Assets mutation has no exact package artifacts.");
+			return false;
+		}
+		TSet<FString> SeenPaths;
+		for (const FGitChangedAssetArtifact& Artifact : InArtifacts)
+		{
+			if (Artifact.AbsoluteFilename.IsEmpty() || Artifact.RepositoryRelativePath.IsEmpty()
+				|| !GitChangedAssetOperationsPrivate::IsSupportedArtifactFilename(Artifact.AbsoluteFilename))
+			{
+				OutError = FString::Printf(TEXT("Changed Assets mutation contains an invalid package artifact: %s"), *Artifact.AbsoluteFilename);
+				return false;
+			}
+			const FString Key = GitChangedAssetOperationsPrivate::NormalizePathKey(Artifact.AbsoluteFilename);
+			if (SeenPaths.Contains(Key))
+			{
+				OutError = FString::Printf(TEXT("Changed Assets mutation contains the same package artifact more than once: %s"), *Artifact.AbsoluteFilename);
+				return false;
+			}
+			SeenPaths.Add(Key);
+			if (InOperationMode == EGitChangedAssetOperationMode::ChangedAssetsRevert && !Artifact.bKnownUnchanged && Artifact.IsConflicted())
+			{
+				OutError = FString::Printf(TEXT("Resolve the Git conflict before reverting this package artifact: %s"), *Artifact.AbsoluteFilename);
+				return false;
+			}
+			if (InOperationMode == EGitChangedAssetOperationMode::DiscardTracked && !Artifact.bKnownUnchanged
+				&& ((Artifact.State != EGitChangedAssetState::Modified && Artifact.State != EGitChangedAssetState::Deleted) || Artifact.bHasUntrackedReplacement
+					|| Artifact.IndexStatus == TEXT('?') || Artifact.WorktreeStatus == TEXT('?')))
+			{
+				OutError = FString::Printf(TEXT("Discard tracked changes refuses non-tracked or non-modified package artifacts; it will not delete an added, untracked, renamed, deleted, conflicted, or replacement artifact: %s"), *Artifact.AbsoluteFilename);
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool FGitChangedAssetOperations::ValidateMutationSet(const FGitChangedAssetMutationSet& InMutationSet, FString& OutError)
+	{
+		return ValidateEntries(InMutationSet.SelectedEntries, InMutationSet.OperationMode, OutError)
+			&& ValidateArtifacts(InMutationSet.Artifacts, InMutationSet.OperationMode, OutError);
 	}
 
 	FGitChangedAssetOperations::FGitChangedAssetOperations(FString InGitBinary, FString InRepositoryRoot)
@@ -1092,6 +1271,31 @@ namespace GitChangedAssetOperations
 	bool FGitChangedAssetOperations::RevertToHead(const FString& InPinnedHead, const TArray<FGitChangedAssetEntry>& InEntries,
 		const FGitChangedAssetRevertCallbacks& InCallbacks, FGitChangedAssetRevertResult& OutResult) const
 	{
+		FGitChangedAssetMutationSet MutationSet;
+		MutationSet.PinnedHead = InPinnedHead;
+		MutationSet.OperationMode = EGitChangedAssetOperationMode::ChangedAssetsRevert;
+		MutationSet.SelectedEntries = InEntries;
+		for (const FGitChangedAssetEntry& Entry : InEntries)
+		{
+			FGitChangedAssetArtifact& Artifact = MutationSet.Artifacts.AddDefaulted_GetRef();
+			Artifact.RepositoryRelativePath = Entry.RepositoryRelativePath;
+			Artifact.AbsoluteFilename = Entry.AbsoluteFilename;
+			Artifact.RenameFromRepositoryRelativePath = Entry.RenameFromRepositoryRelativePath;
+			Artifact.RenameFromAbsoluteFilename = Entry.RenameFromAbsoluteFilename;
+			Artifact.State = Entry.State;
+			Artifact.IndexStatus = Entry.IndexStatus;
+			Artifact.WorktreeStatus = Entry.WorktreeStatus;
+			Artifact.bHasUntrackedReplacement = Entry.bHasUntrackedReplacement;
+			Artifact.Kind = EGitChangedAssetArtifactKind::PrimaryPackage;
+		}
+		return RevertToHead(MutationSet, InCallbacks, OutResult);
+	}
+
+	bool FGitChangedAssetOperations::RevertToHead(const FGitChangedAssetMutationSet& InMutationSet,
+		const FGitChangedAssetRevertCallbacks& InCallbacks, FGitChangedAssetRevertResult& OutResult) const
+	{
+		const FString& InPinnedHead = InMutationSet.PinnedHead;
+		const TArray<FGitChangedAssetEntry>& InEntries = InMutationSet.SelectedEntries;
 		OutResult = FGitChangedAssetRevertResult();
 		const double RevertStartSeconds = FPlatformTime::Seconds();
 		double PreflightSeconds = 0.0;
@@ -1124,20 +1328,20 @@ namespace GitChangedAssetOperations
 			return false;
 		}
 		FString Error;
-		if (!ValidateEntries(InEntries, Error))
+		if (!ValidateMutationSet(InMutationSet, Error))
 		{
 			OutResult.AddError(Error);
 			return false;
 		}
 
 		GitChangedAssetOperationsPrivate::FRevertPlan Plan;
-		if (!GitChangedAssetOperationsPrivate::BuildPlan(RepositoryRoot, InEntries, Plan, Error))
+		if (!GitChangedAssetOperationsPrivate::BuildPlan(RepositoryRoot, InMutationSet.Artifacts, Plan, Error))
 		{
 			OutResult.AddError(Error);
 			return false;
 		}
 		if (!GitChangedAssetOperationsPrivate::VerifyPinnedHead(GitBinary, RepositoryRoot, InPinnedHead, Error) ||
-			!GitChangedAssetOperationsPrivate::ValidateCurrentStatus(GitBinary, RepositoryRoot, Plan.AllFiles, InEntries, Error))
+			!GitChangedAssetOperationsPrivate::ValidateCurrentStatus(GitBinary, RepositoryRoot, Plan.AllFiles, InMutationSet.Artifacts, Error))
 		{
 			OutResult.AddError(Error);
 			return false;
@@ -1240,7 +1444,7 @@ namespace GitChangedAssetOperations
 			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
 			return false;
 		}
-		if (!GitChangedAssetOperationsPrivate::ValidateCurrentStatus(GitBinary, RepositoryRoot, Plan.AllFiles, InEntries, Error))
+		if (!GitChangedAssetOperationsPrivate::ValidateCurrentStatus(GitBinary, RepositoryRoot, Plan.AllFiles, InMutationSet.Artifacts, Error))
 		{
 			OutResult.AddError(Error);
 			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
@@ -1328,10 +1532,291 @@ namespace GitChangedAssetOperations
 		}
 
 		GitChangedAssetOperationsPrivate::DeleteBackups(Backups);
+		OutResult.bDiskMutationSucceeded = true;
 		DiskMutationSeconds = FPlatformTime::Seconds() - DiskMutationStartSeconds;
 		OutResult.bSucceeded = true;
 		OutResult.AffectedFiles = Plan.AllFiles;
 		FinalizePreparedEditor(EGitChangedAssetMutationOutcome::Succeeded);
+		return true;
+	}
+
+	bool FGitChangedAssetOperations::RestorePackageRevision(const FGitChangedAssetRevisionRestoreRequest& InRequest,
+		const FGitChangedAssetRevertCallbacks& InCallbacks, FGitChangedAssetRevertResult& OutResult) const
+	{
+		OutResult = FGitChangedAssetRevertResult();
+		const FGitChangedAssetMutationSet& MutationSet = InRequest.CurrentMutationSet;
+		if (GitBinary.IsEmpty() || RepositoryRoot.IsEmpty() || !GitChangedAssetOperationsPrivate::IsCompleteObjectId(MutationSet.PinnedHead)
+			|| !GitChangedAssetOperationsPrivate::IsCompleteObjectId(InRequest.RevisionArtifacts.Revision)
+			|| !InRequest.RevisionArtifacts.bComplete || InRequest.RevisionArtifacts.RepositoryRelativePaths.IsEmpty() || MutationSet.IsEmpty())
+		{
+			OutResult.AddError(TEXT("Historical package restore requires a complete current artifact set and a validated revision artifact set."));
+			return false;
+		}
+		if (MutationSet.SelectedEntries.Num() != 1 || !MutationSet.SelectedEntries[0].RepositoryRelativePath.Equals(
+			InRequest.RevisionArtifacts.PrimaryTarget.RepositoryRelativePath, ESearchCase::CaseSensitive))
+		{
+			OutResult.AddError(TEXT("Historical package restore requires exactly one selected package with the same current and revision primary path."));
+			return false;
+		}
+		FGitPackageRevisionArtifactSet RevalidatedRevisionArtifacts;
+		FString Error;
+		if (!GitMapPackageSet::BuildPackageRevisionArtifactSet(GitBinary, RepositoryRoot, InRequest.RevisionArtifacts.Revision,
+			InRequest.RevisionArtifacts.PrimaryTarget, RevalidatedRevisionArtifacts, Error)
+			|| RevalidatedRevisionArtifacts.RepositoryRelativePaths != InRequest.RevisionArtifacts.RepositoryRelativePaths)
+		{
+			OutResult.AddError(Error.IsEmpty()
+				? TEXT("The historical package artifact set changed or could not be revalidated before restore.")
+				: Error);
+			return false;
+		}
+
+		if (MutationSet.OperationMode != EGitChangedAssetOperationMode::HistoricalRestore
+			|| !ValidateEntries(MutationSet.SelectedEntries, EGitChangedAssetOperationMode::HistoricalRestore, Error)
+			|| !ValidateArtifacts(MutationSet.Artifacts, EGitChangedAssetOperationMode::HistoricalRestore, Error))
+		{
+			OutResult.AddError(Error.IsEmpty() ? TEXT("Historical package restore requires a HistoricalRestore mutation policy.") : Error);
+			return false;
+		}
+		GitChangedAssetOperationsPrivate::FRevertPlan CurrentPlan;
+		if (!GitChangedAssetOperationsPrivate::BuildHistoricalRestorePlan(RepositoryRoot, MutationSet.Artifacts, CurrentPlan, Error))
+		{
+			OutResult.AddError(Error);
+			return false;
+		}
+
+		TArray<FString> RevisionFiles;
+		for (const FString& RevisionRelativePath : InRequest.RevisionArtifacts.RepositoryRelativePaths)
+		{
+			FString AbsoluteFilename = FPaths::ConvertRelativePathToFull(RepositoryRoot, RevisionRelativePath);
+			FPaths::NormalizeFilename(AbsoluteFilename);
+			FString CheckedAbsolute;
+			FString CheckedRelative;
+			if (!GitChangedAssetOperationsPrivate::NormalizeAbsolutePath(RepositoryRoot, AbsoluteFilename, CheckedAbsolute, CheckedRelative, Error)
+				|| !CheckedRelative.Equals(RevisionRelativePath, ESearchCase::CaseSensitive)
+				|| !GitChangedAssetOperationsPrivate::IsSupportedArtifactFilename(CheckedAbsolute))
+			{
+				OutResult.AddError(Error.IsEmpty() ? TEXT("Historical restore revision artifact is invalid.") : Error);
+				return false;
+			}
+			GitChangedAssetOperationsPrivate::AddUniqueAbsolutePath(RevisionFiles, CheckedAbsolute);
+			GitChangedAssetOperationsPrivate::AddUniqueAbsolutePath(CurrentPlan.AllFiles, CheckedAbsolute);
+		}
+
+		TArray<FString> DeleteFromWorktreeFiles;
+		for (const FString& CurrentFile : CurrentPlan.AllFiles)
+		{
+			if (!RevisionFiles.ContainsByPredicate([&CurrentFile](const FString& RevisionFile)
+			{
+				return GitChangedAssetOperationsPrivate::NormalizePathKey(CurrentFile) == GitChangedAssetOperationsPrivate::NormalizePathKey(RevisionFile);
+			}))
+			{
+				DeleteFromWorktreeFiles.Add(CurrentFile);
+			}
+		}
+
+		GitSourceControlRepositoryMutation::FGitRepositoryMutationGuard TransactionGuard(RepositoryRoot);
+		if (!TransactionGuard.Acquire([&InCallbacks]() { return InCallbacks.IsCancellationRequested && InCallbacks.IsCancellationRequested(); }))
+		{
+			OutResult.bCancelled = InCallbacks.IsCancellationRequested && InCallbacks.IsCancellationRequested();
+			if (!OutResult.bCancelled)
+			{
+				OutResult.AddError(TEXT("Historical package restore could not acquire the repository mutation transaction guard."));
+			}
+			return false;
+		}
+		if (!GitChangedAssetOperationsPrivate::VerifyPinnedHead(GitBinary, RepositoryRoot, MutationSet.PinnedHead, Error)
+			|| !GitChangedAssetOperationsPrivate::ValidateCurrentStatus(GitBinary, RepositoryRoot, CurrentPlan.AllFiles, MutationSet.Artifacts, Error))
+		{
+			OutResult.AddError(Error);
+			return false;
+		}
+
+		TMap<FString, GitChangedAssetOperationsPrivate::FFileFingerprint> Fingerprints;
+		for (const FString& Filename : CurrentPlan.AllFiles)
+		{
+			const GitChangedAssetOperationsPrivate::FFileFingerprint Fingerprint = GitChangedAssetOperationsPrivate::CaptureFingerprint(Filename);
+			if (!Fingerprint.bHashValid)
+			{
+				OutResult.AddError(FString::Printf(TEXT("Could not fingerprint '%s' before historical package restore."), *Filename));
+				return false;
+			}
+			Fingerprints.Add(GitChangedAssetOperationsPrivate::NormalizePathKey(Filename), Fingerprint);
+		}
+		FGitIndexSnapshot IndexSnapshot;
+		if (!GitSourceControlUtils::CaptureIndexEntriesForPaths(GitBinary, RepositoryRoot, CurrentPlan.AllFiles, IndexSnapshot, Error))
+		{
+			OutResult.AddError(Error);
+			return false;
+		}
+		if (InCallbacks.Confirm && !InCallbacks.Confirm(MutationSet.SelectedEntries, Error))
+		{
+			OutResult.bCancelled = Error.IsEmpty();
+			OutResult.AddError(Error);
+			return false;
+		}
+		if (!GitMapPackageSet::ValidatePackageRevisionPrimaryForRestore(GitBinary, RepositoryRoot, RevalidatedRevisionArtifacts, Error))
+		{
+			OutResult.AddError(Error);
+			return false;
+		}
+
+		FGitLfsLocalObjectStore LfsObjectStore(GitBinary, RepositoryRoot);
+		if (!GitChangedAssetOperationsPrivate::EnsureHeadLfsObjectsAvailable(LfsObjectStore, GitBinary, RepositoryRoot,
+			InRequest.RevisionArtifacts.Revision, RevisionFiles, Error))
+		{
+			OutResult.AddError(Error);
+			return false;
+		}
+
+		bool bPrepared = false;
+		auto FinalizePreparedEditor = [&](const EGitChangedAssetMutationOutcome Outcome)
+		{
+			if (!bPrepared || !InCallbacks.FinalizeEditor)
+			{
+				return;
+			}
+			FString FinalizeError;
+			if (!InCallbacks.FinalizeEditor(MutationSet.SelectedEntries, CurrentPlan.AllFiles, Outcome, FinalizeError))
+			{
+				OutResult.bReloadSucceeded = false;
+				OutResult.AddError(FinalizeError.IsEmpty() ? TEXT("The Editor package reload did not complete.") : FinalizeError);
+			}
+		};
+		if (InCallbacks.PrepareForMutation && !InCallbacks.PrepareForMutation(MutationSet.SelectedEntries, Error))
+		{
+			OutResult.AddError(Error.IsEmpty() ? TEXT("The Editor could not prepare the selected package for historical restore.") : Error);
+			return false;
+		}
+		bPrepared = true;
+
+#if WITH_DEV_AUTOMATION_TESTS
+		if (InCallbacks.BeforeCommitPointForTesting)
+		{
+			InCallbacks.BeforeCommitPointForTesting();
+		}
+#endif
+		if (!GitChangedAssetOperationsPrivate::VerifyPinnedHead(GitBinary, RepositoryRoot, MutationSet.PinnedHead, Error))
+		{
+			OutResult.AddError(Error);
+			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
+			return false;
+		}
+		for (const FString& Filename : CurrentPlan.AllFiles)
+		{
+			const GitChangedAssetOperationsPrivate::FFileFingerprint* Expected = Fingerprints.Find(GitChangedAssetOperationsPrivate::NormalizePathKey(Filename));
+			if (Expected == nullptr || !(GitChangedAssetOperationsPrivate::CaptureFingerprint(Filename) == *Expected))
+			{
+				OutResult.AddError(FString::Printf(TEXT("The selected package artifact changed while historical restore was pending: %s"), *Filename));
+				FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
+				return false;
+			}
+		}
+		FGitIndexSnapshot CurrentIndexSnapshot;
+		if (!GitSourceControlUtils::CaptureIndexEntriesForPaths(GitBinary, RepositoryRoot, CurrentPlan.AllFiles, CurrentIndexSnapshot, Error)
+			|| !GitChangedAssetOperationsPrivate::SnapshotsEqual(IndexSnapshot, CurrentIndexSnapshot)
+			|| !GitChangedAssetOperationsPrivate::ValidateCurrentStatus(GitBinary, RepositoryRoot, CurrentPlan.AllFiles, MutationSet.Artifacts, Error))
+		{
+			OutResult.AddError(Error.IsEmpty() ? TEXT("The Git index or package artifact status changed while historical restore was pending.") : Error);
+			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
+			return false;
+		}
+		if (!GitMapPackageSet::ValidatePackageRevisionPrimaryForRestore(GitBinary, RepositoryRoot, RevalidatedRevisionArtifacts, Error))
+		{
+			OutResult.AddError(Error);
+			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
+			return false;
+		}
+
+		TArray<GitChangedAssetOperationsPrivate::FFileBackup> Backups;
+		if (!GitChangedAssetOperationsPrivate::CreateBackups(CurrentPlan.AllFiles, Backups, Error))
+		{
+			OutResult.AddError(Error);
+			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
+			return false;
+		}
+		if (InCallbacks.BeginMutation && !InCallbacks.BeginMutation(MutationSet.SelectedEntries, Error))
+		{
+			OutResult.AddError(Error.IsEmpty() ? TEXT("The Editor could not enter the historical restore commit point.") : Error);
+			GitChangedAssetOperationsPrivate::DeleteBackups(Backups);
+			FinalizePreparedEditor(EGitChangedAssetMutationOutcome::NeverMutated);
+			return false;
+		}
+
+		auto RollBack = [&](const FString& MutationError)
+		{
+			TArray<FString> FailedBackups;
+			const bool bWorktreeRestored = GitChangedAssetOperationsPrivate::RestoreBackups(Backups, FailedBackups);
+			FString RestoreIndexError;
+			const bool bIndexRestored = GitSourceControlUtils::RestoreIndexEntries(GitBinary, RepositoryRoot, IndexSnapshot, RestoreIndexError);
+			OutResult.AddError(MutationError);
+			if (!bIndexRestored)
+			{
+				OutResult.AddError(RestoreIndexError.IsEmpty() ? TEXT("Git index rollback failed.") : RestoreIndexError);
+			}
+			if (bWorktreeRestored && bIndexRestored)
+			{
+				GitChangedAssetOperationsPrivate::DeleteBackups(Backups);
+			}
+			else
+			{
+				TArray<FString> PreservedBackups;
+				for (const GitChangedAssetOperationsPrivate::FFileBackup& Backup : Backups)
+				{
+					if (!Backup.BackupFilename.IsEmpty())
+					{
+						PreservedBackups.Add(Backup.BackupFilename);
+					}
+				}
+				OutResult.AddError(FString::Printf(TEXT("Historical package restore rollback was incomplete. Safety backups were preserved at:\n%s"),
+					*FString::Join(PreservedBackups, TEXT("\n"))));
+			}
+			FinalizePreparedEditor(bWorktreeRestored && bIndexRestored ? EGitChangedAssetMutationOutcome::RolledBack : EGitChangedAssetMutationOutcome::RollbackFailed);
+		};
+
+		if (!GitChangedAssetOperationsPrivate::ResetExactIndexPathsToPinnedHead(GitBinary, RepositoryRoot, MutationSet.PinnedHead, CurrentPlan.AllFiles, Error))
+		{
+			RollBack(Error.IsEmpty() ? TEXT("Could not reset the exact historical package index paths to pinned HEAD.") : Error);
+			return false;
+		}
+		bool bAllowFilesystemMutation = true;
+#if WITH_DEV_AUTOMATION_TESTS
+		if (InCallbacks.AllowFilesystemMutationForTesting)
+		{
+			bAllowFilesystemMutation = InCallbacks.AllowFilesystemMutationForTesting();
+		}
+#endif
+		if (!bAllowFilesystemMutation
+			|| !GitChangedAssetOperationsPrivate::RestoreExactWorktreePathsFromRevision(GitBinary, RepositoryRoot, InRequest.RevisionArtifacts.Revision, RevisionFiles, Error)
+			|| !GitChangedAssetOperationsPrivate::DeleteExactFiles(DeleteFromWorktreeFiles, Error))
+		{
+			RollBack(!bAllowFilesystemMutation
+				? TEXT("Filesystem mutation was rejected by the historical package restore rollback test seam.")
+				: (Error.IsEmpty() ? TEXT("Could not apply the exact historical package artifact set.") : Error));
+			return false;
+		}
+		OutResult.bDiskMutationSucceeded = true;
+		OutResult.bSucceeded = true;
+		OutResult.AffectedFiles = CurrentPlan.AllFiles;
+		FinalizePreparedEditor(EGitChangedAssetMutationOutcome::Succeeded);
+		if (OutResult.bReloadSucceeded)
+		{
+			GitChangedAssetOperationsPrivate::DeleteBackups(Backups);
+		}
+		else
+		{
+			TArray<FString> PreservedBackups;
+			for (const GitChangedAssetOperationsPrivate::FFileBackup& Backup : Backups)
+			{
+				if (!Backup.BackupFilename.IsEmpty())
+				{
+					PreservedBackups.Add(Backup.BackupFilename);
+				}
+			}
+			OutResult.AddError(FString::Printf(TEXT("Historical package restore wrote the revision, but Editor reload failed. Safety backups were preserved at:\n%s"),
+				*FString::Join(PreservedBackups, TEXT("\n"))));
+			OutResult.bSucceeded = false;
+			return false;
+		}
 		return true;
 	}
 
@@ -1358,7 +1843,7 @@ namespace GitChangedAssetOperations
 			OutError = TEXT("Changed Assets lifecycle preview must run on the GameThread.");
 			return false;
 		}
-		if (!FGitChangedAssetOperations::ValidateEntries(InEntries, OutError))
+		if (!ValidateEntriesForLifecycle(InEntries, OutError))
 		{
 			return false;
 		}
@@ -1398,7 +1883,7 @@ namespace GitChangedAssetOperations
 			OutError = TEXT("Changed Assets package preparation must run on the GameThread.");
 			return false;
 		}
-		if (!FGitChangedAssetOperations::ValidateEntries(InEntries, OutError))
+		if (!ValidateEntriesForLifecycle(InEntries, OutError))
 		{
 			return false;
 		}

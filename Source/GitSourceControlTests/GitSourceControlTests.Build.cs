@@ -19,6 +19,7 @@ public class GitSourceControlTests : ModuleRules
 				"DataValidation",
 				"Engine",
 				"GitSourceControl",
+				"TypedElementRuntime",
 				"SourceControl",
 				"UnrealEd",
 				"Projects"

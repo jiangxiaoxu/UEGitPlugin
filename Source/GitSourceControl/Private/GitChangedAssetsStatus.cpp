@@ -5,6 +5,7 @@
 #include "GitSourceControlUtils.h"
 
 #include "Misc/Char.h"
+#include "HAL/FileManager.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -261,10 +262,45 @@ namespace GitChangedAssetsStatusPrivate
 		return true;
 	}
 
-	bool AddEntry(const FString& InRepositoryRoot, const TCHAR InRecordType, const FString& InRecord, const FString& InCurrentPath,
-		const FString& InOriginalPath, TMap<FString, int32>& InOutEntryIndicesByPath, TArray<FGitChangedAssetEntry>& OutEntries, FString& OutError)
+	bool AddOrMergeArtifact(FGitChangedAssetArtifact&& InArtifact, TMap<FString, int32>& InOutArtifactIndicesByPath,
+		TArray<FGitChangedAssetArtifact>& OutArtifacts, FString& OutError)
 	{
-		if (!IsGitChangedAssetUassetPath(InCurrentPath))
+		const FString PathKey = NormalizeEntryPathKey(InArtifact.AbsoluteFilename);
+		if (const int32* ExistingIndex = InOutArtifactIndicesByPath.Find(PathKey))
+		{
+			FGitChangedAssetArtifact& Existing = OutArtifacts[*ExistingIndex];
+			const bool bExistingIsUntracked = Existing.State == EGitChangedAssetState::Untracked;
+			const bool bIncomingIsUntracked = InArtifact.State == EGitChangedAssetState::Untracked;
+			const FGitChangedAssetArtifact& TrackedArtifact = bExistingIsUntracked ? InArtifact : Existing;
+			const bool bStagedDeletion = TrackedArtifact.State == EGitChangedAssetState::Deleted
+				&& TrackedArtifact.IndexStatus == TEXT('D') && TrackedArtifact.WorktreeStatus == TEXT('.');
+			if ((!bExistingIsUntracked && !bIncomingIsUntracked) || !bStagedDeletion)
+			{
+				OutError = FString::Printf(TEXT("Git returned an unsupported duplicate status topology for one Changed Assets artifact: %s"), *InArtifact.RepositoryRelativePath);
+				return false;
+			}
+			if (bExistingIsUntracked)
+			{
+				InArtifact.bHasUntrackedReplacement = true;
+				Existing = MoveTemp(InArtifact);
+			}
+			else
+			{
+				Existing.bHasUntrackedReplacement = true;
+			}
+			return true;
+		}
+
+		InOutArtifactIndicesByPath.Add(PathKey, OutArtifacts.Num());
+		OutArtifacts.Add(MoveTemp(InArtifact));
+		return true;
+	}
+
+	bool AddEntry(const FString& InRepositoryRoot, const TCHAR InRecordType, const FString& InRecord, const FString& InCurrentPath,
+		const FString& InOriginalPath, TMap<FString, int32>& InOutEntryIndicesByPath, TArray<FGitChangedAssetEntry>& OutEntries,
+		TMap<FString, int32>& InOutArtifactIndicesByPath, TArray<FGitChangedAssetArtifact>& OutArtifacts, FString& OutError)
+	{
+		if (!IsGitChangedAssetArtifactPath(InCurrentPath))
 		{
 			return true;
 		}
@@ -293,8 +329,212 @@ namespace GitChangedAssetsStatusPrivate
 				Entry.RenameFromAbsoluteFilename.Reset();
 			}
 		}
+		FGitChangedAssetArtifact Artifact;
+		Artifact.RepositoryRelativePath = Entry.RepositoryRelativePath;
+		Artifact.AbsoluteFilename = Entry.AbsoluteFilename;
+		Artifact.RenameFromRepositoryRelativePath = Entry.RenameFromRepositoryRelativePath;
+		Artifact.RenameFromAbsoluteFilename = Entry.RenameFromAbsoluteFilename;
+		Artifact.State = Entry.State;
+		Artifact.IndexStatus = Entry.IndexStatus;
+		Artifact.WorktreeStatus = Entry.WorktreeStatus;
+		Artifact.Kind = IsGitChangedAssetPrimaryPackagePath(Artifact.RepositoryRelativePath)
+			? EGitChangedAssetArtifactKind::PrimaryPackage
+			: EGitChangedAssetArtifactKind::Sidecar;
+		if (!AddOrMergeArtifact(MoveTemp(Artifact), InOutArtifactIndicesByPath, OutArtifacts, OutError))
+		{
+			return false;
+		}
+
+		if (!IsGitChangedAssetPrimaryPackagePath(Entry.RepositoryRelativePath))
+		{
+			return true;
+		}
 		Entry.RecomputeBaseRevertEligibility();
 		return AddOrMergeEntry(MoveTemp(Entry), InOutEntryIndicesByPath, OutEntries, OutError);
+	}
+
+	FString GetPrimaryStemForSidecarPath(const FString& InRepositoryRelativePath)
+	{
+		FString Result = InRepositoryRelativePath;
+		if (Result.EndsWith(TEXT(".m.ubulk"), ESearchCase::IgnoreCase))
+		{
+			Result.LeftChopInline(FCString::Strlen(TEXT(".m.ubulk")));
+			return Result;
+		}
+		return FPaths::ChangeExtension(Result, FString());
+	}
+
+	FString GetPrimaryStemForArtifactPath(const FGitChangedAssetArtifact& InArtifact)
+	{
+		return InArtifact.Kind == EGitChangedAssetArtifactKind::Sidecar
+			? GetPrimaryStemForSidecarPath(InArtifact.RepositoryRelativePath)
+			: FPaths::ChangeExtension(InArtifact.RepositoryRelativePath, FString());
+	}
+
+	void SetClosureAggregationFailure(FGitChangedAssetEntry& InOutEntry, const FString& InReason)
+	{
+		InOutEntry.bBaseRevertEligible = false;
+		InOutEntry.bCanRevert = false;
+		InOutEntry.RevertBlockReason = InReason;
+	}
+
+	bool AggregateArtifactClosureIntoPrimaryRows(const FString& InRepositoryRoot, const TArray<FGitChangedAssetArtifact>& InArtifacts,
+		TArray<FGitChangedAssetEntry>& InOutEntries, FString& OutError)
+	{
+		for (FGitChangedAssetEntry& Entry : InOutEntries)
+		{
+			const FString PrimaryStem = FPaths::ChangeExtension(Entry.RepositoryRelativePath, FString());
+			TArray<const FGitChangedAssetArtifact*> ClosureArtifacts;
+			for (const FGitChangedAssetArtifact& Artifact : InArtifacts)
+			{
+				if (GetPrimaryStemForArtifactPath(Artifact).Equals(PrimaryStem, ESearchCase::IgnoreCase))
+				{
+					ClosureArtifacts.Add(&Artifact);
+				}
+			}
+			if (ClosureArtifacts.IsEmpty())
+			{
+				continue;
+			}
+
+			bool bHasConflict = false;
+			bool bHasReplacement = false;
+			bool bHasPrimaryArtifact = false;
+			bool bPrimaryArtifactIsRename = false;
+			TSet<FString> RenameSourceStems;
+			for (const FGitChangedAssetArtifact* Artifact : ClosureArtifacts)
+			{
+				bHasConflict |= Artifact->IsConflicted();
+				bHasReplacement |= Artifact->bHasUntrackedReplacement;
+				if (Artifact->Kind == EGitChangedAssetArtifactKind::PrimaryPackage)
+				{
+					bHasPrimaryArtifact = true;
+					bPrimaryArtifactIsRename |= Artifact->IsRename();
+				}
+				if (Artifact->IsRename())
+				{
+					const FString RenameSourceStem = Artifact->Kind == EGitChangedAssetArtifactKind::Sidecar
+						? GetPrimaryStemForSidecarPath(Artifact->RenameFromRepositoryRelativePath)
+						: FPaths::ChangeExtension(Artifact->RenameFromRepositoryRelativePath, FString());
+					if (RenameSourceStem.IsEmpty())
+					{
+						SetClosureAggregationFailure(Entry, TEXT("The package artifact closure has a rename without a valid source path."));
+						break;
+					}
+					RenameSourceStems.Add(RenameSourceStem);
+				}
+			}
+			if (!Entry.RevertBlockReason.IsEmpty() && !Entry.bBaseRevertEligible)
+			{
+				continue;
+			}
+
+			Entry.bHasUntrackedReplacement |= bHasReplacement;
+			if (bHasConflict)
+			{
+				Entry.State = EGitChangedAssetState::Conflicted;
+				Entry.IndexStatus = TEXT('U');
+				Entry.WorktreeStatus = TEXT('U');
+				Entry.RecomputeBaseRevertEligibility();
+				continue;
+			}
+			if (!RenameSourceStems.IsEmpty())
+			{
+				if (RenameSourceStems.Num() != 1 || (bHasPrimaryArtifact && !bPrimaryArtifactIsRename))
+				{
+					SetClosureAggregationFailure(Entry, TEXT("The package artifact closure has incompatible primary and sidecar rename topologies."));
+					continue;
+				}
+				const FString SourceExtension = FPaths::GetExtension(Entry.RepositoryRelativePath, false);
+				Entry.State = EGitChangedAssetState::Renamed;
+				Entry.RenameFromRepositoryRelativePath = RenameSourceStems.Array()[0] + TEXT(".") + SourceExtension;
+				if (!MakeAbsoluteAssetPath(InRepositoryRoot, Entry.RenameFromRepositoryRelativePath, Entry.RenameFromAbsoluteFilename))
+				{
+					SetClosureAggregationFailure(Entry, TEXT("The package artifact closure rename source is outside the repository."));
+					continue;
+				}
+				Entry.RecomputeBaseRevertEligibility();
+				continue;
+			}
+
+			if (!bHasPrimaryArtifact)
+			{
+				// A sidecar-only delta is one logical package change. Its exact Git
+				// topology remains in ArtifactEntries; this row must not pretend the
+				// unchanged primary itself was added/deleted.
+				Entry.State = EGitChangedAssetState::Modified;
+				Entry.IndexStatus = TEXT('.');
+				Entry.WorktreeStatus = TEXT('M');
+				Entry.RecomputeBaseRevertEligibility();
+			}
+		}
+		return true;
+	}
+
+	bool SynthesizePrimaryEntriesForSidecars(const FString& InRepositoryRoot, const TArray<FGitChangedAssetArtifact>& InArtifacts,
+		TMap<FString, int32>& InOutEntryIndicesByPath, TArray<FGitChangedAssetEntry>& OutEntries, FString& OutError)
+	{
+		for (const FGitChangedAssetArtifact& Artifact : InArtifacts)
+		{
+			if (Artifact.Kind != EGitChangedAssetArtifactKind::Sidecar)
+			{
+				continue;
+			}
+			const FString PrimaryStem = GetPrimaryStemForSidecarPath(Artifact.RepositoryRelativePath);
+			TArray<FString> CandidatePaths = { PrimaryStem + TEXT(".umap"), PrimaryStem + TEXT(".uasset") };
+			FString PrimaryRelativePath;
+			FString PrimaryAbsolutePath;
+			int32 CandidateCount = 0;
+			for (const FString& CandidatePath : CandidatePaths)
+			{
+				FString CandidateAbsolutePath;
+				if (!MakeAbsoluteAssetPath(InRepositoryRoot, CandidatePath, CandidateAbsolutePath) || !IFileManager::Get().FileExists(*CandidateAbsolutePath))
+				{
+					continue;
+				}
+				++CandidateCount;
+				PrimaryRelativePath = CandidatePath;
+				PrimaryAbsolutePath = MoveTemp(CandidateAbsolutePath);
+			}
+			if (CandidateCount == 0)
+			{
+				continue;
+			}
+			if (CandidateCount != 1)
+			{
+				OutError = FString::Printf(TEXT("A changed package sidecar has ambiguous .umap/.uasset primary identity: %s"), *Artifact.RepositoryRelativePath);
+				return false;
+			}
+
+			const FString PrimaryKey = NormalizeEntryPathKey(PrimaryAbsolutePath);
+			if (InOutEntryIndicesByPath.Contains(PrimaryKey))
+			{
+				continue;
+			}
+			FGitChangedAssetEntry Entry;
+			Entry.RepositoryRelativePath = MoveTemp(PrimaryRelativePath);
+			Entry.AbsoluteFilename = MoveTemp(PrimaryAbsolutePath);
+			Entry.State = Artifact.IsRename() ? EGitChangedAssetState::Modified : Artifact.State;
+			Entry.IndexStatus = Artifact.IndexStatus;
+			Entry.WorktreeStatus = Artifact.WorktreeStatus;
+			Entry.bHasUntrackedReplacement = Artifact.bHasUntrackedReplacement;
+			if (Artifact.IsRename())
+			{
+				// A sidecar rename alone cannot prove that its sibling primary package
+				// was renamed. Never synthesize a cross-stem primary rename from it.
+				Entry.RecomputeBaseRevertEligibility();
+				SetClosureAggregationFailure(Entry, TEXT("A sidecar-only rename has no primary package rename evidence and cannot be reverted safely."));
+			}
+			else
+			{
+				Entry.RecomputeBaseRevertEligibility();
+			}
+			if (!AddOrMergeEntry(MoveTemp(Entry), InOutEntryIndicesByPath, OutEntries, OutError))
+			{
+				return false;
+			}
+		}
+		return true;
 	}
 }
 
@@ -325,7 +565,8 @@ bool FGitChangedAssetsStatus::CaptureSnapshot(const FString& InGitBinary, const 
 	}
 
 	TArray<FGitChangedAssetEntry> Entries;
-	if (!ParsePorcelainV2(StatusOutput, RepositoryRoot, Entries, OutError))
+	TArray<FGitChangedAssetArtifact> Artifacts;
+	if (!ParsePorcelainV2WithArtifacts(StatusOutput, RepositoryRoot, Entries, Artifacts, OutError))
 	{
 		return false;
 	}
@@ -348,6 +589,7 @@ bool FGitChangedAssetsStatus::CaptureSnapshot(const FString& InGitBinary, const 
 	OutSnapshot.CapturedAtUtc = FDateTime::UtcNow();
 	OutSnapshot.StatusDurationSeconds = StatusDurationSeconds;
 	OutSnapshot.Entries = MoveTemp(Entries);
+	OutSnapshot.ArtifactEntries = MoveTemp(Artifacts);
 	return true;
 }
 
@@ -400,8 +642,17 @@ bool FGitChangedAssetsStatus::CapturePathsSnapshot(const FString& InGitBinary, c
 
 bool FGitChangedAssetsStatus::ParsePorcelainV2(const TArray<uint8>& InOutput, const FString& InRepositoryRoot,
 	TArray<FGitChangedAssetEntry>& OutEntries, FString& OutError)
+
+{
+	TArray<FGitChangedAssetArtifact> IgnoredArtifacts;
+	return ParsePorcelainV2WithArtifacts(InOutput, InRepositoryRoot, OutEntries, IgnoredArtifacts, OutError);
+}
+
+bool FGitChangedAssetsStatus::ParsePorcelainV2WithArtifacts(const TArray<uint8>& InOutput, const FString& InRepositoryRoot,
+	TArray<FGitChangedAssetEntry>& OutEntries, TArray<FGitChangedAssetArtifact>& OutArtifacts, FString& OutError)
 {
 	OutEntries.Reset();
+	OutArtifacts.Reset();
 	OutError.Reset();
 	if (InRepositoryRoot.IsEmpty())
 	{
@@ -411,6 +662,7 @@ bool FGitChangedAssetsStatus::ParsePorcelainV2(const TArray<uint8>& InOutput, co
 
 	int32 Offset = 0;
 	TMap<FString, int32> EntryIndicesByPath;
+	TMap<FString, int32> ArtifactIndicesByPath;
 	FString Record;
 	while (GitChangedAssetsStatusPrivate::ReadNulToken(InOutput, Offset, Record))
 	{
@@ -427,7 +679,8 @@ bool FGitChangedAssetsStatus::ParsePorcelainV2(const TArray<uint8>& InOutput, co
 		if (RecordType == TEXT('?'))
 		{
 			if (!Record.StartsWith(TEXT("? "), ESearchCase::CaseSensitive) ||
-				!GitChangedAssetsStatusPrivate::AddEntry(InRepositoryRoot, RecordType, Record, Record.Mid(2), FString(), EntryIndicesByPath, OutEntries, OutError))
+				!GitChangedAssetsStatusPrivate::AddEntry(InRepositoryRoot, RecordType, Record, Record.Mid(2), FString(), EntryIndicesByPath, OutEntries,
+					ArtifactIndicesByPath, OutArtifacts, OutError))
 			{
 				if (OutError.IsEmpty())
 				{
@@ -470,10 +723,15 @@ bool FGitChangedAssetsStatus::ParsePorcelainV2(const TArray<uint8>& InOutput, co
 			OutError = TEXT("Malformed porcelain-v2 rename record without its original path.");
 			return false;
 		}
-		if (!GitChangedAssetsStatusPrivate::AddEntry(InRepositoryRoot, RecordType, Record, CurrentPath, OriginalPath, EntryIndicesByPath, OutEntries, OutError))
+		if (!GitChangedAssetsStatusPrivate::AddEntry(InRepositoryRoot, RecordType, Record, CurrentPath, OriginalPath, EntryIndicesByPath, OutEntries,
+			ArtifactIndicesByPath, OutArtifacts, OutError))
 		{
 			return false;
 		}
 	}
-	return true;
+	if (!GitChangedAssetsStatusPrivate::SynthesizePrimaryEntriesForSidecars(InRepositoryRoot, OutArtifacts, EntryIndicesByPath, OutEntries, OutError))
+	{
+		return false;
+	}
+	return GitChangedAssetsStatusPrivate::AggregateArtifactClosureIntoPrimaryRows(InRepositoryRoot, OutArtifacts, OutEntries, OutError);
 }

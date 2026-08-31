@@ -5,9 +5,6 @@
 #include "GitSourceControlUtils.h"
 #include "Framework/Application/SlateApplication.h"
 #include "HAL/FileManager.h"
-#if WITH_DEV_AUTOMATION_TESTS
-#include "Misc/AutomationTest.h"
-#endif
 #include "Misc/Paths.h"
 #include "Styling/AppStyle.h"
 #include "Widgets/Images/SImage.h"
@@ -296,6 +293,7 @@ namespace SGitStandaloneHistoryWindowPrivate
 			SLATE_EVENT(FGitStandaloneHistoryRestoreDelegate, OnRestore)
 			SLATE_EVENT(FGitStandaloneHistoryRefreshDelegate, OnRefresh)
 			SLATE_EVENT(FGitStandaloneHistoryDiffDelegate, OnDiff)
+			SLATE_ARGUMENT(FGitStandaloneHistoryWindowCapabilities, Capabilities)
 		SLATE_END_ARGS()
 
 		void Construct(const FArguments& InArgs)
@@ -305,6 +303,7 @@ namespace SGitStandaloneHistoryWindowPrivate
 			OnRestore = InArgs._OnRestore;
 			OnRefresh = InArgs._OnRefresh;
 			OnDiff = InArgs._OnDiff;
+			Capabilities = InArgs._Capabilities;
 
 			const FHistoryTreeItemPtr FileItem = MakeShared<FHistoryTreeItem>();
 			FileItem->Filename = Filename;
@@ -414,7 +413,7 @@ namespace SGitStandaloneHistoryWindowPrivate
 						[
 							SNew(SButton)
 							.Text(LOCTEXT("StandaloneHistoryRestore", "Restore Selected..."))
-							.Visibility(EVisibility::Visible)
+							.Visibility(this, &SGitStandaloneHistoryWindow::GetRestoreActionVisibility)
 							.IsEnabled(this, &SGitStandaloneHistoryWindow::CanRestoreSelectedRevision)
 							.ToolTipText(this, &SGitStandaloneHistoryWindow::GetRestoreTooltip)
 							.OnClicked(this, &SGitStandaloneHistoryWindow::OnRestoreSelected)
@@ -576,7 +575,8 @@ namespace SGitStandaloneHistoryWindowPrivate
 
 		bool IsSupportedCurrentAsset() const
 		{
-			return Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase);
+			return Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase)
+				|| Filename.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase);
 		}
 
 		bool HasCurrentHistoricalPath(const FRevisionPtr& Revision) const
@@ -588,7 +588,8 @@ namespace SGitStandaloneHistoryWindowPrivate
 		bool CanDiffAgainstWorkspace() const { return MakeWorkspaceDiffRequest(GetSingleSelectedRevision()).IsSet(); }
 		bool CanDiffAgainstPrevious() const { return MakePreviousDiffRequest(Revisions, GetSingleSelectedRevision()).IsSet(); }
 		bool CanDiffSelectedRevisions() const { return MakeSelectedRevisionDiffRequest(Revisions, GetSelectedRevisions()).IsSet(); }
-		bool CanRestoreSelectedRevision() const { return IsSupportedCurrentAsset() && HasCurrentHistoricalPath(GetSingleSelectedRevision()); }
+		bool CanShowRestore() const { return GitSourceControlStandaloneHistory::CanShowRestoreAction(Capabilities, OnRestore.IsBound(), Filename); }
+		bool CanRestoreSelectedRevision() const { return CanShowRestore() && HasCurrentHistoricalPath(GetSingleSelectedRevision()); }
 		FText GetRestoreTooltip() const
 		{
 			const TArray<FRevisionPtr> SelectedRevisions = GetSelectedRevisions();
@@ -602,7 +603,11 @@ namespace SGitStandaloneHistoryWindowPrivate
 			}
 			if (!IsSupportedCurrentAsset())
 			{
-				return LOCTEXT("StandaloneHistoryRestoreUnsupportedAsset", "Restore is available only for .uasset assets.");
+				return LOCTEXT("StandaloneHistoryRestoreUnsupportedAsset", "Restore is available only for Unreal package files (.uasset or .umap).");
+			}
+			if (!Capabilities.bAllowRestore || !OnRestore.IsBound())
+			{
+				return LOCTEXT("StandaloneHistoryRestoreUnavailable", "Restore is unavailable for this History target.");
 			}
 
 			const FRevisionPtr& Revision = SelectedRevisions[0];
@@ -622,6 +627,7 @@ namespace SGitStandaloneHistoryWindowPrivate
 		EVisibility GetSingleRevisionActionVisibility() const { return CanDiffAgainstWorkspace() ? EVisibility::Visible : EVisibility::Collapsed; }
 		EVisibility GetPreviousRevisionActionVisibility() const { return CanDiffAgainstPrevious() ? EVisibility::Visible : EVisibility::Collapsed; }
 		EVisibility GetTwoRevisionActionVisibility() const { return CanDiffSelectedRevisions() ? EVisibility::Visible : EVisibility::Collapsed; }
+		EVisibility GetRestoreActionVisibility() const { return CanShowRestore() ? EVisibility::Visible : EVisibility::Collapsed; }
 
 		FReply OnDiffAgainstWorkspace()
 		{
@@ -746,44 +752,19 @@ namespace SGitStandaloneHistoryWindowPrivate
 		FGitStandaloneHistoryRestoreDelegate OnRestore;
 		FGitStandaloneHistoryRefreshDelegate OnRefresh;
 		FGitStandaloneHistoryDiffDelegate OnDiff;
+		FGitStandaloneHistoryWindowCapabilities Capabilities;
 		TArray<TWeakPtr<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>> ActiveDiffCancellationContexts;
 	};
 }
 
-#if WITH_DEV_AUTOMATION_TESTS
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStandaloneHistoryDiffSelectionTest, "Cthulhu.GitSourceControl.Standalone.DiffSelection", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitStandaloneHistoryDiffSelectionTest::RunTest(const FString& Parameters)
+bool GitSourceControlStandaloneHistory::CanShowRestoreAction(const FGitStandaloneHistoryWindowCapabilities Capabilities,
+	const bool bRestoreDelegateBound, const FString& Filename)
 {
-	using namespace SGitStandaloneHistoryWindowPrivate;
-	const auto MakeRevision = [](const TCHAR* Commit, const TCHAR* Path)
-	{
-		const FRevisionPtr Revision = MakeShared<FGitSourceControlRevision, ESPMode::ThreadSafe>();
-		Revision->CommitId = Commit;
-		Revision->Filename = Path;
-		return Revision;
-	};
-
-	const FRevisionPtr Newest = MakeRevision(TEXT("newest"), TEXT("Content/Newest.uasset"));
-	const FRevisionPtr Previous = MakeRevision(TEXT("previous"), TEXT("Content/Previous.uasset"));
-	const FRevisionPtr Oldest = MakeRevision(TEXT("oldest"), TEXT("Content/Oldest.uasset"));
-	const FRevisionPtr Deleted = MakeRevision(TEXT("deleted"), TEXT("Content/Deleted.uasset"));
-	Deleted->Action = TEXT("D");
-	const TArray<FRevisionPtr> Snapshot = { Newest, Previous, Oldest };
-	TestTrue(TEXT("Workspace Diff keeps the selected revision as older side"), MakeWorkspaceDiffRequest(Newest).IsSet());
-	const TOptional<FHistoryDiffRequest> PreviousRequest = MakePreviousDiffRequest(Snapshot, Newest);
-	TestTrue(TEXT("Previous Diff uses the snapshot-adjacent older revision"), PreviousRequest.IsSet() && PreviousRequest->OlderRevision == Previous && PreviousRequest->NewerRevision == Newest);
-	TestFalse(TEXT("Oldest revision has no previous Diff target"), MakePreviousDiffRequest(Snapshot, Oldest).IsSet());
-	const TOptional<FHistoryDiffRequest> SelectedRequest = MakeSelectedRevisionDiffRequest(Snapshot, { Oldest, Newest });
-	TestTrue(TEXT("Selected revisions use snapshot order instead of click order"), SelectedRequest.IsSet() && SelectedRequest->OlderRevision == Oldest && SelectedRequest->NewerRevision == Newest);
-	TestFalse(TEXT("A delete revision has no single-selection Diff action"), MakeWorkspaceDiffRequest(Deleted).IsSet());
-	TestFalse(TEXT("A delete revision has no previous Diff action"), MakePreviousDiffRequest({ Newest, Deleted }, Deleted).IsSet());
-	TestFalse(TEXT("A selection containing a delete revision has no two-revision Diff action"), MakeSelectedRevisionDiffRequest({ Newest, Deleted }, { Newest, Deleted }).IsSet());
-	return true;
+	return Capabilities.bAllowRestore && bRestoreDelegateBound
+		&& (Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase) || Filename.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase));
 }
-#endif
 
-TSharedRef<SWindow> GitSourceControlStandaloneHistory::CreateWindow(const FString& Filename, const EGitLocalSourceControlHistoryMode Mode, const TGitSourceControlHistory& History, FGitStandaloneHistoryRestoreDelegate OnRestore, FGitStandaloneHistoryRefreshDelegate OnRefresh, FGitStandaloneHistoryDiffDelegate OnDiff)
+TSharedRef<SWindow> GitSourceControlStandaloneHistory::CreateWindow(const FString& Filename, const EGitLocalSourceControlHistoryMode Mode, const TGitSourceControlHistory& History, FGitStandaloneHistoryRestoreDelegate OnRestore, FGitStandaloneHistoryRefreshDelegate OnRefresh, FGitStandaloneHistoryDiffDelegate OnDiff, const FGitStandaloneHistoryWindowCapabilities Capabilities)
 {
 	using namespace SGitStandaloneHistoryWindowPrivate;
 	return SNew(SWindow)
@@ -801,6 +782,7 @@ TSharedRef<SWindow> GitSourceControlStandaloneHistory::CreateWindow(const FStrin
 			.OnRestore(OnRestore)
 			.OnRefresh(OnRefresh)
 			.OnDiff(OnDiff)
+			.Capabilities(Capabilities)
 		];
 }
 

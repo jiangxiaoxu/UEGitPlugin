@@ -6,17 +6,23 @@
 #include "GitSourceControlMenu.h"
 
 #include "AssetRegistry/AssetData.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
 #include "ContentBrowserModule.h"
 #include "ContentBrowserDelegates.h"
 #include "Editor.h"
 #include "Engine/World.h"
+#include "GameFramework/Actor.h"
 #include "FileHelpers.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "GitSourceControlAssetOperations.h"
+#include "GitSourceControlActorHistory.h"
+#include "GitChangedAssetOperations.h"
+#include "GitMapPackageSet.h"
 #include "GitSourceControlRevision.h"
 #include "DiffUtils.h"
+#include "SDetailsDiff.h"
 #include "GitStandaloneHistory.h"
 #include "SGitStandaloneHistoryWindow.h"
 #include "GitStandaloneLog.h"
@@ -49,6 +55,8 @@
 #include "HAL/CriticalSection.h"
 #include "HAL/PlatformProcess.h"
 #include "Misc/ScopeLock.h"
+#include "LevelEditorMenuContext.h"
+#include "ToolMenus.h"
 
 #define LOCTEXT_NAMESPACE "GitSourceControl"
 
@@ -454,7 +462,8 @@ public:
 			}
 		}
 
-		// 此前已关闭 dispatcher, shutdown 开始后 worker 无法再排入 GameThread 工作.
+
+		// dispatcher 已关闭, shutdown 开始后 worker 无法再排入 GameThread 工作.
 		AllTasksCompletedEvent->Wait();
 	}
 
@@ -470,6 +479,7 @@ public:
 		FScopeLock Lock(&Mutex);
 		return GameThreadUiStates.Num();
 	}
+
 #endif
 
 private:
@@ -833,6 +843,17 @@ namespace GitSourceControlMenuPrivate
 		}
 	}
 
+	bool IsStandalonePackageFilename(const FString& Filename)
+	{
+		return Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase)
+			|| Filename.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase);
+	}
+
+	bool IsMapPackageFilename(const FString& Filename)
+	{
+		return Filename.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase);
+	}
+
 	TArray<FString> GetAssetFiles(const TArray<FAssetData>& SelectedAssets)
 	{
 		TArray<FString> Files;
@@ -843,9 +864,7 @@ namespace GitSourceControlMenuPrivate
 			{
 				continue;
 			}
-			// The standalone asset tool currently has an explicit .uasset-only scope.
-			// Maps remain a future extension and must not expose Git actions.
-			if (!PackageFilename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase))
+			if (!IsStandalonePackageFilename(PackageFilename))
 			{
 				continue;
 			}
@@ -860,7 +879,7 @@ namespace GitSourceControlMenuPrivate
 		TArray<FString> PackageFiles;
 		for (const FString& Filename : Files)
 		{
-			if (Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase))
+			if (IsStandalonePackageFilename(Filename))
 			{
 				PackageFiles.Add(Filename);
 			}
@@ -1246,16 +1265,140 @@ namespace GitSourceControlMenuPrivate
 			FText::FromString(FString::Join(AffectedFiles, TEXT("\n"))));
 	}
 
-	void DispatchAssetMutation(FAssetMutationRequest Request, const TSharedRef<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe>& LifetimeState)
+	bool IsMapPackageMutationRequest(const FAssetMutationRequest& Request)
+	{
+		return Request.Files.ContainsByPredicate([](const FString& Filename)
+		{
+			return IsMapPackageFilename(Filename);
+		});
+	}
+
+	bool ConfirmChangedPackageMutationAndRunExecutionModal(const TSharedRef<FGitSourceControlMenuGameThreadDispatcher, ESPMode::ThreadSafe>& Dispatcher,
+		const TWeakPtr<FGitSourceControlAssetOperationUiState, ESPMode::ThreadSafe>& WeakUiState,
+		const TSharedRef<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe>& Lifecycle,
+		const TArray<FString>& ArtifactFiles, const EAssetMutationKind MutationKind, const TArray<FGitChangedAssetEntry>& Entries, FString& OutError)
+	{
+		return Dispatcher->InvokeAndWait([WeakUiState, Lifecycle, ArtifactFiles, MutationKind, &Entries, &OutError]()
+		{
+			const TSharedPtr<FGitSourceControlAssetOperationUiState, ESPMode::ThreadSafe> UiState = WeakUiState.Pin();
+			if (!UiState.IsValid() || UiState->WasCancellationRequested())
+			{
+				OutError = TEXT("The local Git package operation was cancelled before confirmation.");
+				return false;
+			}
+
+			UiState->FinishPreflightNotification();
+			GitChangedAssetOperations::FGitChangedAssetRevertPreview Preview;
+			if (!GitChangedAssetOperations::FGitChangedAssetRevertLifecycle::BuildPreview(Entries, Preview, OutError))
+			{
+				return false;
+			}
+
+			TArray<FString> SortedArtifacts = ArtifactFiles;
+			SortedArtifacts.Sort();
+			bool bDeletesSelectedPackage = false;
+			if (MutationKind == EAssetMutationKind::RestoreRevision)
+			{
+				for (const FGitChangedAssetEntry& Entry : Entries)
+				{
+					bDeletesSelectedPackage |= Entry.State == EGitChangedAssetState::Added || Entry.State == EGitChangedAssetState::Untracked;
+				}
+			}
+			FString Message = MutationKind == EAssetMutationKind::RestoreRevision
+				? TEXT("Force-restore the selected Git package revision to the workspace?\n\nThis discards staged and unstaged changes for exactly these package artifacts:\n")
+				: TEXT("Discard the selected tracked Git package changes and restore them to HEAD?\n\nAdded, untracked, renamed, conflicted, or replacement package artifacts are rejected without disk changes. This discards staged and unstaged changes for exactly these package artifacts:\n");
+			Message += FString::Join(SortedArtifacts, TEXT("\n"))
+				+ TEXT("\n\nThis operation has no Undo. Missing Git LFS objects may be fetched for these exact paths after confirmation.");
+			if (bDeletesSelectedPackage)
+			{
+				Message += TEXT("\n\nAdded or untracked selected package artifacts may be deleted to reproduce the chosen historical revision.");
+			}
+			if (!Preview.SelectedDirtyPackageNames.IsEmpty())
+			{
+				Message += TEXT("\n\nSelected dirty packages whose unsaved changes will be discarded:\n") + FString::Join(Preview.SelectedDirtyPackageNames, TEXT("\n"));
+			}
+			if (!Preview.OwnerMapsToReload.IsEmpty())
+			{
+				Message += TEXT("\n\nMap package(s) to reload:\n") + FString::Join(Preview.OwnerMapsToReload, TEXT("\n"));
+			}
+			const FText Title = MutationKind == EAssetMutationKind::RestoreRevision
+				? LOCTEXT("ConfirmStandalonePackageSetRestoreTitle", "Restore Git Package Revision")
+				: LOCTEXT("ConfirmStandalonePackageSetDiscardTitle", "Discard Git Package Changes");
+			if (FMessageDialog::Open(EAppMsgType::OkCancel, FText::FromString(Message), Title) != EAppReturnType::Ok)
+			{
+				OutError = TEXT("The local Git package operation was not confirmed.");
+				return false;
+			}
+			if (!Lifecycle->RecordConfirmedClosure(Entries, OutError) || !UiState->PrepareExecutionModal())
+			{
+				return false;
+			}
+			UiState->RunExecutionModalLoop();
+			return true;
+		});
+	}
+
+	GitChangedAssetOperations::FGitChangedAssetRevertCallbacks MakeChangedPackageMutationCallbacks(
+		const TSharedRef<FGitSourceControlMenuGameThreadDispatcher, ESPMode::ThreadSafe>& Dispatcher,
+		const TWeakPtr<FGitSourceControlAssetOperationUiState, ESPMode::ThreadSafe>& WeakUiState,
+		const TSharedRef<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe>& Lifecycle,
+		const TSharedRef<FGitSourceControlAssetMutationPhaseState, ESPMode::ThreadSafe>& MutationPhase,
+		const TSharedRef<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>& CancellationContext,
+		const TArray<FString>& ArtifactFiles, const EAssetMutationKind MutationKind)
+	{
+		GitChangedAssetOperations::FGitChangedAssetRevertCallbacks Callbacks;
+		Callbacks.IsCancellationRequested = [CancellationContext]()
+		{
+			return CancellationContext->IsCancellationRequested();
+		};
+		Callbacks.Confirm = [Dispatcher, WeakUiState, Lifecycle, ArtifactFiles, MutationKind](const TArray<FGitChangedAssetEntry>& Entries, FString& OutError)
+		{
+			return ConfirmChangedPackageMutationAndRunExecutionModal(Dispatcher, WeakUiState, Lifecycle, ArtifactFiles, MutationKind, Entries, OutError);
+		};
+		Callbacks.PrepareForMutation = [Dispatcher, Lifecycle](const TArray<FGitChangedAssetEntry>& Entries, FString& OutError)
+		{
+			return InvokeOnGameThreadAndWait(Dispatcher, [Lifecycle, &Entries, &OutError]()
+			{
+				return Lifecycle->Prepare(Entries, OutError);
+			});
+		};
+		Callbacks.BeginMutation = [Dispatcher, Lifecycle, MutationPhase](const TArray<FGitChangedAssetEntry>& Entries, FString& OutError)
+		{
+			return InvokeOnGameThreadAndWait(Dispatcher, [Lifecycle, MutationPhase, &Entries, &OutError]()
+			{
+				const bool bReadyToCommit = Lifecycle->BeginMutation(Entries, OutError);
+				if (bReadyToCommit)
+				{
+					MutationPhase->EnterCommitPhase();
+				}
+				return bReadyToCommit;
+			});
+		};
+		Callbacks.FinalizeEditor = [Dispatcher, Lifecycle, MutationPhase](const TArray<FGitChangedAssetEntry>& Entries, const TArray<FString>& AffectedFiles,
+			const GitChangedAssetOperations::EGitChangedAssetMutationOutcome Outcome, FString& OutError)
+		{
+			if (MutationPhase->IsShutdownStarted())
+			{
+				// 模块卸载只保证已提交磁盘事务安全结束; 不再触发 Editor reload 或 UI 回调.
+				return true;
+			}
+			return InvokeOnGameThreadAndWait(Dispatcher, [Lifecycle, &Entries, &AffectedFiles, Outcome, &OutError]()
+			{
+				const bool bFinished = Lifecycle->Finish(Entries, AffectedFiles, Outcome, OutError);
+				if (Outcome == GitChangedAssetOperations::EGitChangedAssetMutationOutcome::Succeeded)
+				{
+					IAssetRegistry::GetChecked().ScanModifiedAssetFiles(AffectedFiles);
+					FEditorDelegates::RefreshAllBrowsers.Broadcast();
+				}
+				return bFinished;
+			});
+		};
+		return Callbacks;
+	}
+
+	void DispatchMapPackageMutation(FAssetMutationRequest Request, const TSharedRef<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe>& LifetimeState)
 	{
 		check(IsInGameThread());
-		FString MutationPreflightError;
-		if (!GitSourceControlAssetOperations::FGitSourceControlAssetOperations::ValidateStandaloneMutationPreflight(
-			Request.Files, GatherLoadedPackages(Request.Files, true), MutationPreflightError))
-		{
-			ShowFailure(FText::FromString(MutationPreflightError));
-			return;
-		}
 		if (!LifetimeState->TryBeginTask())
 		{
 			return;
@@ -1282,55 +1425,96 @@ namespace GitSourceControlMenuPrivate
 		}
 		UiState->ShowPreflightNotification();
 		const TWeakPtr<FGitSourceControlAssetOperationUiState, ESPMode::ThreadSafe> WeakUiState = UiState;
+
 		Async(EAsyncExecution::ThreadPool, [Request = MoveTemp(Request), LifetimeState, CancellationContext, Dispatcher, WeakUiState, MutationPhase, Task]() mutable
 		{
-			using namespace GitSourceControlAssetOperations;
 			GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(CancellationContext);
-			if (!IsLifetimeAcceptingCallbacks(LifetimeState))
-			{
-				return;
-			}
-
-			FGitAssetOperationResult Result;
-			FString RepositoryRoot;
-			FString ResolveError;
+			GitChangedAssetOperations::FGitChangedAssetRevertResult Result;
+			FString Error;
 			FString GitBinary;
-			bool bSucceeded = !Request.Files.IsEmpty();
-			if (!bSucceeded)
+			FString RepositoryRoot;
+			bool bSucceeded = !Request.Files.IsEmpty()
+				&& GitSourceControlUtils::ResolveStandaloneRepositoryForFile(Request.Files[0], GitBinary, RepositoryRoot, Error);
+			FGitChangedAssetMutationSet MutationSet;
+			if (bSucceeded)
 			{
-				ResolveError = TEXT("No asset files were supplied for the standalone Git operation.");
+				const EGitChangedAssetOperationMode OperationMode = Request.Kind == EAssetMutationKind::DiscardTracked
+					? EGitChangedAssetOperationMode::DiscardTracked
+					: EGitChangedAssetOperationMode::HistoricalRestore;
+				bSucceeded = GitMapPackageSet::BuildSelectionMutationSetForFiles(GitBinary, RepositoryRoot, FString(), Request.Files,
+					OperationMode, MutationSet, Error);
 			}
-			else
+			if (bSucceeded)
 			{
-				bSucceeded = GitSourceControlUtils::ResolveStandaloneRepositoryForFile(Request.Files[0], GitBinary, RepositoryRoot, ResolveError);
-			}
-			const TSharedRef<FReloadOutcome, ESPMode::ThreadSafe> ReloadOutcome = MakeShared<FReloadOutcome, ESPMode::ThreadSafe>();
-			const TSharedRef<FPreparedPackageReloadState, ESPMode::ThreadSafe> PreparedPackages = MakeShared<FPreparedPackageReloadState, ESPMode::ThreadSafe>();
-			if (!bSucceeded)
-			{
-				Result.AddError(ResolveError);
-			}
-			else
-			{
-				const FGitSourceControlAssetOperations Operations(MoveTemp(GitBinary), MoveTemp(RepositoryRoot));
-				const FGitAssetOperationCallbacks Callbacks = MakeAssetOperationCallbacks(Dispatcher, WeakUiState, ReloadOutcome, PreparedPackages, MutationPhase,
-					Request.Kind == EAssetMutationKind::RestoreRevision);
-				if (bSucceeded)
+				bSucceeded = InvokeOnGameThreadAndWait(Dispatcher, [&MutationSet, &Error]()
 				{
-					switch (Request.Kind)
+					return GitMapPackageSet::EnrichMutationSetForLifecycle(MutationSet, Error);
+				});
+			}
+			if (bSucceeded)
+			{
+				TArray<FString> ArtifactFiles;
+				ArtifactFiles.Reserve(MutationSet.Artifacts.Num());
+				for (const FGitChangedAssetArtifact& Artifact : MutationSet.Artifacts)
+				{
+					ArtifactFiles.Add(Artifact.AbsoluteFilename);
+				}
+				const TSharedRef<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe> Lifecycle =
+					MakeShared<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe>();
+				auto MakeCallbacks = [&Dispatcher, &WeakUiState, &Lifecycle, &MutationPhase, &CancellationContext, &ArtifactFiles, &Request]()
+				{
+					return MakeChangedPackageMutationCallbacks(Dispatcher, WeakUiState, Lifecycle, MutationPhase, CancellationContext, ArtifactFiles, Request.Kind);
+				};
+				if (Request.Kind == EAssetMutationKind::RestoreRevision)
+				{
+					if (Request.Files.Num() != 1 || !MutationSet.SelectedEntries[0].RepositoryRelativePath.Equals(Request.HistoricalPath, ESearchCase::CaseSensitive))
 					{
-					case EAssetMutationKind::DiscardTracked:
-						bSucceeded = Operations.DiscardTrackedFiles(Request.Files, Callbacks, Result);
-						break;
-					case EAssetMutationKind::RestoreRevision:
-						bSucceeded = Operations.RestoreRevisionToWorkspace(Request.Files[0], Request.CommitId, Request.HistoricalPath, Callbacks, Result);
-						break;
+						Result.AddError(TEXT("Historical package restore requires exactly one selected package with the same current and historical Git path."));
+						bSucceeded = false;
+					}
+					else
+					{
+						FString PackageName;
+						if (!FPackageName::TryConvertFilenameToLongPackageName(Request.Files[0], PackageName))
+						{
+							Result.AddError(FString::Printf(TEXT("Could not resolve the selected package name for historical restore: %s"), *Request.Files[0]));
+							bSucceeded = false;
+						}
+						else
+						{
+							FGitChangedPrimaryPackageTarget PrimaryTarget;
+							PrimaryTarget.PackageName = PackageName;
+							PrimaryTarget.RepositoryRelativePath = Request.HistoricalPath;
+							PrimaryTarget.AbsoluteFilename = Request.Files[0];
+							PrimaryTarget.bIsMap = true;
+							FGitPackageRevisionArtifactSet RevisionArtifacts;
+							if (!GitMapPackageSet::BuildPackageRevisionArtifactSet(GitBinary, RepositoryRoot, Request.CommitId, PrimaryTarget, RevisionArtifacts, Error))
+							{
+								Result.AddError(Error);
+								bSucceeded = false;
+							}
+							else
+							{
+								for (const FString& RevisionRelativePath : RevisionArtifacts.RepositoryRelativePaths)
+								{
+									AddUniquePath(ArtifactFiles, FPaths::ConvertRelativePathToFull(RepositoryRoot, RevisionRelativePath));
+								}
+								GitChangedAssetOperations::FGitChangedAssetRevisionRestoreRequest RestoreRequest;
+								RestoreRequest.CurrentMutationSet = MoveTemp(MutationSet);
+								RestoreRequest.RevisionArtifacts = MoveTemp(RevisionArtifacts);
+								bSucceeded = GitChangedAssetOperations::FGitChangedAssetOperations(GitBinary, RepositoryRoot).RestorePackageRevision(RestoreRequest, MakeCallbacks(), Result);
+							}
+						}
 					}
 				}
-				if (!bSucceeded && !ResolveError.IsEmpty())
+				else
 				{
-					Result.AddError(ResolveError);
+					bSucceeded = GitChangedAssetOperations::FGitChangedAssetOperations(GitBinary, RepositoryRoot).RevertToHead(MutationSet, MakeCallbacks(), Result);
 				}
+			}
+			if (!bSucceeded && !Error.IsEmpty())
+			{
+				Result.AddError(Error);
 			}
 
 			const bool bShutdownDuringCommit = MutationPhase->IsInCommitPhase() && MutationPhase->IsShutdownStarted();
@@ -1340,11 +1524,9 @@ namespace GitSourceControlMenuPrivate
 			}
 			if (bShutdownDuringCommit)
 			{
-				// The core mutation has completed or rolled back. Shutdown has already
-				// released the dispatcher, so never schedule reload UI from this worker.
 				return;
 			}
-			Dispatcher->InvokeAndWait([Request = MoveTemp(Request), Result = MoveTemp(Result), ReloadOutcome, PreparedPackages, LifetimeState, CancellationContext, Dispatcher, WeakUiState, bSucceeded]() mutable
+			Dispatcher->InvokeAndWait([Result = MoveTemp(Result), MutationKind = Request.Kind, LifetimeState, CancellationContext, Dispatcher, WeakUiState, bSucceeded]() mutable
 			{
 				LifetimeState->UntrackCancellationContext(CancellationContext);
 				const TSharedPtr<FGitSourceControlAssetOperationUiState, ESPMode::ThreadSafe> UiState = WeakUiState.Pin();
@@ -1361,67 +1543,40 @@ namespace GitSourceControlMenuPrivate
 					Dispatcher->Close();
 					return false;
 				}
-				if (!IsLifetimeAcceptingCallbacks(LifetimeState))
-				{
-					UiState->CloseExecutionModal();
-					LifetimeState->UntrackDispatcher(Dispatcher);
-					Dispatcher->Close();
-					return false;
-				}
 				UiState->FinishPreflightNotification();
-				ReloadPreparedPackages(*PreparedPackages, *ReloadOutcome);
-				if (PreparedPackages->bPackagesUnloaded)
-				{
-					Result.bReloadSucceeded = ReloadOutcome->bSucceeded;
-				}
+				UiState->CloseExecutionModal();
 				if (!bSucceeded)
 				{
-					UiState->CloseExecutionModal();
-					if (PreparedPackages->bPackagesUnloaded && !ReloadOutcome->bSucceeded)
+					if (Result.bCancelled || UiState->WasCancellationRequested())
 					{
-						const FString OperationError = Result.Errors.IsEmpty()
-							? TEXT("The local Git asset operation did not complete.")
-							: FString::Join(Result.Errors, TEXT("\n"));
-						ShowFailure(FText::Format(
-							LOCTEXT("AssetMutationFailureReloadFailed", "{0}\n\nThe package was unloaded before the operation and could not be reloaded:\n{1}"),
-							FText::FromString(OperationError), FText::FromString(ReloadOutcome->Detail)));
-					}
-					else if (Result.bCancelled || UiState->WasCancellationRequested())
-					{
-						ShowNeutralNotification(PreparedPackages->bPackagesUnloaded
-							? LOCTEXT("GitAssetMutationCancelledReloaded", "The local Git asset operation was cancelled. The unloaded package was reloaded.")
-							: LOCTEXT("GitAssetMutationCancelled", "The local Git asset operation was cancelled. No asset files were changed."));
+						ShowNeutralNotification(LOCTEXT("GitPackageMutationCancelled", "The local Git package operation was cancelled. No package files were changed."));
 					}
 					else
 					{
-						ShowFailure(FText::FromString(FString::Join(Result.Errors, TEXT("\n"))));
+						ShowFailure(FText::FromString(Result.Errors.IsEmpty() ? TEXT("The local Git package operation did not complete.") : FString::Join(Result.Errors, TEXT("\n"))));
 					}
-					LifetimeState->UntrackDispatcher(Dispatcher);
-					Dispatcher->Close();
-					return true;
 				}
-
-				UiState->CloseExecutionModal();
-				if (!ReloadOutcome->bKnown)
+				else if (!Result.bReloadSucceeded)
 				{
-					ShowNeutralNotification(GetAssetMutationUnknownReloadText(Request.Kind, Result.AffectedFiles));
-					LifetimeState->UntrackDispatcher(Dispatcher);
-					Dispatcher->Close();
-					return true;
+					ShowFailure(FText::Format(
+						LOCTEXT("GitPackageMutationReloadFailed", "The Git package operation completed on disk, but the affected Editor packages could not be reloaded. Reopen the package or restart the Editor before further edits.\n{0}"),
+						FText::FromString(Result.Errors.IsEmpty() ? TEXT("No additional reload diagnostic was returned.") : FString::Join(Result.Errors, TEXT("\n")))));
 				}
-				if (!Result.bReloadSucceeded || !ReloadOutcome->bSucceeded)
+				else
 				{
-					ShowFailure(FText::Format(LOCTEXT("AssetMutationReloadFailed", "The disk operation succeeded, but package reload reported a problem.\n{0}"), FText::FromString(ReloadOutcome->Detail)));
-					LifetimeState->UntrackDispatcher(Dispatcher);
-					Dispatcher->Close();
-					return true;
+					ShowNotification(GetAssetMutationSuccessText(MutationKind), true);
 				}
-				ShowNotification(GetAssetMutationSuccessText(Request.Kind), true);
 				LifetimeState->UntrackDispatcher(Dispatcher);
 				Dispatcher->Close();
 				return true;
 			});
 		});
+	}
+
+	void DispatchAssetMutation(FAssetMutationRequest Request, const TSharedRef<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe>& LifetimeState)
+	{
+		check(IsInGameThread());
+		DispatchMapPackageMutation(MoveTemp(Request), LifetimeState);
 	}
 
 	FRevisionInfo MakeHistoryDiffRevisionInfo(const FGitSourceControlRevision& Revision)
@@ -1433,7 +1588,30 @@ namespace GitSourceControlMenuPrivate
 		return Info;
 	}
 
-	UObject* LoadExportedHistoryRevisionForDiff(const FGitSourceControlRevision& Revision, const FString& ExportedFilename)
+	struct FGitHistoryTarget
+	{
+		FString Filename;
+		EGitHistoryTargetKind Kind = EGitHistoryTargetKind::Asset;
+	};
+
+	UObject* FindDiffObjectInPackage(UPackage* Package, const FGitHistoryTarget& Target)
+	{
+		if (Package == nullptr)
+		{
+			return nullptr;
+		}
+
+		if (Target.Kind == EGitHistoryTargetKind::ExternalActor)
+		{
+			return AActor::FindActorInPackage(Package);
+		}
+
+		return IsMapPackageFilename(Target.Filename)
+			? static_cast<UObject*>(UWorld::FindWorldInPackage(Package))
+			: Package->FindAssetInPackage();
+	}
+
+	UObject* LoadExportedHistoryRevisionForDiff(const FGitHistoryTarget& Target, const FGitSourceControlRevision& Revision, const FString& ExportedFilename)
 	{
 		const FPackagePath TempPackagePath = FPackagePath::FromLocalPath(ExportedFilename);
 		const FPackagePath OriginalPackagePath = FPackagePath::FromLocalPath(Revision.GetFilename());
@@ -1442,28 +1620,172 @@ namespace GitSourceControlMenuPrivate
 			return nullptr;
 		}
 		UPackage* Package = DiffUtils::LoadPackageForDiff(TempPackagePath, OriginalPackagePath);
-		return Package == nullptr ? nullptr : Package->FindAssetInPackage();
+		return FindDiffObjectInPackage(Package, Target);
+	}
+
+	UObject* ResolveCurrentHistoryDiffObject(const FGitHistoryTarget& Target)
+	{
+		if (Target.Kind == EGitHistoryTargetKind::ExternalActor)
+		{
+			// OFPA actor history 不允许为 workspace Diff 隐式加载 actor package.
+			return GitSourceControlActorHistory::FindLoadedExternalActorForHistoryDiff(Target.Filename);
+		}
+
+		FString WorkspacePackageName;
+		if (!FPackageName::TryConvertFilenameToLongPackageName(Target.Filename, WorkspacePackageName))
+		{
+			return nullptr;
+		}
+
+		// 普通 asset 优先使用已加载 package, 保留 Editor 中尚未保存的属性修改.
+		UPackage* WorkspacePackage = FindPackage(nullptr, *WorkspacePackageName);
+		if (WorkspacePackage == nullptr)
+		{
+			WorkspacePackage = LoadPackage(nullptr, *WorkspacePackageName, LOAD_None);
+		}
+		return FindDiffObjectInPackage(WorkspacePackage, Target);
+	}
+
+	bool ExportHistoryRevisionForDiff(const FGitHistoryTarget& Target, const FGitSourceControlRevision& Revision,
+		FString& OutPrimaryFilename, FString& OutMaterializationDirectory, FString& OutError)
+	{
+		OutPrimaryFilename.Reset();
+		OutMaterializationDirectory.Reset();
+		OutError.Reset();
+
+		FString PackageName;
+		if (!FPackageName::TryConvertFilenameToLongPackageName(Target.Filename, PackageName))
+		{
+			OutError = FString::Printf(TEXT("Could not resolve the current package name for Diff: %s"), *Target.Filename);
+			return false;
+		}
+		FGitChangedPrimaryPackageTarget PrimaryTarget;
+		PrimaryTarget.PackageName = PackageName;
+		PrimaryTarget.RepositoryRelativePath = Revision.Filename;
+		PrimaryTarget.AbsoluteFilename = Target.Filename;
+		PrimaryTarget.bIsMap = IsMapPackageFilename(Target.Filename);
+		FGitPackageRevisionArtifactSet RevisionArtifacts;
+		if (!GitMapPackageSet::BuildPackageRevisionArtifactSet(Revision.GitBinary, Revision.RepositoryRoot, Revision.CommitId,
+			PrimaryTarget, RevisionArtifacts, OutError))
+		{
+			return false;
+		}
+
+		FGitPackageRevisionMaterialization Materialization;
+		if (!GitMapPackageSet::MaterializePackageRevisionArtifacts(Revision.GitBinary, Revision.RepositoryRoot, RevisionArtifacts, Materialization, OutError))
+		{
+			return false;
+		}
+		GitSourceControlRevision::RegisterTemporaryExportDirectory(Materialization.TemporaryDirectory);
+		OutMaterializationDirectory = MoveTemp(Materialization.TemporaryDirectory);
+		OutPrimaryFilename = MoveTemp(Materialization.PrimaryFilename);
+		return true;
 	}
 
 	struct FHistoryDiffExportFiles
 	{
 		FString Older;
 		FString Newer;
+		FString OlderMaterializationDirectory;
+		FString NewerMaterializationDirectory;
 	};
 
 	void ReleaseHistoryDiffExports(const FHistoryDiffExportFiles& Exports)
 	{
-		if (!Exports.Older.IsEmpty())
+		if (!Exports.OlderMaterializationDirectory.IsEmpty())
+		{
+			GitSourceControlRevision::ReleaseTemporaryExportDirectory(Exports.OlderMaterializationDirectory);
+		}
+		else if (!Exports.Older.IsEmpty())
 		{
 			GitSourceControlRevision::ReleaseTemporaryExport(Exports.Older);
 		}
-		if (!Exports.Newer.IsEmpty())
+		if (!Exports.NewerMaterializationDirectory.IsEmpty())
+		{
+			GitSourceControlRevision::ReleaseTemporaryExportDirectory(Exports.NewerMaterializationDirectory);
+		}
+		else if (!Exports.Newer.IsEmpty())
 		{
 			GitSourceControlRevision::ReleaseTemporaryExport(Exports.Newer);
 		}
 	}
 
-	TSharedPtr<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe> DispatchHistoryDiff(const FString& WorkspaceFilename, const TSharedPtr<FGitSourceControlRevision, ESPMode::ThreadSafe>& OlderRevision,
+	/**
+	 * Details Diff 自己拥有顶层 Slate window; 该 state 将其纳入菜单 lifetime,
+	 * 并在正常关闭或模块 shutdown 时解除插件回调和回收 materialization.
+	 */
+	class FGitHistoryDetailsDiffWindowState final : public FGitSourceControlMenuGameThreadUiState,
+		public TSharedFromThis<FGitHistoryDetailsDiffWindowState, ESPMode::ThreadSafe>
+	{
+	public:
+		FGitHistoryDetailsDiffWindowState(const TSharedRef<FHistoryDiffExportFiles, ESPMode::ThreadSafe>& InExports,
+			const TSharedRef<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe>& InLifetimeState)
+			: Exports(InExports)
+			, LifetimeState(InLifetimeState)
+		{
+		}
+
+		virtual ~FGitHistoryDetailsDiffWindowState() override
+		{
+			check(IsInGameThread());
+			Cleanup();
+		}
+
+		void Attach(const TSharedRef<SDetailsDiff>& InDetailsDiff, const TSharedRef<SWindow>& InWindow)
+		{
+			check(IsInGameThread());
+			DetailsDiff = InDetailsDiff;
+			Window = InWindow;
+			DetailsDiffClosedHandle = InDetailsDiff->OnWindowClosedEvent.AddSP(AsShared(), &FGitHistoryDetailsDiffWindowState::HandleDetailsDiffClosed);
+		}
+
+private:
+		void HandleDetailsDiffClosed(TSharedRef<SDetailsDiff>)
+		{
+			check(IsInGameThread());
+			const TSharedRef<FGitHistoryDetailsDiffWindowState, ESPMode::ThreadSafe> KeepAlive = AsShared();
+			Cleanup();
+			if (const TSharedPtr<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe> PinnedLifetimeState = LifetimeState.Pin())
+			{
+				PinnedLifetimeState->UntrackGameThreadUiState(StaticCastSharedRef<FGitSourceControlMenuGameThreadUiState>(KeepAlive));
+			}
+		}
+
+		void Cleanup()
+		{
+			check(IsInGameThread());
+			if (bCleanedUp)
+			{
+				return;
+			}
+			bCleanedUp = true;
+			if (DetailsDiffClosedHandle.IsValid())
+			{
+				if (const TSharedPtr<SDetailsDiff> PinnedDetailsDiff = DetailsDiff.Pin())
+				{
+					PinnedDetailsDiff->OnWindowClosedEvent.Remove(DetailsDiffClosedHandle);
+				}
+				DetailsDiffClosedHandle.Reset();
+			}
+			if (const TSharedPtr<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe> PinnedLifetimeState = LifetimeState.Pin())
+			{
+				if (const TSharedPtr<SWindow> PinnedWindow = Window.Pin())
+				{
+					PinnedLifetimeState->UntrackExecutionWindow(PinnedWindow.ToSharedRef());
+				}
+			}
+			ReleaseHistoryDiffExports(*Exports);
+		}
+
+		TSharedRef<FHistoryDiffExportFiles, ESPMode::ThreadSafe> Exports;
+		TWeakPtr<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe> LifetimeState;
+		TWeakPtr<SDetailsDiff> DetailsDiff;
+		TWeakPtr<SWindow> Window;
+		FDelegateHandle DetailsDiffClosedHandle;
+		bool bCleanedUp = false;
+	};
+
+	TSharedPtr<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe> DispatchHistoryDiff(const FGitHistoryTarget& Target, const TSharedPtr<FGitSourceControlRevision, ESPMode::ThreadSafe>& OlderRevision,
 		const TSharedPtr<FGitSourceControlRevision, ESPMode::ThreadSafe>& NewerRevision,
 		const TSharedRef<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe>& LifetimeState)
 	{
@@ -1497,22 +1819,28 @@ namespace GitSourceControlMenuPrivate
 		UiState->Show();
 		const TWeakPtr<FGitSourceControlHistoryDiffUiState, ESPMode::ThreadSafe> WeakUiState = UiState;
 
-		Async(EAsyncExecution::ThreadPool, [WorkspaceFilename, OlderRevision, NewerRevision, LifetimeState, CancellationContext, Dispatcher, WeakUiState, Task]()
+		Async(EAsyncExecution::ThreadPool, [Target, OlderRevision, NewerRevision, LifetimeState, CancellationContext, Dispatcher, WeakUiState, Task]()
 		{
 			GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(CancellationContext);
 			const TSharedRef<FHistoryDiffExportFiles, ESPMode::ThreadSafe> Exports = MakeShared<FHistoryDiffExportFiles, ESPMode::ThreadSafe>();
 			FString Error;
-			bool bSucceeded = OlderRevision->Get(Exports->Older);
+			bool bSucceeded = ExportHistoryRevisionForDiff(Target, *OlderRevision, Exports->Older, Exports->OlderMaterializationDirectory, Error);
 			if (!bSucceeded)
 			{
-				Error = TEXT("Could not export the older Git revision for Diff.");
+				if (Error.IsEmpty())
+				{
+					Error = TEXT("Could not export the older Git revision for Diff.");
+				}
 			}
 			if (bSucceeded && !CancellationContext->IsCancellationRequested() && NewerRevision.IsValid())
 			{
-				bSucceeded = NewerRevision->Get(Exports->Newer);
+				bSucceeded = ExportHistoryRevisionForDiff(Target, *NewerRevision, Exports->Newer, Exports->NewerMaterializationDirectory, Error);
 				if (!bSucceeded)
 				{
-					Error = TEXT("Could not export the newer Git revision for Diff.");
+					if (Error.IsEmpty())
+					{
+						Error = TEXT("Could not export the newer Git revision for Diff.");
+					}
 				}
 			}
 			if (CancellationContext->IsCancellationRequested())
@@ -1521,7 +1849,7 @@ namespace GitSourceControlMenuPrivate
 				Error = TEXT("Git revision export was cancelled.");
 			}
 
-			const bool bDelivered = Dispatcher->InvokeAndWait([WorkspaceFilename, OlderRevision, NewerRevision, Exports,
+			const bool bDelivered = Dispatcher->InvokeAndWait([Target, OlderRevision, NewerRevision, Exports,
 				Error = MoveTemp(Error), LifetimeState, CancellationContext, Dispatcher, WeakUiState, bSucceeded]() mutable
 			{
 				LifetimeState->UntrackCancellationContext(CancellationContext);
@@ -1565,24 +1893,17 @@ namespace GitSourceControlMenuPrivate
 					return true;
 				}
 
-				UObject* OlderAsset = LoadExportedHistoryRevisionForDiff(*OlderRevision, Exports->Older);
+				UObject* OlderAsset = LoadExportedHistoryRevisionForDiff(Target, *OlderRevision, Exports->Older);
 				UObject* NewerAsset = nullptr;
 				FRevisionInfo NewerInfo;
 				if (NewerRevision.IsValid())
 				{
-					NewerAsset = LoadExportedHistoryRevisionForDiff(*NewerRevision, Exports->Newer);
+					NewerAsset = LoadExportedHistoryRevisionForDiff(Target, *NewerRevision, Exports->Newer);
 					NewerInfo = MakeHistoryDiffRevisionInfo(*NewerRevision);
 				}
 				else
 				{
-					FString WorkspacePackageName;
-					if (FPackageName::TryConvertFilenameToLongPackageName(WorkspaceFilename, WorkspacePackageName))
-					{
-						if (UPackage* WorkspacePackage = LoadPackage(nullptr, *WorkspacePackageName, LOAD_None))
-						{
-							NewerAsset = WorkspacePackage->FindAssetInPackage();
-						}
-					}
+					NewerAsset = ResolveCurrentHistoryDiffObject(Target);
 				}
 
 				if (OlderAsset == nullptr || NewerAsset == nullptr || OlderAsset->GetClass() != NewerAsset->GetClass())
@@ -1592,8 +1913,47 @@ namespace GitSourceControlMenuPrivate
 				}
 				else
 				{
-					FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get().DiffAssets(
-						OlderAsset, NewerAsset, MakeHistoryDiffRevisionInfo(*OlderRevision), NewerInfo);
+					if (GitSourceControlActorHistory::GetDiffStrategy(Target.Kind) == EGitHistoryDiffStrategy::ActorDetails)
+					{
+						const TSharedRef<SDetailsDiff> DetailsDiff = SDetailsDiff::CreateDiffWindow(
+							OlderAsset, NewerAsset, MakeHistoryDiffRevisionInfo(*OlderRevision), NewerInfo, OlderAsset->GetClass());
+						const TSharedPtr<SWindow> DetailsDiffWindow = FSlateApplication::Get().FindWidgetWindow(DetailsDiff);
+						if (!DetailsDiffWindow.IsValid())
+						{
+							ShowFailure(LOCTEXT("StandaloneHistoryDetailsDiffWindowMissing", "Unable to locate the Actor Details Diff window for Git History lifetime management."));
+							ReleaseHistoryDiffExports(*Exports);
+						}
+						else if (!LifetimeState->TrackExecutionWindow(DetailsDiffWindow.ToSharedRef()))
+						{
+							DetailsDiffWindow->SetOnWindowClosed(FOnWindowClosed());
+							DetailsDiffWindow->SetContent(SNullWidget::NullWidget);
+							FSlateApplication::Get().RequestDestroyWindow(DetailsDiffWindow.ToSharedRef());
+							ShowFailure(LOCTEXT("StandaloneHistoryDetailsDiffTrackingFailed", "Unable to keep the Actor Details Diff window alive during Git History shutdown."));
+							ReleaseHistoryDiffExports(*Exports);
+						}
+						else
+						{
+							const TSharedRef<FGitHistoryDetailsDiffWindowState, ESPMode::ThreadSafe> DetailsDiffState =
+								MakeShared<FGitHistoryDetailsDiffWindowState, ESPMode::ThreadSafe>(Exports, LifetimeState);
+							if (!LifetimeState->TrackGameThreadUiState(StaticCastSharedRef<FGitSourceControlMenuGameThreadUiState>(DetailsDiffState)))
+							{
+								LifetimeState->UntrackExecutionWindow(DetailsDiffWindow.ToSharedRef());
+								DetailsDiffWindow->SetOnWindowClosed(FOnWindowClosed());
+								DetailsDiffWindow->SetContent(SNullWidget::NullWidget);
+								FSlateApplication::Get().RequestDestroyWindow(DetailsDiffWindow.ToSharedRef());
+								ReleaseHistoryDiffExports(*Exports);
+							}
+							else
+							{
+								DetailsDiffState->Attach(DetailsDiff, DetailsDiffWindow.ToSharedRef());
+							}
+						}
+					}
+					else
+					{
+						FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get().DiffAssets(
+							OlderAsset, NewerAsset, MakeHistoryDiffRevisionInfo(*OlderRevision), NewerInfo);
+					}
 				}
 				LifetimeState->UntrackDispatcher(Dispatcher);
 				Dispatcher->Close();
@@ -1607,7 +1967,7 @@ namespace GitSourceControlMenuPrivate
 		return CancellationContext;
 	}
 
-	void BeginStandaloneHistoryLoad(const FString& Filename, const EGitLocalSourceControlHistoryMode Mode,
+	void BeginStandaloneHistoryLoad(const FGitHistoryTarget& Target, const EGitLocalSourceControlHistoryMode Mode,
 		const TSharedRef<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe>& LifetimeState)
 	{
 		if (!LifetimeState->TryBeginTask())
@@ -1639,7 +1999,7 @@ namespace GitSourceControlMenuPrivate
 		UiState->Show();
 		const TWeakPtr<FGitSourceControlHistoryLoadUiState, ESPMode::ThreadSafe> WeakUiState = UiState;
 
-		Async(EAsyncExecution::ThreadPool, [Filename, Mode, LifetimeState, CancellationContext, Dispatcher, WeakUiState, Task]()
+		Async(EAsyncExecution::ThreadPool, [Target, Mode, LifetimeState, CancellationContext, Dispatcher, WeakUiState, Task]()
 		{
 			GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(CancellationContext);
 			FString GitBinary;
@@ -1649,15 +2009,15 @@ namespace GitSourceControlMenuPrivate
 			TGitSourceControlHistory History;
 			FString CapturedHead;
 			bool bHeadChanged = false;
-			const bool bResolved = GitSourceControlUtils::ResolveStandaloneRepositoryForFile(Filename, GitBinary, RepositoryRoot, ResolveError);
+			const bool bResolved = GitSourceControlUtils::ResolveStandaloneRepositoryForFile(Target.Filename, GitBinary, RepositoryRoot, ResolveError);
 			const bool bSucceeded = bResolved && GitSourceControlUtils::RunGetHistory(
-				GitBinary, RepositoryRoot, Filename, false, Mode, CapturedHead, bHeadChanged, Errors, History);
+				GitBinary, RepositoryRoot, Target.Filename, false, Mode, CapturedHead, bHeadChanged, Errors, History);
 			if (!bResolved && !ResolveError.IsEmpty())
 			{
 				Errors.Add(ResolveError);
 			}
 
-			Dispatcher->InvokeAndWait([Filename, Mode, LifetimeState, CancellationContext, Dispatcher, WeakUiState, bSucceeded, bHeadChanged,
+			Dispatcher->InvokeAndWait([Target, Mode, LifetimeState, CancellationContext, Dispatcher, WeakUiState, bSucceeded, bHeadChanged,
 				Errors = MoveTemp(Errors), History = MoveTemp(History)]() mutable
 			{
 				LifetimeState->UntrackCancellationContext(CancellationContext);
@@ -1694,7 +2054,7 @@ namespace GitSourceControlMenuPrivate
 					const FString Detail = Errors.IsEmpty() ? TEXT("Git did not return parseable history for this file.") : FString::Join(Errors, TEXT("\n"));
 					ShowFailure(FText::Format(
 						LOCTEXT("GitHistoryLoadFailed", "Failed to load Git history for:\n{0}\n\n{1}"),
-						FText::FromString(Filename), FText::FromString(Detail)));
+						FText::FromString(Target.Filename), FText::FromString(Detail)));
 					LifetimeState->UntrackDispatcher(Dispatcher);
 					Dispatcher->Close();
 					return true;
@@ -1726,25 +2086,26 @@ namespace GitSourceControlMenuPrivate
 						DispatchAssetMutation(MoveTemp(Request), LifetimeState);
 					});
 				const FGitStandaloneHistoryRefreshDelegate RefreshDelegate = FGitStandaloneHistoryRefreshDelegate::CreateLambda(
-					[LifetimeState](FString LocalFilename, const EGitLocalSourceControlHistoryMode RefreshMode)
+					[Target, LifetimeState](FString LocalFilename, const EGitLocalSourceControlHistoryMode RefreshMode)
 					{
-						if (LifetimeState->IsAcceptingCallbacks())
+						if (LifetimeState->IsAcceptingCallbacks() && LocalFilename.Equals(Target.Filename, ESearchCase::CaseSensitive))
 						{
-							BeginStandaloneHistoryLoad(LocalFilename, RefreshMode, LifetimeState);
+							BeginStandaloneHistoryLoad(Target, RefreshMode, LifetimeState);
 						}
 					});
 				const FGitStandaloneHistoryDiffDelegate DiffDelegate = FGitStandaloneHistoryDiffDelegate::CreateLambda(
-					[LifetimeState](FString LocalFilename, TSharedPtr<FGitSourceControlRevision, ESPMode::ThreadSafe> OlderRevision,
+					[Target, LifetimeState](FString LocalFilename, TSharedPtr<FGitSourceControlRevision, ESPMode::ThreadSafe> OlderRevision,
 						TSharedPtr<FGitSourceControlRevision, ESPMode::ThreadSafe> NewerRevision)
 					{
-						if (LifetimeState->IsAcceptingCallbacks())
+						if (LifetimeState->IsAcceptingCallbacks() && LocalFilename.Equals(Target.Filename, ESearchCase::CaseSensitive))
 						{
-							return DispatchHistoryDiff(LocalFilename, OlderRevision, NewerRevision, LifetimeState);
+							return DispatchHistoryDiff(Target, OlderRevision, NewerRevision, LifetimeState);
 						}
 						return TSharedPtr<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>();
 					});
 				const TSharedRef<SWindow> HistoryWindow = GitSourceControlStandaloneHistory::CreateWindow(
-					Filename, Mode, History, RestoreDelegate, RefreshDelegate, DiffDelegate);
+					Target.Filename, Mode, History, RestoreDelegate, RefreshDelegate, DiffDelegate,
+					FGitStandaloneHistoryWindowCapabilities{ true });
 				if (!LifetimeState->TrackExecutionWindow(HistoryWindow))
 				{
 					LifetimeState->UntrackDispatcher(Dispatcher);
@@ -1783,6 +2144,8 @@ void FGitSourceControlMenu::Register()
 	Extenders.Add(FContentBrowserMenuExtender_SelectedAssets::CreateRaw(this, &FGitSourceControlMenu::OnExtendContentBrowserAssetSelectionMenu));
 	AssetMenuExtenderHandle = Extenders.Last().GetHandle();
 	bRegistered = true;
+	ActorContextMenuStartupHandle = UToolMenus::RegisterStartupCallback(
+		FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FGitSourceControlMenu::RegisterActorContextMenu));
 }
 
 void FGitSourceControlMenu::Unregister()
@@ -1791,6 +2154,20 @@ void FGitSourceControlMenu::Unregister()
 	{
 		return;
 	}
+	if (UToolMenus::TryGet())
+	{
+		if (ActorContextMenuStartupHandle.IsValid())
+		{
+			UToolMenus::UnRegisterStartupCallback(ActorContextMenuStartupHandle);
+			ActorContextMenuStartupHandle.Reset();
+		}
+		UToolMenus::UnregisterOwner(this);
+	}
+	else
+	{
+		ActorContextMenuStartupHandle.Reset();
+	}
+
 	if (LifetimeState.IsValid())
 	{
 		LifetimeState->StopAcceptingAndWait();
@@ -1806,6 +2183,63 @@ void FGitSourceControlMenu::Unregister()
 	}
 	AssetMenuExtenderHandle.Reset();
 	bRegistered = false;
+}
+
+void FGitSourceControlMenu::RegisterActorContextMenu()
+{
+	if (!bRegistered || !UToolMenus::TryGet())
+	{
+		return;
+	}
+
+	FToolMenuOwnerScoped OwnerScoped(this);
+	UToolMenu* const ActorContextMenu = UToolMenus::Get()->ExtendMenu(TEXT("LevelEditor.ActorContextMenu"));
+	ActorContextMenu->AddDynamicSection(TEXT("GitLocalExternalActorHistory"),
+		FNewToolMenuDelegate::CreateRaw(this, &FGitSourceControlMenu::AddActorContextMenuEntries),
+		FToolMenuInsert(TEXT("ActorTypeTools"), EToolMenuInsertType::After));
+}
+
+void FGitSourceControlMenu::AddActorContextMenuEntries(UToolMenu* InMenu)
+{
+	if (InMenu == nullptr || !LifetimeState.IsValid() || !LifetimeState->IsAcceptingCallbacks())
+	{
+		return;
+	}
+
+	const ULevelEditorContextMenuContext* const Context = InMenu->FindContext<ULevelEditorContextMenuContext>();
+	if (Context == nullptr || Context->CurrentSelection == nullptr)
+	{
+		return;
+	}
+
+	FGitActorHistoryTarget ActorTarget;
+	FString IgnoredFailureReason;
+	if (!GitSourceControlActorHistory::ResolveExternalActorHistoryTarget(*Context->CurrentSelection, ActorTarget, IgnoredFailureReason))
+	{
+		return;
+	}
+
+	const TWeakPtr<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe> WeakLifetimeState = LifetimeState;
+	FToolMenuSection& Section = InMenu->AddSection(TEXT("GitLocalExternalActorActions"), LOCTEXT("GitLocalExternalActorActions", "Git (Local)"));
+	Section.AddMenuEntry(
+		TEXT("GitLocalExternalActorViewHistory"),
+		LOCTEXT("ViewExternalActorGitHistory", "View Git History..."),
+		LOCTEXT("ViewExternalActorGitHistoryTooltip", "Open standalone, fixed-HEAD Git history and Details Diff for this external actor."),
+		FSlateIcon(),
+		FUIAction(FExecuteAction::CreateLambda([ActorTarget = MoveTemp(ActorTarget), WeakLifetimeState]()
+		{
+			const TSharedPtr<FGitSourceControlMenuLifetimeState, ESPMode::ThreadSafe> PinnedLifetimeState = WeakLifetimeState.Pin();
+			if (!PinnedLifetimeState.IsValid() || !PinnedLifetimeState->IsAcceptingCallbacks()
+				|| !GitSourceControlMenuPrivate::GuardGitActionExecution())
+			{
+				return;
+			}
+
+			GitSourceControlMenuPrivate::FGitHistoryTarget Target;
+			Target.Filename = ActorTarget.Filename;
+			Target.Kind = EGitHistoryTargetKind::ExternalActor;
+			GitSourceControlMenuPrivate::BeginStandaloneHistoryLoad(Target, EGitLocalSourceControlHistoryMode::CurrentPath, PinnedLifetimeState.ToSharedRef());
+		})));
 }
 
 TSharedRef<FExtender> FGitSourceControlMenu::OnExtendContentBrowserAssetSelectionMenu(const TArray<FAssetData>& SelectedAssets)
@@ -1839,7 +2273,7 @@ void FGitSourceControlMenu::AddAssetMenuEntries(FMenuBuilder& MenuBuilder, const
 	}
 	MenuBuilder.AddMenuEntry(
 		LOCTEXT("DiscardGitChanges", "Discard Git Changes..."),
-		LOCTEXT("DiscardGitChangesTooltip", "Restore selected tracked .uasset files from HEAD. This also discards staged changes for exactly those assets."),
+		LOCTEXT("DiscardGitChangesTooltip", "Restore selected tracked Unreal package files from HEAD. This also discards staged changes for exactly those selected packages."),
 		FSlateIcon(),
 		FUIAction(FExecuteAction::CreateRaw(this, &FGitSourceControlMenu::DiscardSelectedAssets, SelectedAssets)));
 	MenuBuilder.EndSection();
@@ -1847,14 +2281,6 @@ void FGitSourceControlMenu::AddAssetMenuEntries(FMenuBuilder& MenuBuilder, const
 
 void FGitSourceControlMenu::ViewSelectedAssetHistory(TArray<FAssetData> SelectedAssets, const EGitLocalSourceControlHistoryMode Mode)
 {
-	if (!GitSourceControlMenuPrivate::GuardGitActionExecution())
-	{
-		return;
-	}
-	if (!LifetimeState.IsValid() || !LifetimeState->IsAcceptingCallbacks())
-	{
-		return;
-	}
 	const TArray<FString> PackageFiles = GitSourceControlMenuPrivate::GetPrimaryPackageFiles(GitSourceControlMenuPrivate::GetAssetFiles(SelectedAssets));
 	if (PackageFiles.Num() != 1)
 	{
@@ -1862,7 +2288,20 @@ void FGitSourceControlMenu::ViewSelectedAssetHistory(TArray<FAssetData> Selected
 		return;
 	}
 
-	GitSourceControlMenuPrivate::BeginStandaloneHistoryLoad(PackageFiles[0], Mode, LifetimeState.ToSharedRef());
+	ViewPackageHistory(PackageFiles[0], Mode);
+}
+
+void FGitSourceControlMenu::ViewPackageHistory(FString Filename, const EGitLocalSourceControlHistoryMode Mode)
+{
+	if (!GitSourceControlMenuPrivate::GuardGitActionExecution() || !LifetimeState.IsValid() || !LifetimeState->IsAcceptingCallbacks())
+	{
+		return;
+	}
+
+	GitSourceControlMenuPrivate::FGitHistoryTarget Target;
+	Target.Filename = MoveTemp(Filename);
+	Target.Kind = EGitHistoryTargetKind::Asset;
+	GitSourceControlMenuPrivate::BeginStandaloneHistoryLoad(Target, Mode, LifetimeState.ToSharedRef());
 }
 
 void FGitSourceControlMenu::DiscardSelectedAssets(TArray<FAssetData> SelectedAssets)
@@ -1887,66 +2326,7 @@ void FGitSourceControlMenu::DiscardSelectedAssets(TArray<FAssetData> SelectedAss
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStandaloneUAssetMenuScopeTest, "Cthulhu.GitSourceControl.Standalone.UAssetMenuScope",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitStandaloneUAssetMenuScopeTest::RunTest(const FString& Parameters)
-{
-	(void)Parameters;
-	const TArray<FString> Files = { TEXT("Content/Example.uasset"), TEXT("Content/Example.umap"), TEXT("Content/Example.txt") };
-	const TArray<FString> PackageFiles = GitSourceControlMenuPrivate::GetPrimaryPackageFiles(Files);
-	TestEqual(TEXT("Only .uasset files are eligible for standalone Git menu actions"), PackageFiles.Num(), 1);
-	TestTrue(TEXT("The .uasset path remains eligible"), PackageFiles.Contains(TEXT("Content/Example.uasset")));
-	TestFalse(TEXT("The future .umap scope is not exposed"), PackageFiles.Contains(TEXT("Content/Example.umap")));
-
-	const GitSourceControlUtils::FGitStartupCapability SavedCapability = GitSourceControlUtils::GetStartupGitCapability();
-	ON_SCOPE_EXIT
-	{
-		GitSourceControlUtils::Testing::SetStartupGitCapabilityForTesting(SavedCapability);
-	};
-	GitSourceControlUtils::FGitStartupCapability PendingCapability;
-	PendingCapability.State = GitSourceControlUtils::EGitStartupCapabilityState::Pending;
-	PendingCapability.Diagnostic = TEXT("Checking for Git 2.53.0 or newer...");
-	GitSourceControlUtils::Testing::SetStartupGitCapabilityForTesting(PendingCapability);
-	GitSourceControlUtils::Testing::ResetGitProcessLaunchCount();
-	FText CapabilityMessage;
-	TestFalse(TEXT("Pending startup capability blocks a clickable Content Browser Git action"),
-		GitSourceControlMenuPrivate::CheckGitActionExecutionCapability(CapabilityMessage));
-	TestTrue(TEXT("Pending Git action explains that the startup check is still running"), CapabilityMessage.ToString().Contains(TEXT("Checking for Git")));
-	TestEqual(TEXT("Pending Content Browser Git action starts no Git process"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount(), static_cast<uint64>(0));
-	TestEqual(TEXT("Pending startup capability keeps the .uasset action scope present"),
-		GitSourceControlMenuPrivate::GetPrimaryPackageFiles(Files).Num(), 1);
-	GitSourceControlUtils::FGitStartupCapability UnavailableCapability;
-	UnavailableCapability.State = GitSourceControlUtils::EGitStartupCapabilityState::Unavailable;
-	UnavailableCapability.Diagnostic = TEXT("Detected Git executable: C:/Tools/Git/bin/git.exe\nDetected version: git version 2.42.0\nGit 2.53.0 or a newer release is required. Install or upgrade Git, then restart the Editor.");
-	GitSourceControlUtils::Testing::SetStartupGitCapabilityForTesting(UnavailableCapability);
-	CapabilityMessage = FText::GetEmpty();
-	TestFalse(TEXT("Unavailable startup capability blocks a clickable Content Browser Git action"),
-		GitSourceControlMenuPrivate::CheckGitActionExecutionCapability(CapabilityMessage));
-	TestTrue(TEXT("Unavailable Git action preserves the detected path, required version, and restart guidance"),
-		CapabilityMessage.ToString().Contains(TEXT("C:/Tools/Git/bin/git.exe"))
-		&& CapabilityMessage.ToString().Contains(TEXT("Git 2.53.0"))
-		&& CapabilityMessage.ToString().Contains(TEXT("restart the Editor")));
-	TestEqual(TEXT("Unavailable Content Browser Git action starts no Git process"), GitSourceControlUtils::Testing::GetGitProcessLaunchCount(), static_cast<uint64>(0));
-	return TestEqual(TEXT("Unavailable startup capability keeps the .uasset action scope present"),
-		GitSourceControlMenuPrivate::GetPrimaryPackageFiles(Files).Num(), 1);
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStandaloneMutationShutdownPhaseTest, "Cthulhu.GitSourceControl.Standalone.MutationShutdownPhase",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitStandaloneMutationShutdownPhaseTest::RunTest(const FString& Parameters)
-{
-	const TSharedPtr<FGitSourceControlAssetMutationPhaseState, ESPMode::ThreadSafe> Phase = MakeShared<FGitSourceControlAssetMutationPhaseState, ESPMode::ThreadSafe>();
-	TestTrue(TEXT("Preflight mutation is cancelled during module shutdown"), ShouldCancelForModuleShutdown(Phase));
-	Phase->EnterCommitPhase();
-	TestFalse(TEXT("Committed mutation is not cancelled during module shutdown"), ShouldCancelForModuleShutdown(Phase));
-	Phase->MarkShutdown();
-	TestTrue(TEXT("Committed mutation records shutdown for reload UI bypass"), Phase->IsShutdownStarted());
-	return true;
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStandaloneGameThreadUiLifetimeTest, "Cthulhu.GitSourceControl.Standalone.GameThreadUiLifetime",
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStandaloneGameThreadUiLifetimeTest, "UEGitPlugin.Standalone.GameThreadUiLifetime",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
 struct FGitSourceControlMenuUiLifetimeTestProbe
@@ -1983,6 +2363,34 @@ bool FGitStandaloneGameThreadUiLifetimeTest::RunTest(const FString& Parameters)
 	{
 		AddError(TEXT("The Slate lifetime regression test must run on the GameThread."));
 		return false;
+	}
+
+	// 将 mutation shutdown 策略与生命周期路径放在同一 suite, 保持 pre-commit cancel 与 post-commit completion 契约一致.
+	const TSharedPtr<FGitSourceControlAssetMutationPhaseState, ESPMode::ThreadSafe> MutationPhase =
+		MakeShared<FGitSourceControlAssetMutationPhaseState, ESPMode::ThreadSafe>();
+	TestTrue(TEXT("Preflight mutation is cancelled during module shutdown"), ShouldCancelForModuleShutdown(MutationPhase));
+	MutationPhase->EnterCommitPhase();
+	TestFalse(TEXT("Committed mutation is not cancelled during module shutdown"), ShouldCancelForModuleShutdown(MutationPhase));
+	MutationPhase->MarkShutdown();
+	TestTrue(TEXT("Committed mutation records shutdown for reload UI bypass"), MutationPhase->IsShutdownStarted());
+	{
+		const TSharedRef<FGitSourceControlMenuGameThreadDispatcher, ESPMode::ThreadSafe> ClosedDispatcher =
+			MakeShared<FGitSourceControlMenuGameThreadDispatcher, ESPMode::ThreadSafe>();
+		ClosedDispatcher->Close();
+		const TSharedRef<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe> Lifecycle =
+			MakeShared<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe>();
+		const TSharedRef<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe> CancellationContext =
+			MakeShared<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>();
+		const TWeakPtr<FGitSourceControlAssetOperationUiState, ESPMode::ThreadSafe> NoUiState;
+		const TArray<FString> NoArtifacts;
+		const GitChangedAssetOperations::FGitChangedAssetRevertCallbacks Callbacks =
+			GitSourceControlMenuPrivate::MakeChangedPackageMutationCallbacks(ClosedDispatcher, NoUiState, Lifecycle, MutationPhase.ToSharedRef(),
+				CancellationContext, NoArtifacts, GitSourceControlMenuPrivate::EAssetMutationKind::DiscardTracked);
+		const TArray<FGitChangedAssetEntry> NoEntries;
+		FString FinalizeError;
+		TestTrue(TEXT("Committed shutdown finalizer succeeds after its dispatcher closes without scheduling reload"),
+			Callbacks.FinalizeEditor(NoEntries, NoArtifacts, GitChangedAssetOperations::EGitChangedAssetMutationOutcome::Succeeded, FinalizeError));
+		TestTrue(TEXT("Committed shutdown finalizer leaves no reload diagnostic"), FinalizeError.IsEmpty());
 	}
 
 	{
@@ -2050,11 +2458,11 @@ bool FGitStandaloneGameThreadUiLifetimeTest::RunTest(const FString& Parameters)
 		TSharedPtr<FGitSourceControlMenuUiLifetimeTestState, ESPMode::ThreadSafe> UiState =
 			MakeShared<FGitSourceControlMenuUiLifetimeTestState, ESPMode::ThreadSafe>(Probe);
 		const TWeakPtr<FGitSourceControlMenuUiLifetimeTestState, ESPMode::ThreadSafe> WeakUiState = UiState;
+		const TSharedRef<FGitSourceControlMenuGameThreadDispatcher, ESPMode::ThreadSafe> Dispatcher =
+			MakeShared<FGitSourceControlMenuGameThreadDispatcher, ESPMode::ThreadSafe>();
 		TestTrue(TEXT("Dispatcher rejection tracks GameThread UI state"), LifetimeState->TrackGameThreadUiState(
 			StaticCastSharedRef<FGitSourceControlMenuGameThreadUiState>(UiState.ToSharedRef())));
 		TestTrue(TEXT("Dispatcher rejection begins its tracked worker task"), LifetimeState->TryBeginTask());
-		const TSharedRef<FGitSourceControlMenuGameThreadDispatcher, ESPMode::ThreadSafe> Dispatcher =
-			MakeShared<FGitSourceControlMenuGameThreadDispatcher, ESPMode::ThreadSafe>();
 		TestTrue(TEXT("Dispatcher rejection tracks dispatcher"), LifetimeState->TrackDispatcher(Dispatcher));
 		TSharedPtr<FGitSourceControlMenuTask, ESPMode::ThreadSafe> WorkerTask =
 			MakeShared<FGitSourceControlMenuTask, ESPMode::ThreadSafe>(LifetimeState);
@@ -2099,13 +2507,13 @@ bool FGitStandaloneGameThreadUiLifetimeTest::RunTest(const FString& Parameters)
 			MakeShared<FGitSourceControlMenuUiLifetimeTestProbe, ESPMode::ThreadSafe>();
 		const TSharedRef<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe> CancellationContext =
 			MakeShared<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>();
-		const TSharedRef<FGitSourceControlAssetMutationPhaseState, ESPMode::ThreadSafe> MutationPhase =
+		const TSharedRef<FGitSourceControlAssetMutationPhaseState, ESPMode::ThreadSafe> PreCommitMutationPhase =
 			MakeShared<FGitSourceControlAssetMutationPhaseState, ESPMode::ThreadSafe>();
 		TSharedPtr<FGitSourceControlMenuUiLifetimeTestState, ESPMode::ThreadSafe> UiState =
 			MakeShared<FGitSourceControlMenuUiLifetimeTestState, ESPMode::ThreadSafe>(Probe);
 		TestTrue(TEXT("Pre-commit shutdown tracks GameThread UI state"), LifetimeState->TrackGameThreadUiState(
 			StaticCastSharedRef<FGitSourceControlMenuGameThreadUiState>(UiState.ToSharedRef())));
-		TestTrue(TEXT("Pre-commit shutdown tracks cancellation context"), LifetimeState->TrackCancellationContext(CancellationContext, MutationPhase));
+		TestTrue(TEXT("Pre-commit shutdown tracks cancellation context"), LifetimeState->TrackCancellationContext(CancellationContext, PreCommitMutationPhase));
 		TestTrue(TEXT("Pre-commit shutdown begins its tracked worker task"), LifetimeState->TryBeginTask());
 		TSharedPtr<FGitSourceControlMenuTask, ESPMode::ThreadSafe> WorkerTask =
 			MakeShared<FGitSourceControlMenuTask, ESPMode::ThreadSafe>(LifetimeState);
@@ -2129,7 +2537,7 @@ bool FGitStandaloneGameThreadUiLifetimeTest::RunTest(const FString& Parameters)
 			return false;
 		}
 		TestTrue(TEXT("Pre-commit shutdown cancels the worker context"), Probe->bWorkerObservedCancellation.Load());
-		TestTrue(TEXT("Pre-commit shutdown records mutation shutdown"), MutationPhase->IsShutdownStarted());
+		TestTrue(TEXT("Pre-commit shutdown records mutation shutdown"), PreCommitMutationPhase->IsShutdownStarted());
 		TestEqual(TEXT("Pre-commit shutdown destroys UI state exactly once"), Probe->DestructionCount.Load(), 1);
 		TestTrue(TEXT("Pre-commit shutdown destroys UI state on GameThread"), Probe->bDestroyedOnGameThread.Load());
 		TestEqual(TEXT("Pre-commit shutdown clears worker tasks"), LifetimeState->GetActiveTaskCountForTesting(), 0);
@@ -2153,14 +2561,14 @@ bool FGitStandaloneGameThreadUiLifetimeTest::RunTest(const FString& Parameters)
 			MakeShared<FGitSourceControlMenuUiLifetimeTestProbe, ESPMode::ThreadSafe>();
 		const TSharedRef<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe> CancellationContext =
 			MakeShared<GitSourceControlUtils::FGitOperationCancellationContext, ESPMode::ThreadSafe>();
-		const TSharedRef<FGitSourceControlAssetMutationPhaseState, ESPMode::ThreadSafe> MutationPhase =
+		const TSharedRef<FGitSourceControlAssetMutationPhaseState, ESPMode::ThreadSafe> CommitMutationPhase =
 			MakeShared<FGitSourceControlAssetMutationPhaseState, ESPMode::ThreadSafe>();
-		MutationPhase->EnterCommitPhase();
+		CommitMutationPhase->EnterCommitPhase();
 		TSharedPtr<FGitSourceControlMenuUiLifetimeTestState, ESPMode::ThreadSafe> UiState =
 			MakeShared<FGitSourceControlMenuUiLifetimeTestState, ESPMode::ThreadSafe>(Probe);
 		TestTrue(TEXT("Commit shutdown tracks GameThread UI state"), LifetimeState->TrackGameThreadUiState(
 			StaticCastSharedRef<FGitSourceControlMenuGameThreadUiState>(UiState.ToSharedRef())));
-		TestTrue(TEXT("Commit shutdown tracks cancellation context"), LifetimeState->TrackCancellationContext(CancellationContext, MutationPhase));
+		TestTrue(TEXT("Commit shutdown tracks cancellation context"), LifetimeState->TrackCancellationContext(CancellationContext, CommitMutationPhase));
 		TestTrue(TEXT("Commit shutdown begins its tracked worker task"), LifetimeState->TryBeginTask());
 		TSharedPtr<FGitSourceControlMenuTask, ESPMode::ThreadSafe> WorkerTask =
 			MakeShared<FGitSourceControlMenuTask, ESPMode::ThreadSafe>(LifetimeState);
@@ -2172,13 +2580,13 @@ bool FGitStandaloneGameThreadUiLifetimeTest::RunTest(const FString& Parameters)
 			WorkerTask.Reset();
 			WorkerCompletedEvent->Trigger();
 		});
-		Async(EAsyncExecution::ThreadPool, [MutationPhase, CommitGateEvent, GateHelperCompletedEvent]()
+		Async(EAsyncExecution::ThreadPool, [CommitMutationPhase, CommitGateEvent, GateHelperCompletedEvent]()
 		{
-			for (int32 Attempt = 0; Attempt < 5000 && !MutationPhase->IsShutdownStarted(); ++Attempt)
+			for (int32 Attempt = 0; Attempt < 5000 && !CommitMutationPhase->IsShutdownStarted(); ++Attempt)
 			{
 				FPlatformProcess::SleepNoStats(0.001f);
 			}
-			if (MutationPhase->IsShutdownStarted())
+			if (CommitMutationPhase->IsShutdownStarted())
 			{
 				CommitGateEvent->Trigger();
 			}
@@ -2203,7 +2611,7 @@ bool FGitStandaloneGameThreadUiLifetimeTest::RunTest(const FString& Parameters)
 		}
 		TestTrue(TEXT("Commit shutdown lets the commit worker complete"), Probe->bWorkerPassedCommitGate.Load());
 		TestFalse(TEXT("Commit shutdown does not cancel the worker context"), Probe->bWorkerObservedCancellation.Load());
-		TestTrue(TEXT("Commit shutdown records mutation shutdown"), MutationPhase->IsShutdownStarted());
+		TestTrue(TEXT("Commit shutdown records mutation shutdown"), CommitMutationPhase->IsShutdownStarted());
 		TestEqual(TEXT("Commit shutdown destroys UI state exactly once"), Probe->DestructionCount.Load(), 1);
 		TestTrue(TEXT("Commit shutdown destroys UI state on GameThread"), Probe->bDestroyedOnGameThread.Load());
 		TestEqual(TEXT("Commit shutdown clears worker tasks"), LifetimeState->GetActiveTaskCountForTesting(), 0);

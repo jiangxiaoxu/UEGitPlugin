@@ -1,6 +1,6 @@
 // Copyright (c) 2026
 //
-// Changed Assets 的无 UI 数据模型. 只描述单个 .uasset, 不处理额外文件.
+// Changed Assets 的无 UI 数据模型. UI 行只描述 primary package, Git 事务保留 package artifact closure.
 
 #pragma once
 
@@ -15,6 +15,45 @@ enum class EGitChangedAssetState : uint8
 	Untracked,
 	Renamed,
 	Conflicted,
+};
+
+/** 一个 package artifact 的角色. Sidecar 不单独显示为 Changed Assets 行, 但必须进入选中 package 的 Git 事务. */
+enum class EGitChangedAssetArtifactKind : uint8
+{
+	PrimaryPackage,
+	Sidecar,
+};
+
+/** Git package transaction contract. The same artifact transport intentionally has different state eligibility per user operation. */
+enum class EGitChangedAssetOperationMode : uint8
+{
+	/** Changed Assets Revert to pinned HEAD; selected added, untracked and renamed packages are intentionally supported. */
+	ChangedAssetsRevert,
+	/** Discard tracked package changes only; never deletes an added or untracked package artifact. */
+	DiscardTracked,
+	/** Explicit historical/force restore; current Git status does not limit the selected exact package. */
+	HistoricalRestore,
+};
+
+/**
+ * porcelain-v2 中的一个精确 package artifact, 或 selection 时补入的无变更 sibling.
+ * 所有 Git mutation、index/fingerprint/backup/rollback 均使用此类型, 不能退化为目录 pathspec.
+ */
+struct FGitChangedAssetArtifact
+{
+	FString RepositoryRelativePath;
+	FString AbsoluteFilename;
+	FString RenameFromRepositoryRelativePath;
+	FString RenameFromAbsoluteFilename;
+	EGitChangedAssetState State = EGitChangedAssetState::Modified;
+	TCHAR IndexStatus = TEXT('.');
+	TCHAR WorktreeStatus = TEXT('.');
+	bool bHasUntrackedReplacement = false;
+	bool bKnownUnchanged = false;
+	EGitChangedAssetArtifactKind Kind = EGitChangedAssetArtifactKind::PrimaryPackage;
+
+	bool IsRename() const { return !bKnownUnchanged && State == EGitChangedAssetState::Renamed; }
+	bool IsConflicted() const { return !bKnownUnchanged && State == EGitChangedAssetState::Conflicted; }
 };
 
 enum class EGitChangedAssetPackageKind : uint8
@@ -77,7 +116,7 @@ struct FGitChangedAssetDataLayerOwnerCache
 	FGitChangedAssetDataLayerMappingCache Head;
 };
 
-/** 一个相对固定 HEAD 的单 .uasset Git 变更. */
+/** 一个相对固定 HEAD 的单 primary package Git 变更. */
 struct FGitChangedAssetEntry
 {
 	/** 当前 Git path, 始终是 repository-relative normalized filename. */
@@ -148,9 +187,28 @@ struct FGitChangedAssetSnapshot
 	FDateTime CapturedAtUtc;
 	double StatusDurationSeconds = 0.0;
 	TArray<FGitChangedAssetEntry> Entries;
+	/** 所有 primary/sidecar porcelain records; sidecar 不得因 UI filtering 丢失. */
+	TArray<FGitChangedAssetArtifact> ArtifactEntries;
 	/** Owner-level WorldDataLayers data, cache and HEAD safety state; lifetime is one refresh snapshot. */
 	TMap<FString, FGitChangedAssetDataLayerOwnerCache> DataLayerOwnerCaches;
 };
 
+/** 一次 selection-driven Changed Assets Git 事务. 所有 Artifact 都是明确文件, 而非目录或通配 pathspec. */
+struct FGitChangedAssetMutationSet
+{
+	FString PinnedHead;
+	EGitChangedAssetOperationMode OperationMode = EGitChangedAssetOperationMode::ChangedAssetsRevert;
+	TArray<FGitChangedAssetEntry> SelectedEntries;
+	TArray<FGitChangedAssetArtifact> Artifacts;
+	FString Signature;
+
+	bool IsEmpty() const { return SelectedEntries.IsEmpty() || Artifacts.IsEmpty(); }
+};
+
 GITSOURCECONTROL_API const TCHAR* LexToString(EGitChangedAssetState InState);
+/** 仅 OFPA/WDL metadata 路径使用; 不要用它筛掉 .umap. */
 GITSOURCECONTROL_API bool IsGitChangedAssetUassetPath(const FString& InRepositoryRelativePath);
+GITSOURCECONTROL_API bool IsGitChangedAssetMapPath(const FString& InRepositoryRelativePath);
+GITSOURCECONTROL_API bool IsGitChangedAssetPrimaryPackagePath(const FString& InRepositoryRelativePath);
+GITSOURCECONTROL_API bool IsGitChangedAssetSidecarPath(const FString& InRepositoryRelativePath);
+GITSOURCECONTROL_API bool IsGitChangedAssetArtifactPath(const FString& InRepositoryRelativePath);

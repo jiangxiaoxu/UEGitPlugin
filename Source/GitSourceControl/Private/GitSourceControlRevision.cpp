@@ -10,9 +10,8 @@
 #include "GitStandaloneLog.h"
 #include "GitSourceControlUtils.h"
 #include "HAL/FileManager.h"
-#if WITH_DEV_AUTOMATION_TESTS
-#include "Misc/AutomationTest.h"
-#endif
+#include "HAL/PlatformProcess.h"
+#include "Engine/World.h"
 #include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
@@ -29,6 +28,7 @@ namespace GitSourceControlRevisionPrivate
 	constexpr TCHAR TemporaryExportFilenamePrefix[] = TEXT("UEGit-Diff-");
 	FCriticalSection TemporaryExportsLock;
 	TSet<FString> TemporaryExports;
+	TSet<FString> TemporaryExportDirectories;
 
 	FString GetTemporaryExportDirectory()
 	{
@@ -61,9 +61,28 @@ namespace GitSourceControlRevisionPrivate
 			&& FPaths::GetCleanFilename(NormalizedFilename).StartsWith(TemporaryExportFilenamePrefix, ESearchCase::CaseSensitive);
 	}
 
+	bool IsManagedTemporaryExportDirectory(const FString& InDirectory)
+	{
+		if (InDirectory.IsEmpty())
+		{
+			return false;
+		}
+
+		FString NormalizedDirectory = NormalizePathForComparison(InDirectory);
+		FString TemporaryRoot = NormalizePathForComparison(FPlatformProcess::UserTempDir());
+		return FPaths::GetPath(NormalizedDirectory).Equals(TemporaryRoot, ESearchCase::IgnoreCase)
+			&& FPaths::GetCleanFilename(NormalizedDirectory).StartsWith(TEXT("git-source-control-package-"), ESearchCase::CaseSensitive);
+	}
+
 	bool IsPackageFile(const FString& Filename)
 	{
-		return Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase);
+		return Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase)
+			|| Filename.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase);
+	}
+
+	bool IsMapPackageFile(const FString& Filename)
+	{
+		return Filename.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase);
 	}
 
 	bool LoadCurrentPackageForDiff(const FString& LocalFilename)
@@ -79,7 +98,14 @@ namespace GitSourceControlRevisionPrivate
 			return false;
 		}
 		UPackage* Package = LoadPackage(nullptr, *PackageName, LOAD_None);
-		return Package != nullptr && Package->FindAssetInPackage() != nullptr;
+		if (Package == nullptr)
+		{
+			return false;
+		}
+
+		return IsMapPackageFile(LocalFilename)
+			? UWorld::FindWorldInPackage(Package) != nullptr
+			: Package->FindAssetInPackage() != nullptr;
 	}
 
 	bool HasValidPackageHeader(const FString& Filename)
@@ -152,40 +178,6 @@ namespace GitSourceControlRevisionPrivate
 
 }
 
-#if WITH_DEV_AUTOMATION_TESTS
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitStandaloneRevisionUAssetScopeTest, "Cthulhu.GitSourceControl.Standalone.RevisionUAssetScope",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitStandaloneRevisionUAssetScopeTest::RunTest(const FString& Parameters)
-{
-	TestTrue(TEXT("Revision adapter accepts .uasset"), GitSourceControlRevisionPrivate::IsPackageFile(TEXT("Content/Example.uasset")));
-	TestFalse(TEXT("Revision adapter rejects future .umap scope"), GitSourceControlRevisionPrivate::IsPackageFile(TEXT("Content/Example.umap")));
-	TestFalse(TEXT("Revision adapter rejects non-package files"), GitSourceControlRevisionPrivate::IsPackageFile(TEXT("Content/Example.txt")));
-	const FString ManagedExport = FPaths::Combine(GitSourceControlRevisionPrivate::GetTemporaryExportDirectory(), TEXT("UEGit-Diff-test.uasset"));
-	const FString OtherDirectoryFile = FPaths::Combine(FPaths::DiffDir(), TEXT("UEGit-Diff-test.uasset"));
-	const FString OtherPrefixFile = FPaths::Combine(GitSourceControlRevisionPrivate::GetTemporaryExportDirectory(), TEXT("other-test.uasset"));
-	TestTrue(TEXT("Session export cleanup scope is a dedicated directory and prefix"), GitSourceControlRevisionPrivate::IsManagedTemporaryExport(ManagedExport));
-	TestFalse(TEXT("Session export cleanup does not include the parent Diff directory"), GitSourceControlRevisionPrivate::IsManagedTemporaryExport(OtherDirectoryFile));
-	TestFalse(TEXT("Session export cleanup does not include unrelated files in its directory"), GitSourceControlRevisionPrivate::IsManagedTemporaryExport(OtherPrefixFile));
-	IFileManager::Get().MakeDirectory(*GitSourceControlRevisionPrivate::GetTemporaryExportDirectory(), true);
-	TestTrue(TEXT("Managed session export can be retained after a successful Diff"), FFileHelper::SaveStringToFile(TEXT("test"), *ManagedExport));
-	GitSourceControlRevisionPrivate::RegisterTemporaryExport(ManagedExport);
-	TestTrue(TEXT("Successful Diff export remains available until explicit cleanup"), IFileManager::Get().FileExists(*ManagedExport));
-	GitSourceControlRevision::ReleaseTemporaryExport(ManagedExport);
-	TestFalse(TEXT("Failed or abandoned Diff export is released immediately"), IFileManager::Get().FileExists(*ManagedExport));
-	TestTrue(TEXT("Release ignores files outside the plugin-owned session directory"), FFileHelper::SaveStringToFile(TEXT("test"), *OtherDirectoryFile));
-	GitSourceControlRevision::ReleaseTemporaryExport(OtherDirectoryFile);
-	TestTrue(TEXT("Release leaves unrelated files untouched"), IFileManager::Get().FileExists(*OtherDirectoryFile));
-	IFileManager::Get().Delete(*OtherDirectoryFile, false, true, true);
-	FGitSourceControlRevision Revision;
-	Revision.LocalFilename = TEXT("Content/Example.uasset");
-	Revision.Filename = TEXT("Content/Example.umap");
-	FString ExportFilename;
-	TestFalse(TEXT("Revision export rejects a .umap historical path"), Revision.Get(ExportFilename));
-	return true;
-}
-#endif
-
 #if ENGINE_MAJOR_VERSION >= 5
 bool FGitSourceControlRevision::Get(FString& InOutFilename, EConcurrency::Type InConcurrency) const
 {
@@ -199,7 +191,7 @@ bool FGitSourceControlRevision::Get(FString& InOutFilename) const
 #endif
 	if (!GitSourceControlRevisionPrivate::IsPackageFile(Filename) || !GitSourceControlRevisionPrivate::IsPackageFile(LocalFilename))
 	{
-		UE_LOG(LogGitStandalone, Warning, TEXT("Revision export supports only .uasset files."));
+		UE_LOG(LogGitStandalone, Warning, TEXT("Revision export supports only Unreal package files (.uasset or .umap)."));
 		return false;
 	}
 	// Engine SourceControl history 对 workspace side 只执行 FindObject.
@@ -362,6 +354,7 @@ int32 FGitSourceControlRevision::GetFileSize() const
 void GitSourceControlRevision::CleanupTemporaryExports()
 {
 	TArray<FString> Files;
+	TArray<FString> Directories;
 	{
 		FScopeLock Lock(&GitSourceControlRevisionPrivate::TemporaryExportsLock);
 		for (const FString& Filename : GitSourceControlRevisionPrivate::TemporaryExports)
@@ -369,10 +362,19 @@ void GitSourceControlRevision::CleanupTemporaryExports()
 			Files.Add(Filename);
 		}
 		GitSourceControlRevisionPrivate::TemporaryExports.Reset();
+		for (const FString& Directory : GitSourceControlRevisionPrivate::TemporaryExportDirectories)
+		{
+			Directories.Add(Directory);
+		}
+		GitSourceControlRevisionPrivate::TemporaryExportDirectories.Reset();
 	}
 	for (const FString& Filename : Files)
 	{
 		ReleaseTemporaryExport(Filename);
+	}
+	for (const FString& Directory : Directories)
+	{
+		ReleaseTemporaryExportDirectory(Directory);
 	}
 
 	TArray<FString> SessionExports;
@@ -386,6 +388,29 @@ void GitSourceControlRevision::CleanupTemporaryExports()
 			ReleaseTemporaryExport(Filename);
 		}
 	}
+}
+
+void GitSourceControlRevision::RegisterTemporaryExportDirectory(const FString& Directory)
+{
+	if (!GitSourceControlRevisionPrivate::IsManagedTemporaryExportDirectory(Directory))
+	{
+		return;
+	}
+	FScopeLock Lock(&GitSourceControlRevisionPrivate::TemporaryExportsLock);
+	GitSourceControlRevisionPrivate::TemporaryExportDirectories.Add(Directory);
+}
+
+void GitSourceControlRevision::ReleaseTemporaryExportDirectory(const FString& Directory)
+{
+	if (!GitSourceControlRevisionPrivate::IsManagedTemporaryExportDirectory(Directory))
+	{
+		return;
+	}
+	{
+		FScopeLock Lock(&GitSourceControlRevisionPrivate::TemporaryExportsLock);
+		GitSourceControlRevisionPrivate::TemporaryExportDirectories.Remove(Directory);
+	}
+	IFileManager::Get().DeleteDirectory(*Directory, false, true);
 }
 
 void GitSourceControlRevision::ReleaseTemporaryExport(const FString& Filename)

@@ -3,12 +3,17 @@
 #include "GitLocalSourceControl.h"
 
 #include "Async/Async.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "Containers/Ticker.h"
+#include "Editor.h"
+#include "GitChangedAssetOperations.h"
 #include "GitSourceControlAssetOperations.h"
+#include "GitMapPackageSet.h"
 #include "GitSourceControlRevision.h"
 #include "GitStandaloneLog.h"
 #include "GitStandaloneHistory.h"
 #include "GitSourceControlUtils.h"
+#include "Engine/World.h"
 #include "HAL/CriticalSection.h"
 #include "HAL/Event.h"
 #include "HAL/FileManager.h"
@@ -21,16 +26,22 @@
 #include "UObject/SoftObjectPath.h"
 #include "UObject/GCObject.h"
 
-#if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
-#include "Misc/AutomationTest.h"
-#endif
-
 #if WITH_DEV_AUTOMATION_TESTS
 namespace GitLocalSourceControlPrivate
 {
 	class FBlockedReadOnlyOperationGate;
 }
 #endif
+
+struct FGitLocalSourceControlGameThreadRequest final
+{
+	TFunction<bool(FString&)> Work;
+	FEventRef Completed{ EEventMode::ManualReset };
+	FCriticalSection Mutex;
+	FString Error;
+	bool bResult = false;
+	TAtomic<bool> bAbandoned = false;
+};
 
 struct FGitLocalSourceControlOperationState final
 {
@@ -52,6 +63,7 @@ struct FGitLocalSourceControlOperationState final
 	FGitLocalSourceControlOperationResult Result;
 	TArray<FString> ReloadFilenames;
 	TArray<EGitLocalSourceControlOperationPhase> PendingProgressPhases;
+	TArray<TSharedRef<FGitLocalSourceControlGameThreadRequest, ESPMode::ThreadSafe>> PendingGameThreadRequests;
 	TArray<FString> DeferredCleanupAssetObjectPaths;
 	bool bCancellationAllowed = true;
 	bool bCanScheduleDeferredDiscard = false;
@@ -77,6 +89,14 @@ namespace GitLocalSourceControlPrivate
 	void SetForcePreparedPackageReloadFailureForTesting(const bool bEnabled)
 	{
 		GForcePreparedPackageReloadFailureForTesting.Store(bEnabled);
+		GitChangedAssetOperations::FGitChangedAssetRevertLifecycle::SetReloadPackagesForTesting(bEnabled
+			? GitChangedAssetOperations::FGitChangedAssetRevertLifecycle::FReloadPackagesForTesting(
+				[](const TArray<UPackage*>&, FString& OutError)
+				{
+					OutError = TEXT("Automation test seam forced prepared package reload failure.");
+					return false;
+				})
+			: GitChangedAssetOperations::FGitChangedAssetRevertLifecycle::FReloadPackagesForTesting());
 	}
 
 	void SetForceRestoreWorktreeRollbackForTesting(const bool bEnabled)
@@ -153,7 +173,6 @@ namespace GitLocalSourceControlPrivate
 				State->RequestShutdownCancellationIfAllowed();
 			}
 
-			WaitForAllWorkers();
 		}
 
 		void WaitForAllWorkers()
@@ -161,6 +180,12 @@ namespace GitLocalSourceControlPrivate
 			check(IsInGameThread());
 			while (!AllWorkersFinished->Wait(10))
 			{}
+		}
+
+		bool WaitForWorkersFor(const uint32 TimeoutMilliseconds)
+		{
+			check(IsInGameThread());
+			return AllWorkersFinished->Wait(TimeoutMilliseconds);
 		}
 
 	private:
@@ -186,8 +211,10 @@ namespace GitLocalSourceControlPrivate
 		FString ObjectPath;
 		FString PackageName;
 		FString Filename;
+		FString RepositoryResolutionAnchorFilename;
 		FString GitBinary;
 		FString RepositoryRoot;
+		bool bRequiresPrimaryPackageResolution = false;
 	};
 
 	FString NormalizeObjectPath(FString InObjectPath)
@@ -230,27 +257,28 @@ namespace GitLocalSourceControlPrivate
 
 		FString Filename;
 		const bool bPackageExists = FPackageName::DoesPackageExist(PackageName, &Filename);
+		bool bRequiresPrimaryPackageResolution = false;
+		FString RepositoryResolutionAnchorFilename;
 		if (!bPackageExists)
 		{
-			// Explicit history and mutation validation must still resolve a tracked
-			// package path when the worktree file is currently absent.
-			Filename = FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetAssetPackageExtension());
+			// 缺失 object path 不能推断为 .uasset. 此处仅用 map 候选定位仓库,
+			// 后续操作前必须用固定 Git revision 解析精确 primary package identity.
+			RepositoryResolutionAnchorFilename = FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetMapPackageExtension());
+			Filename = RepositoryResolutionAnchorFilename;
+			bRequiresPrimaryPackageResolution = true;
 		}
 		Filename = FPaths::ConvertRelativePathToFull(Filename);
 		FPaths::NormalizeFilename(Filename);
-		if (Filename.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase))
+		if (!Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase) && !Filename.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase))
 		{
-			OutError = TEXT("Map and World Partition assets are not available through the scripted restore API.");
-			return false;
-		}
-		if (!Filename.EndsWith(TEXT(".uasset"), ESearchCase::IgnoreCase))
-		{
-			OutError = FString::Printf(TEXT("Only .uasset files are accepted by the scripted asset API: %s"), *Filename);
+			OutError = FString::Printf(TEXT("Only Unreal package files (.uasset or .umap) are accepted by the scripted asset API: %s"), *Filename);
 			return false;
 		}
 		OutTarget.ObjectPath = ObjectPath;
 		OutTarget.PackageName = PackageName;
 		OutTarget.Filename = MoveTemp(Filename);
+		OutTarget.RepositoryResolutionAnchorFilename = MoveTemp(RepositoryResolutionAnchorFilename);
+		OutTarget.bRequiresPrimaryPackageResolution = bRequiresPrimaryPackageResolution;
 		return true;
 	}
 
@@ -287,8 +315,28 @@ namespace GitLocalSourceControlPrivate
 	bool ResolveRepositoryForTarget(FResolvedTarget& InOutTarget, FString& OutError)
 	{
 		OutError.Reset();
-		return GitSourceControlUtils::ResolveStandaloneRepositoryForFile(InOutTarget.Filename,
-			InOutTarget.GitBinary, InOutTarget.RepositoryRoot, OutError);
+		const FString& RepositoryResolutionFilename = InOutTarget.bRequiresPrimaryPackageResolution
+			? InOutTarget.RepositoryResolutionAnchorFilename
+			: InOutTarget.Filename;
+		if (!GitSourceControlUtils::ResolveStandaloneRepositoryForFile(RepositoryResolutionFilename,
+			InOutTarget.GitBinary, InOutTarget.RepositoryRoot, OutError))
+		{
+			return false;
+		}
+		if (!InOutTarget.bRequiresPrimaryPackageResolution)
+		{
+			return true;
+		}
+
+		FGitChangedPrimaryPackageTarget PrimaryTarget;
+		if (!GitMapPackageSet::ResolvePrimaryPackageTarget(InOutTarget.GitBinary, InOutTarget.RepositoryRoot,
+			InOutTarget.PackageName, FString(), PrimaryTarget, OutError))
+		{
+			return false;
+		}
+		InOutTarget.Filename = MoveTemp(PrimaryTarget.AbsoluteFilename);
+		InOutTarget.bRequiresPrimaryPackageResolution = false;
+		return true;
 	}
 
 	FGitLocalSourceControlProviderInfo GetProviderInfoOnGameThread(const FString& InAssetObjectPath)
@@ -373,7 +421,11 @@ namespace GitLocalSourceControlPrivate
 				continue;
 			}
 			UPackage* Package = LoadPackage(nullptr, *PackageName, LOAD_None);
-			if (Package == nullptr || Package->FindAssetInPackage() == nullptr)
+			const bool bReloadedPackageContainsExpectedObject = Package != nullptr
+				&& (Filename.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase)
+					? UWorld::FindWorldInPackage(Package) != nullptr
+					: Package->FindAssetInPackage() != nullptr);
+			if (!bReloadedPackageContainsExpectedObject)
 			{
 				bReloadSucceeded = false;
 				if (OutErrors != nullptr)
@@ -509,6 +561,72 @@ namespace GitLocalSourceControlPrivate
 		InOutResult.Errors = InAssetResult.Errors;
 	}
 
+	void AddChangedAssetOperationResult(FGitLocalSourceControlOperationResult& InOutResult,
+		const GitChangedAssetOperations::FGitChangedAssetRevertResult& InAssetResult)
+	{
+		InOutResult.bSucceeded = InAssetResult.bSucceeded;
+		InOutResult.bCancelled = InAssetResult.bCancelled;
+		InOutResult.bReloadSucceeded = InAssetResult.bReloadSucceeded;
+		InOutResult.AffectedFiles = InAssetResult.AffectedFiles;
+		InOutResult.Errors = InAssetResult.Errors;
+	}
+
+	bool InvokeOnGameThreadAndWait(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState,
+		TFunction<bool(FString&)>&& InWork, FString& OutError)
+	{
+		if (IsInGameThread())
+		{
+			return InWork(OutError);
+		}
+
+		const TSharedRef<FGitLocalSourceControlGameThreadRequest, ESPMode::ThreadSafe> Request =
+			MakeShared<FGitLocalSourceControlGameThreadRequest, ESPMode::ThreadSafe>();
+		Request->Work = MoveTemp(InWork);
+		{
+			FScopeLock Lock(&InState->Mutex);
+			if (InState->CancellationContext->IsCancellationRequested() || InState->bWorkerFinished)
+			{
+				OutError = TEXT("The scripted local Git operation ended before its Editor lifecycle callback could run.");
+				return false;
+			}
+			InState->PendingGameThreadRequests.Add(Request);
+		}
+
+		while (!Request->Completed->Wait(10))
+		{
+			if (InState->CancellationContext->IsCancellationRequested())
+			{
+				Request->bAbandoned.Store(true);
+				OutError = TEXT("The scripted local Git operation was cancelled before its Editor lifecycle callback ran.");
+				return false;
+			}
+		}
+		FScopeLock Lock(&Request->Mutex);
+		OutError = Request->Error;
+		return Request->bResult;
+	}
+
+	void PumpPendingGameThreadRequests(const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState)
+	{
+		check(IsInGameThread());
+		TArray<TSharedRef<FGitLocalSourceControlGameThreadRequest, ESPMode::ThreadSafe>> Requests;
+		{
+			FScopeLock Lock(&InState->Mutex);
+			Requests = MoveTemp(InState->PendingGameThreadRequests);
+		}
+		for (const TSharedRef<FGitLocalSourceControlGameThreadRequest, ESPMode::ThreadSafe>& Request : Requests)
+		{
+			FString Error;
+			const bool bResult = !Request->bAbandoned.Load() && Request->Work && Request->Work(Error);
+			{
+				FScopeLock Lock(&Request->Mutex);
+				Request->bResult = bResult;
+				Request->Error = MoveTemp(Error);
+			}
+			Request->Completed->Trigger();
+		}
+	}
+
 	void AddHistory(FGitLocalSourceControlOperationResult& InOutResult, const TGitSourceControlHistory& InHistory)
 	{
 		InOutResult.History.Reserve(InHistory.Num());
@@ -609,6 +727,60 @@ namespace GitLocalSourceControlPrivate
 		return Callbacks;
 	}
 
+	GitChangedAssetOperations::FGitChangedAssetRevertCallbacks MakePreauthorizedPackageSetCallbacks(
+		const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>& InState,
+		const TSharedRef<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe>& Lifecycle)
+	{
+		GitChangedAssetOperations::FGitChangedAssetRevertCallbacks Callbacks;
+		Callbacks.IsCancellationRequested = [InState]()
+		{
+			return InState->CancellationContext->IsCancellationRequested();
+		};
+		Callbacks.Confirm = [InState, Lifecycle](const TArray<FGitChangedAssetEntry>& Entries, FString& OutError)
+		{
+			return InvokeOnGameThreadAndWait(InState, [Lifecycle, Entries](FString& DispatchError)
+			{
+				return Lifecycle->RecordConfirmedClosure(Entries, DispatchError);
+			}, OutError);
+		};
+		Callbacks.PrepareForMutation = [InState, Lifecycle](const TArray<FGitChangedAssetEntry>& Entries, FString& OutError)
+		{
+			return InvokeOnGameThreadAndWait(InState, [Lifecycle, Entries](FString& DispatchError)
+			{
+				return Lifecycle->Prepare(Entries, DispatchError);
+			}, OutError);
+		};
+		Callbacks.BeginMutation = [InState, Lifecycle](const TArray<FGitChangedAssetEntry>& Entries, FString& OutError)
+		{
+			return InvokeOnGameThreadAndWait(InState, [InState, Lifecycle, Entries](FString& DispatchError)
+			{
+				return Lifecycle->BeginMutation(Entries, DispatchError) && CanEnterMutation(InState);
+			}, OutError);
+		};
+		Callbacks.FinalizeEditor = [InState, Lifecycle](const TArray<FGitChangedAssetEntry>& Entries, const TArray<FString>& AffectedFiles,
+			const GitChangedAssetOperations::EGitChangedAssetMutationOutcome Outcome, FString& OutError)
+		{
+			SetWorkerPhase(InState, EGitLocalSourceControlOperationPhase::Reloading, false);
+			return InvokeOnGameThreadAndWait(InState, [Lifecycle, Entries, AffectedFiles, Outcome](FString& DispatchError)
+			{
+				const bool bFinished = Lifecycle->Finish(Entries, AffectedFiles, Outcome, DispatchError);
+				if (bFinished && Outcome == GitChangedAssetOperations::EGitChangedAssetMutationOutcome::Succeeded)
+				{
+					IAssetRegistry::GetChecked().ScanModifiedAssetFiles(AffectedFiles);
+					FEditorDelegates::RefreshAllBrowsers.Broadcast();
+				}
+				return bFinished;
+			}, OutError);
+		};
+#if WITH_DEV_AUTOMATION_TESTS
+		Callbacks.AllowFilesystemMutationForTesting = []()
+		{
+			return !GForceRestoreWorktreeRollbackForTesting.Load();
+		};
+#endif
+		return Callbacks;
+	}
+
 	class FOperationManager final : public FGCObject
 	{
 	public:
@@ -669,8 +841,11 @@ namespace GitLocalSourceControlPrivate
 			StopTicker();
 			while (!ManagedOperations.IsEmpty())
 			{
-				GetOperationRegistry().WaitForAllWorkers();
 				PumpOperations(false, true);
+				if (!ManagedOperations.IsEmpty())
+				{
+					GetOperationRegistry().WaitForWorkersFor(10);
+				}
 			}
 		}
 
@@ -696,8 +871,11 @@ namespace GitLocalSourceControlPrivate
 			StopTicker();
 			while (!ManagedOperations.IsEmpty())
 			{
-				GetOperationRegistry().WaitForAllWorkers();
 				PumpOperations(false, true);
+				if (!ManagedOperations.IsEmpty())
+				{
+					GetOperationRegistry().WaitForWorkersFor(10);
+				}
 			}
 			return ManagedOperations.IsEmpty() && !TickerHandle.IsValid();
 		}
@@ -780,6 +958,7 @@ void UGitLocalSourceControlOperation::PumpOnGameThread(const bool bBroadcastNoti
 	{
 		return;
 	}
+	GitLocalSourceControlPrivate::PumpPendingGameThreadRequests(State.ToSharedRef());
 
 	TArray<EGitLocalSourceControlOperationPhase> ProgressPhases;
 	bool bWorkerFinished = false;
@@ -1056,62 +1235,99 @@ UGitLocalSourceControlOperation* UGitLocalSourceControlLibrary::StartRestoreRevi
 	}
 	const TSharedRef<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe> State = MakeShared<FGitLocalSourceControlOperationState, ESPMode::ThreadSafe>();
 	State->bCanScheduleDeferredDiscard = true;
-	if (!GitLocalSourceControlPrivate::PrepareLoadedPackagesForMutation({ Target }, State, true, Error))
-	{
-		GitLocalSourceControlPrivate::ReloadPreparedPackages(State);
-		return GitLocalSourceControlPrivate::MakeFailedOperation(Error);
-	}
-	if (!GitLocalSourceControlPrivate::GetOperationRegistry().TryBegin(State))
-	{
-		GitLocalSourceControlPrivate::ReloadPreparedPackages(State);
-		return GitLocalSourceControlPrivate::MakeFailedOperation(TEXT("Git Local SourceControl is shutting down."));
-	}
-	Async(EAsyncExecution::ThreadPool, [State, Target, Revision]() mutable
-	{
-		GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(State->CancellationContext);
-		GitLocalSourceControlPrivate::SetWorkerPhase(State, EGitLocalSourceControlOperationPhase::LoadingHistory, true);
-		FGitLocalSourceControlOperationResult Result;
-		FString ResolveError;
-		if (!GitLocalSourceControlPrivate::ResolveRepositoryForTarget(Target, ResolveError))
+		if (!GitLocalSourceControlPrivate::GetOperationRegistry().TryBegin(State))
 		{
-			Result.Errors.Add(ResolveError);
-			GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
-			return;
+			return GitLocalSourceControlPrivate::MakeFailedOperation(TEXT("Git Local SourceControl is shutting down."));
 		}
-		TArray<FString> Errors;
-		TGitSourceControlHistory History;
-		FString CapturedHead;
-		bool bHeadChanged = false;
-		if (!GitSourceControlUtils::RunGetHistory(Target.GitBinary, Target.RepositoryRoot, Target.Filename, false,
-			EGitLocalSourceControlHistoryMode::ExactRenames, CapturedHead, bHeadChanged, Errors, History))
+		Async(EAsyncExecution::ThreadPool, [State, Target, Revision]() mutable
 		{
-			GitLocalSourceControlPrivate::AddErrors(Result, Errors);
-			GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
-			return;
-		}
-		FGitSourceControlRevision SelectedRevision;
-		FString SelectionError;
-		if (!GitLocalSourceControlPrivate::FindSelectedRevision(History, Revision, SelectedRevision, SelectionError))
-		{
-			Result.Errors.Add(SelectionError);
-			GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
-			return;
-		}
+			GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(State->CancellationContext);
+			GitLocalSourceControlPrivate::SetWorkerPhase(State, EGitLocalSourceControlOperationPhase::LoadingHistory, true);
+			FGitLocalSourceControlOperationResult Result;
+			FString Error;
+			if (!GitLocalSourceControlPrivate::ResolveRepositoryForTarget(Target, Error))
+			{
+				Result.Errors.Add(Error);
+				GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
+				return;
+			}
+			FGitChangedAssetMutationSet MutationSet;
+			if (!GitMapPackageSet::BuildSelectionMutationSetForFiles(Target.GitBinary, Target.RepositoryRoot, FString(), { Target.Filename },
+				EGitChangedAssetOperationMode::HistoricalRestore, MutationSet, Error))
+			{
+				Result.Errors.Add(Error);
+				GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
+				return;
+			}
+			if (!GitLocalSourceControlPrivate::InvokeOnGameThreadAndWait(State, [&MutationSet](FString& DispatchError)
+			{
+				return GitMapPackageSet::EnrichMutationSetForLifecycle(MutationSet, DispatchError);
+			}, Error))
+			{
+				Result.Errors.Add(Error);
+				GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
+				return;
+			}
+			TArray<FString> Errors;
+			TGitSourceControlHistory History;
+			FString CapturedHead;
+			bool bHeadChanged = false;
+			if (!GitSourceControlUtils::RunGetHistory(Target.GitBinary, Target.RepositoryRoot, Target.Filename, false,
+				EGitLocalSourceControlHistoryMode::ExactRenames, CapturedHead, bHeadChanged, Errors, History))
+			{
+				GitLocalSourceControlPrivate::AddErrors(Result, Errors);
+				GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
+				return;
+			}
+			FGitSourceControlRevision SelectedRevision;
+			if (!GitLocalSourceControlPrivate::FindSelectedRevision(History, Revision, SelectedRevision, Error))
+			{
+				Result.Errors.Add(Error);
+				GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
+				return;
+			}
+			if (!SelectedRevision.Filename.Equals(MutationSet.SelectedEntries[0].RepositoryRelativePath, ESearchCase::CaseSensitive))
+			{
+				Result.Errors.Add(TEXT("Historical map restore requires the selected revision to use the current exact Git path. Rename historical revisions are not restorable."));
+				GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
+				return;
+			}
+			FGitChangedPrimaryPackageTarget PrimaryTarget;
+			PrimaryTarget.PackageName = Target.PackageName;
+			PrimaryTarget.RepositoryRelativePath = SelectedRevision.Filename;
+			PrimaryTarget.AbsoluteFilename = Target.Filename;
+			PrimaryTarget.bIsMap = Target.Filename.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase);
+			FGitPackageRevisionArtifactSet RevisionArtifacts;
+			if (!GitMapPackageSet::BuildPackageRevisionArtifactSet(Target.GitBinary, Target.RepositoryRoot, SelectedRevision.CommitId,
+				PrimaryTarget, RevisionArtifacts, Error))
+			{
+				Result.Errors.Add(Error);
+				GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
+				return;
+			}
 
-		GitLocalSourceControlPrivate::SetWorkerPhase(State, EGitLocalSourceControlOperationPhase::Preparing, true);
-		GitSourceControlAssetOperations::FGitSourceControlAssetOperations Operations(Target.GitBinary, Target.RepositoryRoot);
-		GitSourceControlAssetOperations::FGitAssetOperationResult AssetResult;
-		const bool bRestored = Operations.RestoreRevisionToWorkspace(Target.Filename, SelectedRevision.CommitId, SelectedRevision.Filename,
-			GitLocalSourceControlPrivate::MakePreauthorizedClosedAssetCallbacks(State), AssetResult);
-		if (bRestored && AssetResult.bSucceeded)
-		{
-			GitLocalSourceControlPrivate::MarkDiskMutationCommitted(State);
-		}
-		GitLocalSourceControlPrivate::AddAssetOperationResult(Result, AssetResult);
-		Result.bSucceeded = bRestored && AssetResult.bSucceeded;
-		GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
-	});
-	return GitLocalSourceControlPrivate::MakeOperation(State);
+			GitLocalSourceControlPrivate::SetWorkerPhase(State, EGitLocalSourceControlOperationPhase::Preparing, true);
+			const TSharedRef<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe> Lifecycle =
+				MakeShared<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe>();
+			GitChangedAssetOperations::FGitChangedAssetRevertResult AssetResult;
+			GitChangedAssetOperations::FGitChangedAssetRevisionRestoreRequest RestoreRequest;
+			RestoreRequest.CurrentMutationSet = MoveTemp(MutationSet);
+			RestoreRequest.RevisionArtifacts = MoveTemp(RevisionArtifacts);
+			const bool bRestored = GitChangedAssetOperations::FGitChangedAssetOperations(Target.GitBinary, Target.RepositoryRoot).RestorePackageRevision(
+				RestoreRequest, GitLocalSourceControlPrivate::MakePreauthorizedPackageSetCallbacks(State, Lifecycle), AssetResult);
+			if (AssetResult.bDiskMutationSucceeded)
+			{
+				GitLocalSourceControlPrivate::MarkDiskMutationCommitted(State);
+			}
+			GitLocalSourceControlPrivate::AddChangedAssetOperationResult(Result, AssetResult);
+			Result.bSucceeded = bRestored && AssetResult.bSucceeded && AssetResult.bReloadSucceeded;
+			if (AssetResult.bDiskMutationSucceeded && !AssetResult.bReloadSucceeded)
+			{
+				Result.Errors.Add(TEXT("Git changed the asset file on disk, but the Editor package reload failed. Reopen the asset or Editor before further edits."));
+			}
+			GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
+		});
+		return GitLocalSourceControlPrivate::MakeOperation(State);
 }
 
 UGitLocalSourceControlOperation* GitLocalSourceControlPrivate::StartDiscardTrackedInternal(const TArray<FString>& AssetObjectPaths,
@@ -1128,45 +1344,63 @@ UGitLocalSourceControlOperation* GitLocalSourceControlPrivate::StartDiscardTrack
 	State->bCanScheduleDeferredDiscard = true;
 	State->bInternalDeferredCleanup = bInternalDeferredCleanup;
 	State->DeferredCleanupAssetObjectPaths = AssetObjectPaths;
-	if (!GitLocalSourceControlPrivate::PrepareLoadedPackagesForMutation(Targets, State, false, Error))
-	{
-		GitLocalSourceControlPrivate::ReloadPreparedPackages(State);
-		return GitLocalSourceControlPrivate::MakeFailedOperation(Error, bAllowDuringShutdown, bInternalDeferredCleanup, AssetObjectPaths);
-	}
-	if (!GitLocalSourceControlPrivate::GetOperationRegistry().TryBegin(State, bAllowDuringShutdown))
-	{
-		GitLocalSourceControlPrivate::ReloadPreparedPackages(State);
-		return GitLocalSourceControlPrivate::MakeFailedOperation(TEXT("Git Local SourceControl is shutting down."), bAllowDuringShutdown, bInternalDeferredCleanup, AssetObjectPaths);
-	}
-	Async(EAsyncExecution::ThreadPool, [State, Targets]() mutable
-	{
-		GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(State->CancellationContext);
-		GitLocalSourceControlPrivate::SetWorkerPhase(State, EGitLocalSourceControlOperationPhase::Preparing, true);
-		FGitLocalSourceControlOperationResult Result;
-		FString ResolveError;
-		if (!GitLocalSourceControlPrivate::ResolveRepositoriesForTargets(Targets, ResolveError))
+		if (!GitLocalSourceControlPrivate::GetOperationRegistry().TryBegin(State, bAllowDuringShutdown))
 		{
-			Result.Errors.Add(ResolveError);
+			return GitLocalSourceControlPrivate::MakeFailedOperation(TEXT("Git Local SourceControl is shutting down."), bAllowDuringShutdown, bInternalDeferredCleanup, AssetObjectPaths);
+		}
+		Async(EAsyncExecution::ThreadPool, [State, Targets]() mutable
+		{
+			GitSourceControlUtils::FGitOperationCancellationScope CancellationScope(State->CancellationContext);
+			GitLocalSourceControlPrivate::SetWorkerPhase(State, EGitLocalSourceControlOperationPhase::Preparing, true);
+			FGitLocalSourceControlOperationResult Result;
+			FString ResolveError;
+			if (!GitLocalSourceControlPrivate::ResolveRepositoriesForTargets(Targets, ResolveError))
+			{
+				Result.Errors.Add(ResolveError);
+				GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
+				return;
+			}
+			TArray<FString> Files;
+			for (const GitLocalSourceControlPrivate::FResolvedTarget& Target : Targets)
+			{
+				Files.Add(Target.Filename);
+			}
+			FGitChangedAssetMutationSet MutationSet;
+			FString MutationSetError;
+			if (!GitMapPackageSet::BuildSelectionMutationSetForFiles(Targets[0].GitBinary, Targets[0].RepositoryRoot, FString(), Files,
+				EGitChangedAssetOperationMode::DiscardTracked, MutationSet, MutationSetError))
+			{
+				Result.Errors.Add(MutationSetError);
+				GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
+				return;
+			}
+			if (!GitLocalSourceControlPrivate::InvokeOnGameThreadAndWait(State, [&MutationSet](FString& DispatchError)
+			{
+				return GitMapPackageSet::EnrichMutationSetForLifecycle(MutationSet, DispatchError);
+			}, MutationSetError))
+			{
+				Result.Errors.Add(MutationSetError);
+				GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
+				return;
+			}
+			const TSharedRef<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe> Lifecycle =
+				MakeShared<GitChangedAssetOperations::FGitChangedAssetRevertLifecycle, ESPMode::ThreadSafe>();
+			GitChangedAssetOperations::FGitChangedAssetRevertResult AssetResult;
+			const bool bDiscarded = GitChangedAssetOperations::FGitChangedAssetOperations(Targets[0].GitBinary, Targets[0].RepositoryRoot).RevertToHead(
+				MutationSet, GitLocalSourceControlPrivate::MakePreauthorizedPackageSetCallbacks(State, Lifecycle), AssetResult);
+			if (AssetResult.bDiskMutationSucceeded)
+			{
+				GitLocalSourceControlPrivate::MarkDiskMutationCommitted(State);
+			}
+			GitLocalSourceControlPrivate::AddChangedAssetOperationResult(Result, AssetResult);
+			Result.bSucceeded = bDiscarded && AssetResult.bSucceeded && AssetResult.bReloadSucceeded;
+			if (AssetResult.bDiskMutationSucceeded && !AssetResult.bReloadSucceeded)
+			{
+				Result.Errors.Add(TEXT("Git changed the asset file on disk, but the Editor package reload failed. Reopen the asset or Editor before further edits."));
+			}
 			GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
-			return;
-		}
-		TArray<FString> Files;
-		for (const GitLocalSourceControlPrivate::FResolvedTarget& Target : Targets)
-		{
-			Files.Add(Target.Filename);
-		}
-		GitSourceControlAssetOperations::FGitSourceControlAssetOperations Operations(Targets[0].GitBinary, Targets[0].RepositoryRoot);
-		GitSourceControlAssetOperations::FGitAssetOperationResult AssetResult;
-		const bool bDiscarded = Operations.DiscardTrackedFiles(Files, GitLocalSourceControlPrivate::MakePreauthorizedClosedAssetCallbacks(State), AssetResult);
-		if (bDiscarded && AssetResult.bSucceeded)
-		{
-			GitLocalSourceControlPrivate::MarkDiskMutationCommitted(State);
-		}
-		GitLocalSourceControlPrivate::AddAssetOperationResult(Result, AssetResult);
-		Result.bSucceeded = bDiscarded && AssetResult.bSucceeded;
-		GitLocalSourceControlPrivate::FinishWorker(State, MoveTemp(Result));
-	});
-	return GitLocalSourceControlPrivate::MakeOperation(State, bAllowDuringShutdown);
+		});
+		return GitLocalSourceControlPrivate::MakeOperation(State, bAllowDuringShutdown);
 }
 
 UGitLocalSourceControlOperation* UGitLocalSourceControlLibrary::StartDiscardTracked(const TArray<FString>& AssetObjectPaths)
@@ -1290,27 +1524,6 @@ void GitLocalSourceControl::Testing::ReleaseBlockedReadOnlyOperation()
 bool GitLocalSourceControl::Testing::DrainOperationsForTesting()
 {
 	return GitLocalSourceControlPrivate::GetOperationManager().DrainForTesting();
-}
-
-#endif
-
-#if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitLocalSourceControlShutdownMutationAutomationTest,
-	"Cthulhu.GitSourceControl.Api.ShutdownMutationCancellation",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::EngineFilter)
-
-bool FGitLocalSourceControlShutdownMutationAutomationTest::RunTest(const FString& Parameters)
-{
-	static_cast<void>(Parameters);
-	FGitLocalSourceControlOperationState MutationState;
-	MutationState.bCancellationAllowed = false;
-	TestFalse(TEXT("Shutdown does not cancel an operation after it enters mutation"), MutationState.RequestShutdownCancellationIfAllowed());
-	TestFalse(TEXT("Mutation cancellation token remains clear during shutdown"), MutationState.CancellationContext->IsCancellationRequested());
-
-	FGitLocalSourceControlOperationState ReadOnlyState;
-	TestTrue(TEXT("Shutdown cancels a pre-mutation operation"), ReadOnlyState.RequestShutdownCancellationIfAllowed());
-	return TestTrue(TEXT("Read-only cancellation token is set during shutdown"), ReadOnlyState.CancellationContext->IsCancellationRequested());
 }
 
 #endif

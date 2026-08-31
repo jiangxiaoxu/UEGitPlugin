@@ -350,7 +350,7 @@ namespace GitSourceControlAssetOperations
 			}
 			if (!GitSourceControlAssetOperationsPrivate::IsSupportedUAsset(Filename))
 			{
-				OutError = FString::Printf(TEXT("Standalone Git asset operations support only tracked .uasset files; .umap support is reserved for a future release: %s"), *Filename);
+				OutError = FString::Printf(TEXT("Standalone Git asset operations support only standalone .uasset files. Map packages must use the logical map package operation service: %s"), *Filename);
 				return false;
 			}
 		}
@@ -545,7 +545,7 @@ namespace GitSourceControlAssetOperations
 			if (!GitSourceControlAssetOperationsPrivate::IsSupportedUAsset(Filename))
 			{
 				OutResult.FailedFiles.Add(Filename);
-				OutResult.AddError(FString::Printf(TEXT("Discard supports only tracked .uasset files; .umap support is reserved for a future release: %s"), *Filename));
+				OutResult.AddError(FString::Printf(TEXT("Discard supports only standalone tracked .uasset files. Map packages must use the logical map package operation service: %s"), *Filename));
 				return false;
 			}
 			FGitSourceControlFileStatus* State = GitSourceControlAssetOperationsPrivate::FindState(States, Filename);
@@ -690,7 +690,7 @@ namespace GitSourceControlAssetOperations
 		const FString Target = Files[0];
 		if (!GitSourceControlAssetOperationsPrivate::IsSupportedUAsset(Target))
 		{
-			OutResult.AddError(TEXT("Historical restore supports only tracked .uasset files; .umap support is reserved for a future release."));
+			OutResult.AddError(TEXT("Historical restore supports only standalone tracked .uasset files. Map packages must use the logical map package operation service."));
 			return false;
 		}
 		bool bValidCommitId = InCommitId.Len() == 40 || InCommitId.Len() == 64;

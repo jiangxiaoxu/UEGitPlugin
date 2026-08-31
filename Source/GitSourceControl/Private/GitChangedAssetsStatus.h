@@ -27,4 +27,8 @@ public:
 	/** 供低成本自动化测试及 status snapshot 使用的 NUL-safe porcelain-v2 parser. */
 	static bool ParsePorcelainV2(const TArray<uint8>& InOutput, const FString& InRepositoryRoot,
 		TArray<FGitChangedAssetEntry>& OutEntries, FString& OutError);
+
+	/** 与 UI primary rows 一起保留所有 package sidecar status records. */
+	static bool ParsePorcelainV2WithArtifacts(const TArray<uint8>& InOutput, const FString& InRepositoryRoot,
+		TArray<FGitChangedAssetEntry>& OutEntries, TArray<FGitChangedAssetArtifact>& OutArtifacts, FString& OutError);
 };
